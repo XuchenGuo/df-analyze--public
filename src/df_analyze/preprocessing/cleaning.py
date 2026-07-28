@@ -311,6 +311,8 @@ def reindex(
         return ix_train, ix_tests
 
     keep = np.asarray(idx_keep, dtype=bool)
+    # Regenerate compact, increasing indices after rows are removed so the
+    # saved train/test partitions still address the re-indexed DataFrame.
     old_to_new = np.full(len(keep), -1, dtype=int)
     old_to_new[np.flatnonzero(keep)] = np.arange(keep.sum())
 
@@ -594,7 +596,12 @@ def clean_regression_target(
     Optional[ndarray],
     Optional[list[ndarray]],
 ]:
-    """Drop missing values and convert a regression target to float."""
+    """Remove regression targets that cannot be predicted.
+
+    Missing targets are dropped, then the remaining values are converted to
+    finite floats while preserving their original units. Normalization, when
+    requested, is handled later from training-only data.
+    """
     target = unify_nans(target)
     idx_keep = ~target.isna()
     ix_train, ix_tests = reindex(idx_keep, ix_train, ix_tests)

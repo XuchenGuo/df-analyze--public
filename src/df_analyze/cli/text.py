@@ -101,9 +101,9 @@ The manner in which to use the specified test sets for validation. Available
 options are:
 
   lodo        Leave-One-Dataset-Out. Assuming --df-train=file0, and that
-  --df-tests=file1,file2,...,fileN, then df-analyze runs N+1 full
-  runs of the feature selection, tuning, and validation pipeline,
-  for the sets:
+              --df-tests=file1,file2,...,fileN, then df-analyze runs N+1 full
+              runs of the feature selection, tuning, and validation pipeline,
+              for the sets:
 
               X_test_0={{file0}}, X_train_0=concat({{file1, file2, ..., fileN}})
               X_test_1={{file1}}, X_train_1=concat({{file0, file2, ..., fileN}})
@@ -255,10 +255,11 @@ Defaults are: [{" ".join(CLASSIFIER_DEFAULTS)}].
   rf          LightGBM random forest classifier.
   lr          scikit-learn LogisticRegression.
   sgd         scikit-learn SGDClassifier.
-  mlp         Multi-layer perceptron implemented in skorch/PyTorch.
+  mlp         Modern multi-layer perceptron implemented in skorch/PyTorch.
   kan         Official pykan Kolmogorov-Arnold Network.
   svm         scikit-learn support vector classifier.
-  gandalf     Gated Adaptive Network for Deep Automated Learning of Features.
+  gandalf     Gated Adaptive Network for Deep Automated Learning of
+              Features for Tabular Data: https://arxiv.org/abs/2207.08548
   dummy       scikit-learn DummyClassifier.
 
 """
@@ -278,10 +279,11 @@ Defaults are: [{" ".join(REGRESSOR_DEFAULTS)}].
   rf          LightGBM random forest regressor.
   elastic     scikit-learn ElasticNet.
   sgd         scikit-learn SGDRegressor.
-  mlp         Multi-layer perceptron implemented in skorch/PyTorch.
+  mlp         Modern multi-layer perceptron implemented in skorch/PyTorch.
   kan         Official pykan Kolmogorov-Arnold Network.
   svm         scikit-learn support vector regressor.
-  gandalf     Gated Adaptive Network for Deep Automated Learning of Features.
+  gandalf     Gated Adaptive Network for Deep Automated Learning of
+              Features for Tabular Data: https://arxiv.org/abs/2207.08548
   dummy       scikit-learn DummyRegressor.
 
 """

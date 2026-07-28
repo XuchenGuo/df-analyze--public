@@ -59,9 +59,13 @@ class CatBoostEstimator(DfAnalyzeModel):
                 "CatBoost is not installed. Install it with `pip install catboost`."
             ) from _CATBOOST_IMPORT_ERROR
 
+    def _has_gpu(self) -> bool:
+        """Compatibility helper backed by the centralized runtime policy."""
+        return self.runtime.device_for(RuntimeComponent.CatBoost) == "cuda"
+
     def _maybe_use_gpu(self, kwargs: dict[str, Any]) -> None:
         task_type = str(kwargs.get("task_type", "")).upper()
-        if self.runtime.device_for(RuntimeComponent.CatBoost) == "cuda":
+        if self._has_gpu():
             kwargs["task_type"] = "GPU"
             kwargs.setdefault("devices", "0")
             return

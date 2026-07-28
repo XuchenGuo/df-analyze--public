@@ -348,8 +348,12 @@ def _run(options: ProgramOptions) -> None:
 
         df, renames = sanitize_names(df, target_spec)
         if merged_df is not None:
+            # We already check column names are identical across test dfs, so
+            # we do not need to use renaming info twice.
             merged_df = sanitize_names(merged_df, target_spec)[0]
         prog_dirs.save_renames(renames)
+        # Likewise, the variables below are lists of column names, so there is
+        # nothing separate to rename for merged_df.
         categoricals = renames.rename_columns(categoricals)
         ordinals = renames.rename_columns(ordinals)
         drops = renames.rename_columns(drops)
@@ -481,6 +485,7 @@ def _run(options: ProgramOptions) -> None:
             )
         if downsample_result is not None:
             prog_dirs.save_downsampling(downsample_result, fold_idx)
+            # Describe prepared features after any requested downsampling.
             if fold_idx in (None, 0):
                 if isinstance(prep_train.y, DataFrame):
                     for target_name in prep_train.target_cols:
@@ -496,6 +501,7 @@ def _run(options: ProgramOptions) -> None:
                         desc_cont, desc_cat, desc_target
                     )
         elif not downsampling_requested and fold_idx in (None, 0):
+            # Describe prepared features when no downsampling stage was requested.
             if isinstance(prep_train.y, DataFrame):
                 for target_name in prep_train.target_cols:
                     desc_cont, desc_cat, desc_target = prep_train.for_target(
@@ -545,6 +551,7 @@ def _run(options: ProgramOptions) -> None:
                 prog_dirs.save_pred_report(predictions.to_markdown(), fold_idx)
 
             if FeatureSelection.Filter in options.feat_select:
+                # Select features via filter methods first.
                 assoc_filtered, pred_filtered = filter_select_features(
                     prep_selection, associations, predictions, options
                 )

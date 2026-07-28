@@ -28,6 +28,11 @@ DATA_JSON = DATAFILE.parent / "mcic.json"
 CLEAN_JSON = DATAFILE.parent / "mcic_clean.json"
 UNCORRELATED = DATADIR / "mcic_uncorrelated_cols.json"
 
+# Legacy model-name lists retained for callers that import these constants.
+# The enum choices in df_analyze.enumerables are authoritative for the current CLI.
+CLASSIFIERS = ["rf", "svm", "dtree", "mlp", "bag", "dummy", "lgb"]
+REGRESSORS = ["linear", "rf", "svm", "adaboost", "gboost", "mlp", "knn", "lgb"]
+
 DIMENSION_REDUCTION = ["pca", "kpca", "umap"]
 WRAPPER_METHODS = ["step-up", "step-down"]
 UNIVARIATE_FILTER_METHODS = ["d", "auc", "pearson", "t-test", "u-test", "chi", "info"]
@@ -137,8 +142,23 @@ when running multi-target classification.
 
 Notes
 -----
-Kept separate from N_TARG_LEVEL_MIN so multi-target split warnings can be
-adjusted without changing single-target behavior.
+Kept separate from N_TARG_LEVEL_MIN so multi-target filtering heuristics and
+split warnings can be adjusted without changing single-target behavior.
+"""
+
+MULTITARGET_MAX_RARE_LEVEL_FRAC = 1.0 / 3.0
+"""
+Maximum fraction of multi-target dimensions in a row that may belong to
+undersampled target levels before that row is dropped.
+
+Notes
+-----
+Using one third means, for example, that a 3-target problem can retain rows
+with up to one rare label while still discarding rows dominated by rare labels.
+
+This legacy threshold is retained for import compatibility. The current
+multi-target cleaning path keeps low-support rows and validates their support
+when constructing splits, so it does not apply this threshold.
 """
 
 N_TARG_LEVEL_MIN_INTERNAL = N_TARG_LEVEL_MIN // 2

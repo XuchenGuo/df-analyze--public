@@ -579,10 +579,16 @@ class ProgramOptions(Debug):
 
         if self.is_classification and len(self.classifiers) == 0:
             raise ArgumentError(
-                "No available classifiers remain after dependency checks."
+                "No available classifiers remain after dependency checks. Install "
+                "the missing optional package(s) named in the preceding warning(s), "
+                "or choose a different value for `--classifiers`."
             )
         if not self.is_classification and len(self.regressors) == 0:
-            raise ArgumentError("No available regressors remain after dependency checks.")
+            raise ArgumentError(
+                "No available regressors remain after dependency checks. Install "
+                "the missing optional package(s) named in the preceding warning(s), "
+                "or choose a different value for `--regressors`."
+            )
 
     @staticmethod
     def random(
