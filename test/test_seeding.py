@@ -51,17 +51,12 @@ def test_omni_kfold(capsys: CaptureFixture) -> None:
                 n_min_per_g=100,
                 degenerate=False,
             )
-            g = g_rand.copy()
-            g[:] = np.ones_like(y)  # make degenerate
-            g_singular = g.copy()
-            g_id = g.copy()
-            g_singular[:] = np.zeros_like(g)
-            g_id[:] = np.arange(len(g))
+            g_id = g_rand.copy()
+            g_id[:] = np.arange(len(g_rand))
 
             try:
                 for g, degen in [
                     (g_rand, "random"),
-                    (g_singular, "singular"),
                     (g_id, "ids"),
                 ]:
                     okf = OmniKFold(
@@ -72,6 +67,7 @@ def test_omni_kfold(capsys: CaptureFixture) -> None:
                         shuffle=False,
                         seed=seed,
                         warn_on_fallback=False,
+                        allow_group_fallback=True,
                     )
                     okf2 = OmniKFold(
                         n_splits=5,
@@ -81,6 +77,7 @@ def test_omni_kfold(capsys: CaptureFixture) -> None:
                         shuffle=False,
                         seed=seed,
                         warn_on_fallback=False,
+                        allow_group_fallback=True,
                     )
 
                     okf_splits, fails = okf.split(

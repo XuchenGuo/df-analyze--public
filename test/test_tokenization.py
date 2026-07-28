@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import pytest
 from pytest import CaptureFixture
 from tqdm import tqdm
 from transformers.models.xlm_roberta.modeling_xlm_roberta import XLMRobertaModel
@@ -29,6 +30,11 @@ from df_analyze.embedding.testing import (
 from pandas import DataFrame
 import re
 
+NLP_TEST_DATA = ROOT / "data/testing/embedding/NLP"
+HAS_NLP_TEST_DATA = any(path.is_dir() for path in NLP_TEST_DATA.glob("*"))
+
+
+@pytest.mark.skipif(not HAS_NLP_TEST_DATA, reason="NLP test data is not installed")
 def test_nlp_embed(capsys: CaptureFixture) -> None:
     model, tokenizer = get_model(EmbeddingModality.NLP)
     assert isinstance(model, XLMRobertaModel)
@@ -64,6 +70,7 @@ def test_nlp_embed(capsys: CaptureFixture) -> None:
                 )
             )
 
+@pytest.mark.skipif(not HAS_NLP_TEST_DATA, reason="NLP test data is not installed")
 def test_nlp_truncation(capsys: CaptureFixture) -> None:
     longest_ds = "readability_fineweb"
     model, tokenizer = get_model(EmbeddingModality.NLP)

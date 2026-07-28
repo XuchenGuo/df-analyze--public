@@ -45,16 +45,121 @@ from pandas import DataFrame, Series
 from sklearn.calibration import CalibratedClassifierCV as CVCalibrate
 from sklearn.metrics import accuracy_score as acc
 from sklearn.metrics import mean_absolute_error as mae
+from sklearn.metrics import mean_squared_error as mse
+from sklearn.metrics import r2_score as r2
 
+from df_analyze._constants import SEED
 from df_analyze.enumerables import (
     Scorer,
     WrapperSelection,
 )
-from df_analyze.splitting import OmniKFold, y_split_label
+from df_analyze.runtime.hardware import DeviceIntent, RuntimePolicy, get_runtime
+from df_analyze.splitting import OmniKFold, resolve_final_cv_folds, y_split_label
 
 NEG_MAE = "neg_mean_absolute_error"
 
 OPT_LOGGER = _get_library_root_logger()
+
+
+_MULTITARGET_FIT_ERRORS = (
+    "y should be a 1d array",
+    "bad input shape",
+    "multioutput target data is not supported",
+    "multi-output target data is not supported",
+    "dataframe for label cannot have multiple columns",
+    "label should be a 1-dimensional array",
+)
+
+
+def _is_multitarget_fit_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return any(fragment in message for fragment in _MULTITARGET_FIT_ERRORS)
+
+
+def classification_output_dim(y: Series) -> int:
+    values = np.asarray(y)
+    if values.size == 0:
+        raise ValueError("Cannot determine class count from an empty target.")
+    if np.issubdtype(values.dtype, np.integer) and np.min(values) >= 0:
+        return int(np.max(values)) + 1
+    return int(np.unique(values).size)
+
+
+def _calibration_folds(y: Series) -> Optional[int]:
+    counts = y.value_counts(dropna=False)
+    if counts.empty:
+        return None
+    folds = min(5, int(counts.min()))
+    return folds if folds >= 2 else None
+
+
+class PerTargetEstimator:
+    """Adapter for estimators that only accept a one-dimensional target."""
+
+    def __init__(
+        self,
+        model_cls: Type[Any],
+        model_args: Mapping[str, Any],
+        is_classifier: bool,
+        needs_calibration: bool = False,
+    ) -> None:
+        self.model_cls = model_cls
+        self.model_args = dict(model_args)
+        self.is_classifier = is_classifier
+        self.needs_calibration = needs_calibration
+        self.target_cols: list[str] = []
+        self.models: dict[str, Any] = {}
+
+    def _new_model(self, y: Series) -> Any:
+        model = self.model_cls(**self.model_args)
+        if self.needs_calibration:
+            folds = _calibration_folds(y)
+            if folds is None:
+                warn(
+                    f"Skipping probability calibration for target '{y.name}' because "
+                    "one of its classes has fewer than two training samples."
+                )
+            else:
+                model = CVCalibrate(model, method="sigmoid", cv=folds, n_jobs=folds)
+        return model
+
+    def fit(self, X: DataFrame, y: DataFrame) -> PerTargetEstimator:
+        if not isinstance(y, DataFrame):
+            raise ValueError("PerTargetEstimator requires DataFrame targets.")
+        self.target_cols = [str(col) for col in y.columns]
+        self.models = {}
+        for col in y.columns:
+            model = self._new_model(y[col])
+            model.fit(X, y[col])
+            self.models[str(col)] = model
+        return self
+
+    def predict(self, X: DataFrame) -> DataFrame:
+        predictions = {
+            target: np.asarray(model.predict(X)).reshape(-1)
+            for target, model in self.models.items()
+        }
+        return DataFrame(predictions, index=X.index, columns=self.target_cols)
+
+    def predict_proba(self, X: DataFrame) -> dict[str, ndarray]:
+        if not self.is_classifier:
+            raise ValueError("Cannot get probabilities for a regression model.")
+        return {
+            target: np.asarray(model.predict_proba(X))
+            for target, model in self.models.items()
+        }
+
+    def score(self, X: DataFrame, y: DataFrame) -> float:
+        if not isinstance(y, DataFrame):
+            raise ValueError("PerTargetEstimator requires DataFrame targets.")
+        scores = [
+            float(self.models[str(col)].score(X, y[col]))
+            for col in y.columns
+            if str(col) in self.models
+        ]
+        if not scores:
+            raise ValueError("No target models were available for scoring.")
+        return float(np.mean(scores))
 
 
 class EarlyStopping:
@@ -92,6 +197,10 @@ class DfAnalyzeModel(ABC):
     shortname: str = ""
     longname: str = ""
     timeout_s: int = 3600  # one hour
+    # ``None`` means the model does not use K-fold hyperparameter tuning.
+    # Multi-target preflight validation uses this declaration so it checks the
+    # same fold design that the model will actually run.
+    tuning_cv_folds: Optional[int] = 5
 
     def __init__(self, model_args: Optional[Mapping] = None) -> None:
         super().__init__()
@@ -102,10 +211,36 @@ class DfAnalyzeModel(ABC):
         self.default_args: dict[str, Any] = {}
         self.model_args: Mapping = model_args or {}
         self.grid: Optional[dict[str, Any]] = None
+        self._multitarget_fallback_warned: set[str] = set()
 
         self.tuned_args: Optional[dict[str, Any]] = None
         self.tuned_model: Optional[Any] = None
+        self.per_target_tuning_scores: dict[str, float] = {}
         self.is_refit = False
+        self.runtime: RuntimePolicy = get_runtime(DeviceIntent.CPU)
+
+    def set_runtime(self, runtime: RuntimePolicy) -> DfAnalyzeModel:
+        self.runtime = runtime
+        self._configure_runtime()
+        return self
+
+    def resolve_tuning_cv_folds(self, n_folds: Optional[int] = None) -> int:
+        """Resolve and validate the K-fold design used by this model."""
+        resolved = self.tuning_cv_folds if n_folds is None else n_folds
+        if resolved is None:
+            raise ValueError(
+                f"{self.__class__.__name__} does not use K-fold hyperparameter tuning."
+            )
+        resolved = int(resolved)
+        if resolved < 2:
+            raise ValueError("K-fold hyperparameter tuning requires at least two folds.")
+        return resolved
+
+    def _configure_runtime(self) -> None:
+        return
+
+    def _cleanup_after_fold(self) -> None:
+        return
 
     @abstractmethod
     def model_cls_args(
@@ -233,7 +368,8 @@ class DfAnalyzeModel(ABC):
         out: dict[str, float] = {}
         for key in keys:
             vals = [float(scores.get(key, np.nan)) for scores in per_target]
-            out[key] = float(np.nanmean(vals))
+            arr = np.asarray(vals, dtype=float)
+            out[key] = float(np.nan) if np.all(np.isnan(arr)) else float(np.nanmean(arr))
         return out
 
     def _score_outputs(
@@ -276,13 +412,25 @@ class DfAnalyzeModel(ABC):
             y_pred = np.asarray(y_pred_df.to_numpy())
             subset_acc = float(np.mean(np.all(y_true == y_pred, axis=1)))
             ham_loss = float(np.mean(y_true != y_pred))
-            return {"subset-acc": subset_acc, "hamming-loss": ham_loss}
+            return {
+                "subset-acc": subset_acc,
+                "hamming-loss": ham_loss,
+                "hamming-acc": 1.0 - ham_loss,
+            }
 
         y_true = np.asarray(y_true_df.to_numpy(), dtype=float)
         y_pred = np.asarray(y_pred_df.to_numpy(), dtype=float)
         residual = y_true - y_pred
         sq_norm = np.sum(np.square(residual), axis=1)
-        return {"multi-rmse": float(np.sqrt(np.mean(sq_norm)))}
+        multi_mse = float(mse(y_true, y_pred, multioutput="uniform_average"))
+        return {
+            "multi-mae": float(mae(y_true, y_pred, multioutput="uniform_average")),
+            "multi-mse": multi_mse,
+            "multi-rmse": float(np.sqrt(np.mean(sq_norm))),
+            "multi-rmse-uniform": float(np.sqrt(multi_mse)),
+            "multi-r2": float(r2(y_true, y_pred, multioutput="uniform_average")),
+            "multi-r2-var": float(r2(y_true, y_pred, multioutput="variance_weighted")),
+        }
 
     def _score_outputs_by_target(
         self,
@@ -332,13 +480,19 @@ class DfAnalyzeModel(ABC):
         return out
 
     def _mean_tuning_score(
-        self, metric: Scorer, y_true_df: DataFrame, y_pred_df: DataFrame
+        self,
+        metric: Scorer,
+        y_true_df: DataFrame,
+        y_pred_df: DataFrame,
+        y_baseline_df: Optional[DataFrame] = None,
     ) -> float:
-        y_pred_df = self._align_pred_columns(y_pred_df, y_true_df)
-        scores = []
-        for col in y_true_df.columns:
-            score = metric.tuning_score(y_true_df[col].to_numpy(), y_pred_df[col].to_numpy())
-            scores.append(float(score))
+        per_target = self._tuning_scores_by_target(
+            metric=metric,
+            y_true_df=y_true_df,
+            y_pred_df=y_pred_df,
+            y_baseline_df=y_baseline_df,
+        )
+        scores = list(per_target.values())
         if len(scores) == 0:
             raise ValueError("No valid target columns were available for tuning score.")
         score = float(np.nanmean(scores))
@@ -346,14 +500,77 @@ class DfAnalyzeModel(ABC):
             raise ValueError("All per-target tuning scores were NaN.")
         return score
 
+    def _tuning_scores_by_target(
+        self,
+        metric: Scorer,
+        y_true_df: DataFrame,
+        y_pred_df: DataFrame,
+        y_baseline_df: Optional[DataFrame] = None,
+    ) -> dict[str, float]:
+        y_pred_df = self._align_pred_columns(y_pred_df, y_true_df)
+        scores: dict[str, float] = {}
+        for col in y_true_df.columns:
+            score = metric.tuning_score(
+                y_true_df[col].to_numpy(), y_pred_df[col].to_numpy()
+            )
+            if y_true_df.shape[1] > 1:
+                baseline_values = (
+                    y_true_df[col]
+                    if y_baseline_df is None
+                    else y_baseline_df[col]
+                )
+                score = self._scale_tuning_score(metric, baseline_values, score)
+            scores[str(col)] = float(score)
+        return scores
+
+    @staticmethod
+    def _record_trial_target_scores(
+        trial: Trial,
+        scores_by_target: Mapping[str, list[float]],
+    ) -> None:
+        summary: dict[str, float] = {}
+        for target, values in scores_by_target.items():
+            array = np.asarray(values, dtype=float)
+            finite = array[np.isfinite(array)]
+            if finite.size > 0:
+                summary[str(target)] = float(np.mean(finite))
+        if summary:
+            trial.set_user_attr("per_target_tuning_scores", summary)
+
+    def _capture_best_target_scores(self, study: Study) -> None:
+        raw = study.best_trial.user_attrs.get("per_target_tuning_scores", {})
+        if not isinstance(raw, Mapping):
+            self.per_target_tuning_scores = {}
+            return
+        self.per_target_tuning_scores = {
+            str(target): float(score)
+            for target, score in raw.items()
+            if np.isfinite(float(score))
+        }
+
+    @staticmethod
+    def _scale_tuning_score(
+        metric: Scorer, y_true: Union[Series, ndarray], score: float
+    ) -> float:
+        if metric.higher_is_better():
+            return float(score)
+        values = np.asarray(y_true, dtype=float).reshape(-1)
+        center = np.mean(values) if metric.value == "msqe" else np.median(values)
+        baseline = np.full(values.shape, center, dtype=float)
+        scale = float(metric.tuning_score(values, baseline))
+        if not np.isfinite(scale) or scale <= np.finfo(float).eps:
+            return float(score)
+        return float(score) / scale
+
     def optuna_objective(
         self,
         X_train: DataFrame,
         y_train: Union[Series, DataFrame],
         g_train: Optional[Series],
         metric: Scorer,
-        n_folds: int = 5,
+        n_folds: Optional[int] = None,
     ) -> Callable[[Trial], float]:
+        n_folds = self.resolve_tuning_cv_folds(n_folds)
         y_split = self._split_target_for_cv(y_train)
 
         def objective(trial: Trial) -> float:
@@ -367,10 +584,20 @@ class DfAnalyzeModel(ABC):
                 grouped=g_train is not None,
                 labels=None,
                 warn_on_fallback=False,
+                allow_group_fallback=False,
                 df_analyze_phase="Tuning internal splits",
             )
             splits, group_fail = kf.split(
-                X_train=X_train, y_train=y_split, g_train=g_train
+                X_train=X_train,
+                y_train=y_split,
+                g_train=g_train,
+                multitarget_y=(
+                    y_train
+                    if self.is_classifier
+                    and isinstance(y_train, DataFrame)
+                    and y_train.shape[1] > 1
+                    else None
+                ),
             )
 
             # if g_train is None:
@@ -378,8 +605,14 @@ class DfAnalyzeModel(ABC):
             # else:
             #     _cv = kf(n_splits=n_folds)
             opt_args = self.optuna_args(trial)
-            full_args = {**self.fixed_args, **self.default_args, **opt_args}
+            full_args = {
+                **self.fixed_args,
+                **self.default_args,
+                **self.model_args,
+                **opt_args,
+            }
             scores = []
+            scores_by_target: dict[str, list[float]] = {}
             # try:
             #     splits = [split for split in enumerate(_cv.split(X_train, y_train))]
             # except Exception as e:
@@ -396,24 +629,41 @@ class DfAnalyzeModel(ABC):
             #     splits = [split for split in enumerate(_cv.split(X_train, y_train))]
 
             for step, (idx_train, idx_test) in enumerate(splits):
-                X_tr = X_train.iloc[idx_train]
-                X_test = X_train.iloc[idx_test]
-                y_tr = y_train.iloc[idx_train]
-                y_test = y_train.iloc[idx_test]
-                model_cls, clean_args = self.model_cls_args(full_args)
-                estimator = model_cls(**clean_args)
-                estimator.fit(X_tr, y_tr)
-                preds = estimator.predict(X_test)
-                if isinstance(y_test, DataFrame):
-                    pred_df = self._preds_to_df(preds, y_test, y_test.index)
-                    score = self._mean_tuning_score(metric, y_test, pred_df)
-                else:
-                    score = float(metric.tuning_score(y_test, preds))
-                scores.append(score)
-                # allows pruning
-                trial.report(float(np.mean(scores)), step=step)
-                if trial.should_prune():
-                    raise optuna.TrialPruned()
+                estimator = None
+                try:
+                    X_tr = X_train.iloc[idx_train]
+                    X_test = X_train.iloc[idx_test]
+                    y_tr = y_train.iloc[idx_train]
+                    y_test = y_train.iloc[idx_test]
+                    model_cls, clean_args = self.model_cls_args(full_args)
+                    estimator = self._fit_estimator(
+                        model_cls=model_cls,
+                        clean_args=clean_args,
+                        X=X_tr,
+                        y=y_tr,
+                    )
+                    preds = estimator.predict(X_test)
+                    if isinstance(y_test, DataFrame):
+                        pred_df = self._preds_to_df(preds, y_test, y_test.index)
+                        target_scores = self._tuning_scores_by_target(
+                            metric=metric,
+                            y_true_df=y_test,
+                            y_pred_df=pred_df,
+                            y_baseline_df=y_train,
+                        )
+                        for target, target_score in target_scores.items():
+                            scores_by_target.setdefault(target, []).append(target_score)
+                        score = float(np.nanmean(list(target_scores.values())))
+                    else:
+                        score = float(metric.tuning_score(y_test, preds))
+                    scores.append(score)
+                    trial.report(float(np.mean(scores)), step=step)
+                    if trial.should_prune():
+                        raise optuna.TrialPruned()
+                finally:
+                    estimator = None
+                    self._cleanup_after_fold()
+            self._record_trial_target_scores(trial, scores_by_target)
             return float(np.mean(scores))
 
         return objective
@@ -441,7 +691,11 @@ class DfAnalyzeModel(ABC):
         direction = "maximize" if metric.higher_is_better() else "minimize"
         study = create_study(
             direction=direction,
-            sampler=GridSampler(grid) if grid is not None else TPESampler(),
+            sampler=(
+                GridSampler(grid, seed=SEED)
+                if grid is not None
+                else TPESampler(seed=SEED)
+            ),
             pruner=MedianPruner(n_warmup_steps=0, n_min_trials=5),
         )
         optuna.logging.set_verbosity(verbosity)
@@ -461,17 +715,71 @@ class DfAnalyzeModel(ABC):
             gc_after_trial=True,
             show_progress_bar=True,
         )
+        finite_trials = [
+            trial
+            for trial in study.trials
+            if trial.value is not None and np.isfinite(float(trial.value))
+        ]
+        if not finite_trials:
+            raise RuntimeError(
+                f"Hyperparameter tuning failed for {self.__class__.__name__}: "
+                "no trial produced a finite score."
+            )
+        self._capture_best_target_scores(study)
         self.tuned_args = study.best_params
         self.refit_tuned(X=X_train, y=y_train, tuned_args=self.tuned_args)
 
         return study
 
     def fit(self, X_train: DataFrame, y_train: Union[Series, DataFrame]) -> None:
-        if self.model is None:
-            kwargs = {**self.fixed_args, **self.default_args, **self.model_args}
-            model_cls, clean_args = self.model_cls_args(kwargs)
-            self.model = model_cls(**clean_args)
-        self.model.fit(X_train, y_train)  # type: ignore
+        kwargs = {**self.fixed_args, **self.default_args, **self.model_args}
+        model_cls, clean_args = self.model_cls_args(kwargs)
+        self.model = self._fit_estimator(model_cls, clean_args, X_train, y_train)
+
+    def _fit_estimator(
+        self,
+        model_cls: Type[Any],
+        clean_args: Mapping[str, Any],
+        X: DataFrame,
+        y: Union[Series, DataFrame],
+        needs_calibration: bool = False,
+    ) -> Any:
+        estimator = model_cls(**dict(clean_args))
+        if needs_calibration and isinstance(y, Series):
+            folds = _calibration_folds(y)
+            if folds is None:
+                warn(
+                    f"Skipping probability calibration for target '{y.name}' because "
+                    "one of its classes has fewer than two training samples."
+                )
+            else:
+                estimator = CVCalibrate(
+                    estimator, method="sigmoid", cv=folds, n_jobs=folds
+                )
+
+        try:
+            estimator.fit(X, y)
+            return estimator
+        except (TypeError, ValueError) as error:
+            if (
+                not isinstance(y, DataFrame)
+                or y.shape[1] <= 1
+                or not _is_multitarget_fit_error(error)
+            ):
+                raise
+            model_name = model_cls.__name__
+            if model_name not in self._multitarget_fallback_warned:
+                warn(
+                    f"{model_name} does not support multi-target fitting; "
+                    "using one estimator per target."
+                )
+                self._multitarget_fallback_warned.add(model_name)
+            return PerTargetEstimator(
+                model_cls=model_cls,
+                model_args=clean_args,
+                is_classifier=self.is_classifier,
+                needs_calibration=needs_calibration,
+            ).fit(X, y)
 
     def refit_tuned(
         self,
@@ -488,14 +796,13 @@ class DfAnalyzeModel(ABC):
             **tuned_args,
         }
         model_cls, clean_args = self.model_cls_args(kwargs)
-        self.tuned_model = model_cls(**clean_args)
-
-        if self.needs_calibration:
-            self.tuned_model = CVCalibrate(
-                self.tuned_model, method="sigmoid", cv=5, n_jobs=5
-            )
-
-        self.tuned_model.fit(X, y)  # type: ignore
+        self.tuned_model = self._fit_estimator(
+            model_cls=model_cls,
+            clean_args=clean_args,
+            X=X,
+            y=y,
+            needs_calibration=self.needs_calibration,
+        )
 
     def htune_eval(
         self,
@@ -510,20 +817,19 @@ class DfAnalyzeModel(ABC):
         DataFrame,
         Union[Series, DataFrame, ndarray],
         Union[Series, DataFrame, ndarray],
-        Optional[
-            Union[ndarray, dict[str, ndarray], list[ndarray], tuple[ndarray, ...]]
-        ],
-        Optional[
-            Union[ndarray, dict[str, ndarray], list[ndarray], tuple[ndarray, ...]]
-        ],
+        Optional[Union[ndarray, dict[str, ndarray], list[ndarray], tuple[ndarray, ...]]],
+        Optional[Union[ndarray, dict[str, ndarray], list[ndarray], tuple[ndarray, ...]]],
         Optional[DataFrame],
     ]:
         """
         Returns
         -------
         df: DataFrame
-            DataFrame with columns: [trainset, holdout, 5-fold] and index as
-            the scorers, values as the scorer metric values.
+            DataFrame with columns [trainset, holdout, 5-fold,
+            final_cv_folds] and index as the scorers. `5-fold` is retained as a
+            compatibility column name; `final_cv_folds` records the actual
+            number of group-disjoint folds when fewer than five holdout groups
+            are available.
         """
         # TODO: need to specify valiation method, and return confidences, etc.
         # Actually maybe just want to call refit in here...
@@ -556,12 +862,14 @@ class DfAnalyzeModel(ABC):
             y_prob=probs_train,
         )
 
+        final_cv_folds = resolve_final_cv_folds(y_test, g_test)
         kf = OmniKFold(
-            n_splits=5,
+            n_splits=final_cv_folds,
             is_classification=self.is_classifier,
             grouped=g_test is not None,
             labels=None,
             warn_on_fallback=True,
+            allow_group_fallback=False,
             df_analyze_phase="Final k-fold on holdout set",
             seed=seed,
         )
@@ -571,7 +879,18 @@ class DfAnalyzeModel(ABC):
         fold_scores_by_target: dict[str, list[dict[str, float]]] = {}
         y_cv = self._split_target_for_cv(y_test)
         try:
-            for idx_train, idx_test in kf.split(y_cv.to_frame(), y_cv, g_test)[0]:
+            for idx_train, idx_test in kf.split(
+                y_cv.to_frame(),
+                y_cv,
+                g_test,
+                multitarget_y=(
+                    y_test
+                    if self.is_classifier
+                    and isinstance(y_test, DataFrame)
+                    and y_test.shape[1] > 1
+                    else None
+                ),
+            )[0]:
                 df_train = X_test.iloc[idx_train]
                 df_test = X_test.iloc[idx_test]
                 targ_train = y_test.iloc[idx_train]
@@ -603,9 +922,14 @@ class DfAnalyzeModel(ABC):
                     )
                 scores.append(fold_score)
                 for target_name, target_scores in fold_score_by_target.items():
-                    fold_scores_by_target.setdefault(target_name, []).append(target_scores)
+                    fold_scores_by_target.setdefault(target_name, []).append(
+                        target_scores
+                    )
+                self.tuned_model = None
+                self._cleanup_after_fold()
         finally:
             self.tuned_model = tuned_model_orig
+            self._cleanup_after_fold()
 
         holdout = Series(holdout_scores, name="holdout")
         train = Series(train_scores, name="trainset")
@@ -615,6 +939,7 @@ class DfAnalyzeModel(ABC):
         df = pd.concat([train, holdout, means], axis=1)
         df.index.name = "metric"
         df = df.reset_index()
+        df["final_cv_folds"] = final_cv_folds
         df_target: Optional[DataFrame] = None
         if isinstance(y_test, DataFrame):
             rows = []
@@ -631,9 +956,7 @@ class DfAnalyzeModel(ABC):
                         .to_dict()
                     )
                 metric_names = sorted(
-                    set(tr_scores.keys())
-                    | set(ho_scores.keys())
-                    | set(fold_means.keys())
+                    set(tr_scores.keys()) | set(ho_scores.keys()) | set(fold_means.keys())
                 )
                 for metric_name in metric_names:
                     rows.append(
@@ -643,6 +966,7 @@ class DfAnalyzeModel(ABC):
                             "trainset": tr_scores.get(metric_name, np.nan),
                             "holdout": ho_scores.get(metric_name, np.nan),
                             "5-fold": fold_means.get(metric_name, np.nan),
+                            "final_cv_folds": final_cv_folds,
                         }
                     )
             if len(rows) > 0:
@@ -688,6 +1012,7 @@ class DfAnalyzeModel(ABC):
             grouped=groups is not None,
             labels=None,
             warn_on_fallback=False,
+            allow_group_fallback=False,
             df_analyze_phase="Tuning CV Score",
         )
 
@@ -702,6 +1027,7 @@ class DfAnalyzeModel(ABC):
             self.fit(X_train, y_train)
             preds = self.predict(X=X_test)
             self.model = None  # reset for next fit call
+            self._cleanup_after_fold()
             if metric is None:
                 scorer = acc if self.is_classifier else mae
                 score = scorer(preds, y_test)

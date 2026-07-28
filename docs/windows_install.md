@@ -177,7 +177,7 @@ python -m pip install --upgrade pip setuptools wheel --no-cache-dir
 Then run the following command:
 
 ```powershell
-python -m pip install cli-test-helpers joblib jsonpickle lightgbm llvmlite matplotlib numba numpy openpyxl optuna pandas pyarrow pytest "pytest-xdist[psutil]" python-dateutil scikit-image scikit-learn scipy seaborn statsmodels tabulate torch torchaudio torchvision tqdm typing_extensions skorch "transformers[torch]" accelerate "datasets[vision]" protobuf sentencepiece "pytorch_tabular"
+python -m pip install cli-test-helpers joblib jsonpickle lightgbm xgboost pykan tabpfn llvmlite matplotlib numba numpy openpyxl optuna pandas pyarrow pytest "pytest-xdist[psutil]" python-dateutil scikit-image scikit-learn scipy seaborn statsmodels tabulate torch torchaudio torchvision tqdm typing_extensions skorch "transformers[torch]" accelerate "datasets[vision]" protobuf sentencepiece "pytorch_tabular"
 ```
 
 All necessary dependencies should now be installed. You can verify that the installation
@@ -195,7 +195,21 @@ Anytime you open PowerShell and navigate to the `df-analyze` directory, you will
 to [activate the virtual environment](#activating-the-virtual-environment) prior to
 running `df-analyze`. But you won't have to do any of the other install procedures again.
 
+### TabPFN model cache
 
+TabPFN downloads licensed checkpoints on first use. If the normal Windows
+application-data directory is restricted, set a persistent writable cache in
+the same PowerShell session:
+
+```powershell
+$env:TABPFN_MODEL_CACHE_DIR = "$PWD\.df-analyze-runtime\tabpfn-model-cache"
+```
+
+df-analyze probes this directory before TabPFN acquires its download lock. An
+explicit path that is not writable produces an immediate setup error instead
+of waiting indefinitely. If no path was explicitly configured and TabPFN's
+default cache is not writable, df-analyze automatically uses a writable
+temporary fallback and prints its location.
 
 
 

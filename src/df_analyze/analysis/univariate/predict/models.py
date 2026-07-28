@@ -303,7 +303,11 @@ if __name__ == "__main__":
     e = np.random.uniform(0, sums.mean() / 4, 200)
     y = sums + e
     y_cls = (
-        KBinsDiscretizer(n_bins=5, encode="ordinal")
+        KBinsDiscretizer(
+            n_bins=5,
+            encode="ordinal",
+            quantile_method="linear",
+        )
         .fit_transform(y.reshape(-1, 1))
         .ravel()
     )

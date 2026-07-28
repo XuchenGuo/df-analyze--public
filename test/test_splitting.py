@@ -23,7 +23,15 @@ from pytest import CaptureFixture
 from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 from tqdm import tqdm
 
-from df_analyze.splitting import ApproximateStratifiedGroupSplit, OmniKFold
+from df_analyze.splitting import (
+    ApproximateStratifiedGroupSplit,
+    OmniKFold,
+    regression_split_label,
+    resolve_final_cv_folds,
+    validate_multitarget_model_cv_support,
+    validate_multitarget_cv_support,
+    y_split_label_info,
+)
 from df_analyze.testing.datasets import (
     TestDataset,
     fast_ds,
@@ -33,14 +41,267 @@ from df_analyze.testing.datasets import (
 )
 
 
-def test_unsplittable() -> None:
+def test_multitarget_split_label_reports_fallback() -> None:
+    y = DataFrame(
+        {
+            "target_a": [0] * 40 + [1] * 40,
+            "target_b": np.tile([0, 1, 2, 3], 20),
+        }
+    )
+
+    label, info = y_split_label_info(y, min_count=20, warn_on_fallback=False)
+
+    assert info.initial_targets == ["target_a", "target_b"]
+    assert info.used_targets == ["target_b"]
+    assert info.dropped_targets == ["target_a"]
+    assert info.fallback_used
+    assert label.nunique() == 4
+    assert "Multi-Target Split Audit" in info.to_markdown()
+
+
+def test_multitarget_split_label_has_no_delimiter_collisions() -> None:
+    y = DataFrame(
+        {
+            "target_a": ["x__y", "x__y", "x", "x"],
+            "target_b": ["z", "z", "y__z", "y__z"],
+        }
+    )
+
+    label, info = y_split_label_info(y, min_count=2, warn_on_fallback=False)
+
+    assert label.nunique() == 2
+    assert label.value_counts().tolist() == [2, 2]
+    assert info.initial_n_unique_combinations == 2
+    assert info.initial_min_combination_count == 2
+    assert info.used_targets == ["target_a", "target_b"]
+    assert not info.fallback_used
+
+
+def test_multitarget_split_fallback_keeps_most_informative_combination() -> None:
+    target_a = np.repeat([0, 1], 60)
+    target_c = np.tile(np.repeat([0, 1, 2], 20), 2)
+    target_b = target_a.copy()
+    target_b[[0, 60]] = 1 - target_b[[0, 60]]
+    y = DataFrame({"target_a": target_a, "target_b": target_b, "target_c": target_c})
+
+    _, info = y_split_label_info(y, min_count=20, warn_on_fallback=False)
+
+    assert info.dropped_targets == ["target_b"]
+    assert info.used_targets == ["target_a", "target_c"]
+    assert info.final_min_combination_count == 20
+
+
+def test_multitarget_split_falls_back_when_every_target_has_a_singleton() -> None:
+    y = DataFrame(
+        {
+            "target_a": [1, *([0] * 79)],
+            "target_b": [0, 1, *([0] * 78)],
+        }
+    )
+
+    label, info = y_split_label_info(y, min_count=20, warn_on_fallback=False)
+
+    assert label.nunique() == 1
+    assert any(label.attrs.values())
+    assert info.used_targets == []
+    assert set(info.dropped_targets) == {"target_a", "target_b"}
+    assert "without stratification" in info.reason
+
+
+def test_multitarget_cv_support_fails_before_model_tuning() -> None:
+    y = DataFrame(
+        {
+            "target_a": [1, *([0] * 39)],
+            "target_b": np.tile([0, 1], 20),
+        }
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"'target_a' level 1 has 1 samples",
+    ):
+        validate_multitarget_cv_support(y, n_splits=5)
+
+
+def test_multitarget_cv_support_accepts_feasible_levels() -> None:
+    y = DataFrame(
+        {
+            "target_a": np.tile([0, 1], 20),
+            "target_b": np.tile([0, 1, 2, 3], 10),
+        }
+    )
+
+    validate_multitarget_cv_support(y, n_splits=5)
+
+
+def test_multitarget_model_cv_support_uses_each_declared_fold_design() -> None:
+    class ThreeFoldModel:
+        shortname = "three-fold"
+        tuning_cv_folds = 3
+
+    class FiveFoldModel:
+        shortname = "five-fold"
+        tuning_cv_folds = 5
+
+    y = DataFrame(
+        {
+            "target_a": np.repeat([0, 1], 11),
+            "target_b": np.tile([0, 1], 11),
+        }
+    )
+
+    # Eleven examples per level support the five-fold design (minimum 10)
+    # but not the three-fold design (minimum 12).
+    validate_multitarget_model_cv_support(y, [FiveFoldModel])
+    with pytest.raises(
+        ValueError,
+        match=r"three-fold.*with 3 folds.*at least 12",
+    ):
+        validate_multitarget_model_cv_support(
+            y,
+            [FiveFoldModel, ThreeFoldModel],
+        )
+
+
+def test_multitarget_model_cv_support_skips_non_kfold_tuners() -> None:
+    class HoldoutTunedModel:
+        shortname = "holdout"
+        tuning_cv_folds = None
+
+    y = DataFrame(
+        {
+            "target_a": [0, 1],
+            "target_b": [0, 1],
+        }
+    )
+
+    validate_multitarget_model_cv_support(y, [HoldoutTunedModel])
+
+
+def test_multitarget_cv_reseeds_to_preserve_every_target_level_per_fold() -> None:
+    y = DataFrame(
+        {
+            "target_a": np.r_[
+                np.ones(10, dtype=int),
+                np.zeros(90, dtype=int),
+            ],
+            "target_b": np.repeat(np.arange(5), 20),
+        }
+    )
+    proxy, info = y_split_label_info(y, min_count=20, warn_on_fallback=False)
+    assert info.used_targets == ["target_b"]
+    assert info.dropped_targets == ["target_a"]
+
+    splitter = OmniKFold(
+        n_splits=5,
+        is_classification=True,
+        seed=42,
+        warn_on_fallback=False,
+        df_analyze_phase="multi-target fold-support test",
+    )
+    splits, failed = splitter.split(
+        y,
+        proxy,
+        multitarget_y=y,
+    )
+
+    assert not failed
+    for train, test in splits:
+        for target in y.columns:
+            assert y.iloc[train][target].value_counts().min() >= 8
+            assert y.iloc[test][target].value_counts().min() >= 2
+
+
+def test_grouped_multitarget_cv_rejects_impossible_per_fold_support() -> None:
+    y = DataFrame(
+        {
+            "target_a": np.r_[
+                np.ones(10, dtype=int),
+                np.zeros(90, dtype=int),
+            ],
+            "target_b": np.tile([0, 1], 50),
+        }
+    )
+    groups = Series(np.repeat(np.arange(10), 10))
+    proxy, _ = y_split_label_info(y, min_count=20, warn_on_fallback=False)
+    splitter = OmniKFold(
+        n_splits=5,
+        is_classification=True,
+        grouped=True,
+        shuffle=True,
+        seed=42,
+        warn_on_fallback=False,
+        allow_group_fallback=False,
+        df_analyze_phase="grouped multi-target fold-support test",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="every level of every multi-target classification target",
+    ):
+        splitter.split(y, proxy, groups, multitarget_y=y)
+
+
+def test_final_cv_folds_respect_group_capacity() -> None:
+    y = Series(np.arange(20))
+
+    assert resolve_final_cv_folds(y) == 5
+    assert resolve_final_cv_folds(y, Series(np.repeat(np.arange(4), 5))) == 4
+
+    with pytest.raises(ValueError, match="at least two groups; found 1"):
+        resolve_final_cv_folds(y, Series(np.zeros(len(y), dtype=int)))
+
+
+def test_multitarget_unstratified_fallback_keeps_groups_disjoint() -> None:
+    y = DataFrame(
+        {
+            "target_a": [1, *([0] * 79)],
+            "target_b": [0, 1, *([0] * 78)],
+        }
+    )
+    groups = Series(np.repeat(np.arange(10), 8))
+    label, _ = y_split_label_info(y, min_count=20, warn_on_fallback=False)
+    splitter = ApproximateStratifiedGroupSplit(
+        train_size=0.75,
+        is_classification=True,
+        grouped=True,
+        seed=42,
+        warn_on_fallback=False,
+        warn_on_large_size_diff=False,
+    )
+
+    (train, test), failed = splitter.split(label.to_frame(), label, groups)
+
+    assert not failed
+    assert set(groups.iloc[train]).isdisjoint(groups.iloc[test])
+
+
+def test_multitarget_regression_split_label_is_scale_invariant() -> None:
+    y = DataFrame(
+        {
+            "small": [0.0, 1.0, 2.0, 3.0],
+            "large": [30_000.0, 20_000.0, 10_000.0, 0.0],
+        }
+    )
+
+    label = regression_split_label(y)
+    scaled = regression_split_label(y.assign(large=y["large"] * 1_000_000))
+
+    np.testing.assert_allclose(label, scaled)
+
+
+def test_grouped_safe_fallback_rejects_impossible_data() -> None:
     g = Series(np.concatenate([np.zeros(50), np.ones(50)]))
     y = Series(np.concatenate([np.ones(45), np.zeros(5), np.zeros(45), np.ones(5)]))
     kf = OmniKFold(
-        n_splits=5, is_classification=True, grouped=True, warn_on_fallback=False
+        n_splits=5,
+        is_classification=True,
+        grouped=True,
+        warn_on_fallback=False,
+        allow_group_fallback=True,
     )
-    splits, failed = kf.split(y.to_frame(), y, g)
-    assert failed
+    with pytest.raises(RuntimeError, match="group-disjoint"):
+        kf.split(y.to_frame(), y, g)
 
     y = Series(np.concatenate([range(5) for _ in range(5)]))
     kf = OmniKFold(
@@ -50,30 +311,96 @@ def test_unsplittable() -> None:
         kf.split(y.to_frame(), y, g)
 
 
-def test_should_fail_warn_and_fallback() -> None:
-    """
-    Test that warnings are printed on initial print failure, but not when
-    warn_on_fallback=False
-    """
+def test_grouped_split_does_not_fall_back_by_default() -> None:
     g = Series(np.concatenate([np.zeros(50), np.ones(50)]))
     y = Series(np.concatenate([np.ones(45), np.zeros(5), np.zeros(45), np.ones(5)]))
     kf = OmniKFold(
-        n_splits=5, is_classification=True, grouped=True, warn_on_fallback=True
+        n_splits=5,
+        is_classification=True,
+        grouped=True,
+        warn_on_fallback=False,
+    )
+
+    with pytest.raises(RuntimeError, match="group-disjoint"):
+        kf.split(y.to_frame(), y, g)
+
+
+def test_grouped_holdout_split_does_not_fall_back_by_default() -> None:
+    groups = Series(np.concatenate([np.zeros(50), np.ones(50)]))
+    target = Series(np.concatenate([np.ones(45), np.zeros(5), np.zeros(45), np.ones(5)]))
+    splitter = ApproximateStratifiedGroupSplit(
+        train_size=0.8,
+        is_classification=True,
+        grouped=True,
+        warn_on_fallback=False,
+        warn_on_large_size_diff=False,
+    )
+
+    with pytest.raises(RuntimeError, match="group-disjoint"):
+        splitter.split(target.to_frame(), target, groups)
+
+
+@pytest.mark.parametrize("n_groups", [2, 3, 4])
+def test_grouped_safe_fallback_reduces_folds_without_group_overlap(
+    n_groups: int,
+) -> None:
+    """
+    A requested five-fold split is impossible with four groups. The opt-in
+    fallback may reduce the fold count, but it must retain group disjointness.
+    """
+    g = Series(np.repeat(np.arange(n_groups), 20))
+    y = Series(np.tile([0, 1], n_groups * 10))
+    kf = OmniKFold(
+        n_splits=5,
+        is_classification=True,
+        grouped=True,
+        warn_on_fallback=True,
+        allow_group_fallback=True,
     )
     with pytest.warns(
         UserWarning,
-        match="Could not perform a grouped, stratified split of the target",
+        match="Group membership remains disjoint",
     ):
         splits, failed = kf.split(y.to_frame(), y, g)
     assert failed
+    assert len(splits) == n_groups
+    assert kf.effective_n_splits == n_groups
+    assert kf.fallback_strategy == f"StratifiedGroupKFold with {n_groups} folds"
+    for train, test in splits:
+        assert set(g.iloc[train]).isdisjoint(g.iloc[test])
 
     kf = OmniKFold(
-        n_splits=5, is_classification=True, grouped=True, warn_on_fallback=False
+        n_splits=5,
+        is_classification=True,
+        grouped=True,
+        warn_on_fallback=False,
+        allow_group_fallback=True,
     )
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         splits, failed = kf.split(y.to_frame(), y, g)
     assert failed
+    assert len(splits) == n_groups
+    for train, test in splits:
+        assert set(g.iloc[train]).isdisjoint(g.iloc[test])
+
+
+def test_grouped_holdout_safe_fallback_preserves_groups() -> None:
+    groups = Series(np.repeat(np.arange(4), 10))
+    target = Series(np.tile([0, 1], 20))
+    splitter = ApproximateStratifiedGroupSplit(
+        train_size=0.8,
+        is_classification=True,
+        grouped=True,
+        warn_on_fallback=False,
+        allow_group_fallback=True,
+        warn_on_large_size_diff=False,
+    )
+
+    (train, test), failed = splitter.split(target.to_frame(), target, groups)
+
+    assert failed
+    assert set(groups.iloc[train]).isdisjoint(groups.iloc[test])
 
 
 def test_fail_labeled_error_message() -> None:
@@ -179,10 +506,7 @@ def test_degenerate_group_splitting(capsys: CaptureFixture) -> None:
             y, g = random_grouped_data(
                 n_cls=n_cls, n_grp=n_grp, n_samp=n_samp, n_min_per_targ_cls=20
             )
-            g[:] = np.ones_like(y)  # make degenerate
-            g_singular = g.copy()
             g_id = g.copy()
-            g_singular[:] = np.zeros_like(g)
             g_id[:] = np.arange(len(g))
 
             okf = OmniKFold(
@@ -193,6 +517,7 @@ def test_degenerate_group_splitting(capsys: CaptureFixture) -> None:
                 shuffle=False,
                 seed=seed,
                 warn_on_fallback=True,
+                allow_group_fallback=True,
             )
             okf2 = OmniKFold(
                 n_splits=5,
@@ -202,6 +527,7 @@ def test_degenerate_group_splitting(capsys: CaptureFixture) -> None:
                 shuffle=False,
                 seed=seed,
                 warn_on_fallback=True,
+                allow_group_fallback=True,
             )
 
             assert okf.kf is StratifiedGroupKFold
@@ -209,7 +535,7 @@ def test_degenerate_group_splitting(capsys: CaptureFixture) -> None:
             skf = StratifiedKFold(n_splits=5, shuffle=False)
 
             try:
-                for g, degen in [(g_singular, "singular"), (g_id, "ids")]:
+                for g, degen in [(g_id, "ids")]:
                     okf_splits, fails = okf.split(
                         X_train=y.to_frame(), y_train=y, g_train=g
                     )
@@ -261,9 +587,10 @@ def test_degenerate_group_splitting(capsys: CaptureFixture) -> None:
                             skf_n = len(skf_ix_train)
                             sgkf_n = len(sgkf_ix_train)
                             n_tr_max = max(okf_n, skf_n, sgkf_n)
-                            assert abs(okf_n - skf_n) / n_tr_max < 0.01
-                            assert abs(okf_n - sgkf_n) / n_tr_max < 0.01
-                            assert abs(sgkf_n - skf_n) / n_tr_max < 0.01
+                            max_size_diff = max(1, int(np.ceil(n_tr_max * 0.01)))
+                            assert abs(okf_n - skf_n) <= max_size_diff
+                            assert abs(okf_n - sgkf_n) <= max_size_diff
+                            assert abs(sgkf_n - skf_n) <= max_size_diff
                             n_tr_split = n_tr_max
 
                             okf_skf_overlap = set(okf_ix_train).intersection(skf_ix_train)

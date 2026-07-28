@@ -17,7 +17,6 @@ from df_analyze._constants import N_CAT_LEVEL_MIN, NAN_STRINGS
 if TYPE_CHECKING:
     from df_analyze.cli.cli import ProgramOptions
 
-from df_analyze.preprocessing.targets import TargetSpec, as_target_list
 from df_analyze.preprocessing.inspection.containers import (
     ClsTargetInfo,
     ColumnDescriptions,
@@ -39,6 +38,7 @@ from df_analyze.preprocessing.inspection.inference import (
     infer_ordinal,
     infer_timelike,
 )
+from df_analyze.preprocessing.targets import TargetSpec, as_target_list
 
 
 class InspectionError(Exception):
@@ -771,6 +771,8 @@ def inspect_reg_target(series: Series) -> RegTargetInfo:
     else:
         y = np.asarray(series.values, dtype=np.float64)
 
+    if np.isinf(y).any():
+        raise ValueError(f"Regression target '{series.name}' contains infinite values.")
     var = np.nanvar(y, ddof=1)
     if float(var) <= 0:
         raise ValueError(f"Regression target {series.name} is constant.")

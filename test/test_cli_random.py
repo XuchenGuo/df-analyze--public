@@ -13,6 +13,7 @@ from tempfile import TemporaryDirectory
 
 import numpy as np
 import pandas as pd
+import pytest
 from pandas import DataFrame, Series
 from pytest import CaptureFixture
 from tqdm import tqdm
@@ -578,6 +579,8 @@ def inspect_sparse_data(capsys: CaptureFixture) -> None:
 
 
 def test_sparse_data(capsys: CaptureFixture) -> None:
+    if len(FASTEST) < 2:
+        pytest.skip("Bundled test datasets are not available")
     ds = FASTEST[1][1]
     with capsys.disabled():
         with TemporaryDirectory() as tempdir:

@@ -101,14 +101,14 @@ The manner in which to use the specified test sets for validation. Available
 options are:
 
   lodo        Leave-One-Dataset-Out. Assuming --df-train=file0, and that
-              --df-test=file1,file2,...,fileN, then df-analyze runs N+1 full
-              runs of the feature selection, tuning, and validation pipeline,
-              for the sets:
+  --df-tests=file1,file2,...,fileN, then df-analyze runs N+1 full
+  runs of the feature selection, tuning, and validation pipeline,
+  for the sets:
 
-              X_train_0={{file0}}, X_test_0=concat({{file1, file2, ..., fileN}})
-              X_train_1={{file1}}, X_test_1=concat({{file0, file2, ..., fileN}})
+              X_test_0={{file0}}, X_train_0=concat({{file1, file2, ..., fileN}})
+              X_test_1={{file1}}, X_train_1=concat({{file0, file2, ..., fileN}})
                                          ...
-              X_train_N={{fileN}}, X_test_N=concat({{file0, file2, ..., fileN-1}})
+              X_test_N={{fileN}}, X_train_N=concat({{file0, file2, ..., fileN-1}})
 
               Note: In the case of a single test file, this is just 2-fold. For
               more than 2 test files, expect this option to potentially be very
@@ -159,8 +159,8 @@ Comma-separated target columns for multi-target runs.
 GROUP_HELP_STR = """
 The (string) name of the grouping variable (if one is present) which will be
 used to ensure samples within the same group do not end up in both train and
-test splits. I.e. the name of the feature that will be passed into scikit-learn
-GroupStratifiedKFold.
+test splits. Grouped analyses stop if adequate group-disjoint classification
+folds cannot be created; they do not silently fall back to row-wise splitting.
 
 """
 
@@ -217,21 +217,27 @@ If "classify", do classification. If "regress", do regression.
 
 """
 
-CLASSIFIER_CHOICES = (
-    DfAnalyzeClassifier.choices()
-)
+DEVICE_HELP = """
+Runtime device for supported models: auto, cpu, or cuda. Auto uses workload-aware
+thresholds for KNN, CatBoost, and XGBoost so small jobs stay on CPU; compute-heavy
+neural and embedding backends prefer an available accelerator. CUDA is a request
+rather than a strict mode; an unavailable backend falls back to CPU with a warning.
+GANDALF may use MPS in auto mode on supported Apple systems.
+"""
 
-CLASSIFIER_DEFAULTS = (
-    DfAnalyzeClassifier.defaults()
-)
+DEVICE_INSTALL_HELP = """
+Managed CUDA PyTorch setup policy: auto, ask, or never. The default is never.
+Managed setup is available from a source checkout with pyproject.toml and
+uv.lock.
+"""
 
-REGRESSOR_CHOICES = (
-    DfAnalyzeRegressor.choices()
-)
+CLASSIFIER_CHOICES = DfAnalyzeClassifier.choices()
 
-REGRESSOR_DEFAULTS = (
-    DfAnalyzeRegressor.defaults()
-)
+CLASSIFIER_DEFAULTS = DfAnalyzeClassifier.defaults()
+
+REGRESSOR_CHOICES = DfAnalyzeRegressor.choices()
+
+REGRESSOR_DEFAULTS = DfAnalyzeRegressor.defaults()
 
 
 CLS_HELP_STR = f"""
@@ -239,38 +245,20 @@ The list of classifiers to use when comparing classification performance.
 Can be a list of elements from: [{" ".join(sorted(CLASSIFIER_CHOICES))}].
 Defaults are: [{" ".join(CLASSIFIER_DEFAULTS)}].
 
+  catboost    CatBoost classifier.
+  xgb         XGBoost classifier.
+  tabpfn      Versioned TabPFN foundation-model classifier.
+  dtree       scikit-learn DecisionTreeClassifier.
+  et          scikit-learn ExtraTreesClassifier.
   knn         scikit-learn KNeighborsClassifier.
-
   lgbm        LightGBM boosted decision tree classifier.
-
   rf          LightGBM random forest classifier.
-
+  lr          scikit-learn LogisticRegression.
   sgd         scikit-learn SGDClassifier.
-
-  mlp         Modern multi-layer perceptron implemented in skorch/PyTorch.
-
-  svm         scikit-learn support vector classifer.
-
-  gandalf     Gated Adaptive Network for Deep Automated Learning of
-              Features for Tabular Data: https://arxiv.org/abs/2207.08548
-
-  dummy       scikit-learn DummyClassifier.
-
-  knn         scikit-learn KNeighborsClassifier.
-
-  lgbm        LightGBM boosted decision tree classifier.
-
-  rf          LightGBM random forest classifier.
-
-  sgd         scikit-learn SGDClassifier.
-
-  mlp         Modern multi-layer perceptron implemented in skorch/PyTorch.
-
-  svm         scikit-learn support vector classifer.
-
-  gandalf     Gated Adaptive Network for Deep Automated Learning of
-              Features for Tabular Data: https://arxiv.org/abs/2207.08548
-
+  mlp         Multi-layer perceptron implemented in skorch/PyTorch.
+  kan         Official pykan Kolmogorov-Arnold Network.
+  svm         scikit-learn support vector classifier.
+  gandalf     Gated Adaptive Network for Deep Automated Learning of Features.
   dummy       scikit-learn DummyClassifier.
 
 """
@@ -280,40 +268,30 @@ The list of regressors to use when comparing regression model performance.
 Can be a list of elements from: [{" ".join(sorted(REGRESSOR_CHOICES))}].
 Defaults are: [{" ".join(REGRESSOR_DEFAULTS)}].
 
+  catboost    CatBoost regressor.
+  xgb         XGBoost regressor.
+  tabpfn      Versioned TabPFN foundation-model regressor.
+  dtree       scikit-learn DecisionTreeRegressor.
+  et          scikit-learn ExtraTreesRegressor.
   knn         scikit-learn KNeighborsRegressor.
-
   lgbm        LightGBM boosted decision tree regressor.
-
   rf          LightGBM random forest regressor.
-
+  elastic     scikit-learn ElasticNet.
   sgd         scikit-learn SGDRegressor.
-
-  mlp         Modern multi-layer perceptron implemented in skorch/PyTorch.
-
+  mlp         Multi-layer perceptron implemented in skorch/PyTorch.
+  kan         Official pykan Kolmogorov-Arnold Network.
   svm         scikit-learn support vector regressor.
-
-  gandalf     Gated Adaptive Network for Deep Automated Learning of
-              Features for Tabular Data: https://arxiv.org/abs/2207.08548
-
+  gandalf     Gated Adaptive Network for Deep Automated Learning of Features.
   dummy       scikit-learn DummyRegressor.
 
-  knn         scikit-learn KNeighborsRegressor.
+"""
 
-  lgbm        LightGBM boosted decision tree regressor.
-
-  rf          LightGBM random forest regressor.
-
-  sgd         scikit-learn SGDRegressor.
-
-  mlp         Modern multi-layer perceptron implemented in skorch/PyTorch.
-
-  svm         scikit-learn support vector regressor.
-
-  gandalf     Gated Adaptive Network for Deep Automated Learning of
-              Features for Tabular Data: https://arxiv.org/abs/2207.08548
-
-  dummy       scikit-learn DummyRegressor.
-
+TABPFN_VERSION_HELP = """
+TabPFN checkpoint version. The default is v3; v2.6 and v2.5 select the older
+supported checkpoints. This option is used only when `tabpfn` is selected.
+The first run requires accepting the corresponding Prior Labs license and
+setting TABPFN_TOKEN in the same terminal. Review the current checkpoint terms
+before commercial or production use.
 """
 
 FEAT_SELECT_HELP = """
@@ -341,6 +319,26 @@ provided in the `--df` or `--spreadsheet` argument to `df-analyze.py`. This
 is to prevent double-dipping / circular analysis that can result in
 (extremely) biased performance estimates.
 
+"""
+
+FEAT_DOWNSAMPLE_HELP = """
+Reduce a very wide feature matrix before the usual df-analyze feature selection.
+`auto` chooses a scalable supervised method; `none` keeps the existing behavior.
+The projection methods (`svd` and `sparse-rp`) create new component features.
+"""
+
+N_FEAT_DOWNSAMPLE_HELP = """
+Maximum number or fraction of features retained by feature downsampling.
+"""
+
+DOWNSAMPLE_SCREENING_HELP = """
+Fraction of each training fold used only to fit supervised downsampling. The
+remaining training rows are reserved for model tuning, preventing leakage.
+"""
+
+LARGE_FEATURE_MODE_HELP = """
+Downsample numeric columns before the normal preparation pipeline. Use this for
+tables too wide to materialize all prepared features safely.
 """
 
 EMBED_SELECT_MODEL_HELP = """
@@ -828,6 +826,72 @@ How to combine feature selection results from each target into a single final ra
 MT_TOP_K_HELP_STR = """
 After combining results across targets, keep only the top K features.
 Leave unset to keep all selected features.
+
+"""
+
+ERROR_CONSISTENCY_HELP = """
+Enable error consistency analysis after tuning. Each tuned configuration is
+refit over repeated K-fold splits of the training data, and every fold model is
+evaluated on the same external holdout set.
+
+"""
+
+EC_FOLDS_HELP = """
+Number of folds in each error-consistency repetition.
+
+"""
+
+EC_REPETITIONS_HELP = """
+Number of repeated K-fold partitions used for error consistency. Each tuned
+configuration produces --ec-folds * --ec-repetitions holdout predictions.
+The default is 5 repetitions. EC remains a descriptive stability diagnostic;
+increase repetitions for a more stable descriptive estimate, subject to runtime.
+
+"""
+
+EC_MODEL_SEED_MODE_HELP = """
+Control fitted-model randomness across error-consistency folds. `vary` (the
+default) uses a reproducible, distinct model seed for every repetition/fold and
+therefore measures split plus algorithmic instability. `fixed` reuses the base
+seed for every refit to isolate sensitivity to the training subset as far as the
+estimator permits.
+
+"""
+
+EC_METHODS_HELP = """
+Regression EC metrics to compute. These are seven experimental descriptive
+residual-consistency diagnostics, not confidence intervals or hypothesis tests:
+ratio, ratio_diff, ratio_sign, ratio_diff_sign_magnitude,
+intersection_union_sample, intersection_union_all, and
+intersection_union_distance. The legacy ratio_diff_sign spelling remains
+accepted and remains the compatibility name in existing serialized outputs.
+The ratio_diff_sign_magnitude primary summary uses magnitude to prevent signed
+cancellation; signed means remain available as auxiliary direction diagnostics.
+
+"""
+
+EC_SAVE_PREDICTIONS_HELP = """
+Save the prediction and residual/error matrices used to calculate EC.
+
+"""
+
+EC_EMPTY_UNIONS_HELP = """
+Value used for classification model pairs where neither model makes a holdout
+error. Choices are 0, 1, nan, drop, error, and warn. The default, warn, emits
+one warning and records mathematically undefined empty-union comparisons as NaN.
+
+"""
+
+EC_EPSILON_HELP = """
+Non-negative stabilization constant for regression ratio denominators. The
+default, 0, follows the published formulas exactly.
+
+"""
+
+EC_RECURRENCE_THRESHOLD_HELP = """
+Error-rate threshold used to label high recurrence in the joint adaptive-error
+and error-consistency report. This is a configurable heuristic, not a universal
+scientific cutoff. The default is 0.5.
 
 """
 

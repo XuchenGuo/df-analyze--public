@@ -19,6 +19,7 @@ from pandas import DataFrame, Series
 from sklearn.dummy import DummyClassifier as SklearnDummyClassifier
 from sklearn.dummy import DummyRegressor as SklearnDummyRegressor
 
+from df_analyze._constants import SEED
 from df_analyze.models.base import DfAnalyzeModel
 
 
@@ -113,7 +114,7 @@ class DummyClassifier(DummyEstimator):
         super().__init__(model_args)
         self.is_classifier = True
         self.model_cls = SklearnDummyClassifier
-        self.fixed_args = dict()
+        self.fixed_args = dict(random_state=SEED)
         self.grid = {"strategy": ["most_frequent", "prior", "stratified", "uniform"]}
 
     def model_cls_args(self, full_args: dict[str, Any]) -> tuple[type, dict[str, Any]]:

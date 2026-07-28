@@ -18,6 +18,8 @@ data/testing/**/*.txt
 
 cmc_ata
 downloaded_models
+cuda_smoke/
+__GANDALF_INTERNAL_LOGS__/
 runtimes/*.txt
 
 secrets
@@ -43,6 +45,13 @@ poetry.lock
 **/*.txt
 **/*.xlsx
 **/*.zip
+
+# Reproducible GPU experiment protocols and their intentionally retained outputs.
+!docs/
+!docs/**/*.md
+!benchmarks/results/
+!benchmarks/results/**
+benchmarks/results/**/raw/
 
 # research scripts
 calibration.py
@@ -217,6 +226,7 @@ celerybeat.pid
 # .env
 .env/
 .venv/
+.df-analyze-runtime/
 env/
 venv/
 ENV/

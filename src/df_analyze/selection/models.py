@@ -9,6 +9,7 @@ from warnings import warn
 if TYPE_CHECKING:
     from df_analyze.cli.cli import ProgramOptions
 from df_analyze.preprocessing.prepare import PreparedData
+from df_analyze.enumerables import FeatureSelection
 from df_analyze.selection.embedded import (
     EmbedSelected,
     EmbedSelectionModel,
@@ -47,7 +48,10 @@ def model_select_features(
     embed_selected = None
     wrap_selected = None
     try:
-        if options.embed_select is not None:
+        if (
+            FeatureSelection.Embedded in options.feat_select
+            and options.embed_select is not None
+        ):
             embed_selected = embed_select_features(
                 prep_train=prep_train, options=options
             )
@@ -58,7 +62,10 @@ def model_select_features(
         )
 
     try:
-        if options.wrapper_select is not None:
+        if (
+            FeatureSelection.Wrapper in options.feat_select
+            and options.wrapper_select is not None
+        ):
             wrap_selected = wrap_select_features(prep_train=prep_train, options=options)
     except Exception as e:
         warn(

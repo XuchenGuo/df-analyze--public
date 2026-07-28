@@ -38,7 +38,9 @@ from numpy import ndarray
 from pandas import DataFrame
 
 from df_analyze._constants import (
+    DOWNSAMPLE_CHUNK_SIZE_DEFAULT,
     FULL_RESULTS,
+    N_FEAT_DOWNSAMPLE_DEFAULT,
     N_WRAPPER_DEFAULT,
     P_FILTER_CAT_DEFAULT,
     P_FILTER_CONT_DEFAULT,
@@ -92,22 +94,37 @@ from df_analyze.cli.text import (
     CATEGORICAL_HELP_STR,
     CLS_HELP_STR,
     CLS_TUNE_METRIC,
+    DEVICE_HELP,
+    DEVICE_INSTALL_HELP,
     DF_HELP_STR,
     DF_TEST_SETS_METHOD_HELP_STR,
     DF_TESTS_HELP_STR,
     DF_TRAIN_HELP_STR,
+    DOWNSAMPLE_SCREENING_HELP,
     DROP_HELP_STR,
+    EC_EMPTY_UNIONS_HELP,
+    EC_EPSILON_HELP,
+    EC_FOLDS_HELP,
+    EC_METHODS_HELP,
+    EC_MODEL_SEED_MODE_HELP,
+    EC_RECURRENCE_THRESHOLD_HELP,
+    EC_REPETITIONS_HELP,
+    EC_SAVE_PREDICTIONS_HELP,
     EMBED_SELECT_MODEL_HELP,
+    ERROR_CONSISTENCY_HELP,
     EXPLODE_HELP,
+    FEAT_DOWNSAMPLE_HELP,
     FEAT_SELECT_HELP,
     FILTER_METHOD_HELP,
     GROUP_HELP_STR,
     HTUNE_TRIALS_HELP,
+    LARGE_FEATURE_MODE_HELP,
     MODE_HELP_STR,
     MT_AGG_STRATEGY_HELP_STR,
     MT_TOP_K_HELP_STR,
     N_FEAT_CAT_FILTER_HELP,
     N_FEAT_CONT_FILTER_HELP,
+    N_FEAT_DOWNSAMPLE_HELP,
     N_FEAT_TOTAL_FILTER_HELP,
     N_FEAT_WRAPPER_HELP,
     NAN_HELP,
@@ -125,6 +142,7 @@ from df_analyze.cli.text import (
     SEED_HELP_STR,
     SEP_HELP_STR,
     SHEET_HELP_STR,
+    TABPFN_VERSION_HELP,
     TARGET_HELP_STR,
     TARGETS_HELP_STR,
     TEST_VALSIZES_HELP,
@@ -141,6 +159,7 @@ from df_analyze.enumerables import (
     DfAnalyzeClassifier,
     DfAnalyzeRegressor,
     EmbedSelectionModel,
+    FeatureDownsampleMethod,
     FeatureSelection,
     FilterSelection,
     NanHandling,
@@ -148,11 +167,14 @@ from df_analyze.enumerables import (
     RegressorScorer,
     RegScore,
     SeedKind,
+    TabPFNVersion,
     ValidationMethod,
     WrapperSelection,
     WrapperSelectionModel,
 )
 from df_analyze.loading import load_spreadsheet
+from df_analyze.runtime.hardware import DeviceIntent, RuntimePolicy, get_runtime
+from df_analyze.runtime.install import DeviceInstall
 from df_analyze.saving import add_fold_idx
 
 if TYPE_CHECKING:
@@ -250,9 +272,33 @@ class ProgramOptions(Debug):
         verbosity: Verbosity,
         no_warn_explosion: bool,
         no_preds: bool,
+        feat_downsample: Union[
+            str, FeatureDownsampleMethod
+        ] = FeatureDownsampleMethod.None_,
+        n_feat_downsample: Union[int, float] = N_FEAT_DOWNSAMPLE_DEFAULT,
+        downsample_variance_threshold: Optional[float] = None,
+        downsample_save_scores: bool = False,
+        downsample_chunk_size: int = DOWNSAMPLE_CHUNK_SIZE_DEFAULT,
+        downsample_screening_fraction: float = 0.25,
+        large_feature_mode: bool = False,
+        assume_numeric_features: bool = False,
+        skip_full_prepared_save_before_downsample: bool = False,
+        input_format: str = "auto",
+        svmlight_index_base: str = "auto",
+        device: Union[str, DeviceIntent] = DeviceIntent.Auto,
+        device_install: Union[str, DeviceInstall, None] = None,
         targets: Optional[list[str]] = None,
         mt_agg_strategy: str = "borda",
         mt_top_k: Optional[int] = None,
+        error_consistency: bool = False,
+        ec_folds: int = 5,
+        ec_repetitions: int = 5,
+        ec_model_seed_mode: str = "vary",
+        ec_methods: Optional[tuple[str, ...]] = None,
+        ec_save_predictions: bool = False,
+        ec_empty_unions: str = "warn",
+        ec_epsilon: float = 0.0,
+        ec_recurrence_threshold: float = 0.5,
         adaptive_error: bool = False,
         aer_oof_folds: int = 5,
         aer_bins: int = 20,
@@ -276,6 +322,7 @@ class ProgramOptions(Debug):
         aer_ens_trim_q: float = 0.6,
         aer_ens_tau_low: float = 0.15,
         aer_ens_tau_high: float = 0.35,
+        tabpfn_version: Union[str, TabPFNVersion] = TabPFNVersion.V3,
     ) -> None:
         # memoization-related
         # other
@@ -288,14 +335,21 @@ class ProgramOptions(Debug):
             self.seed = secrets.randbelow(2**16 - 1)
         else:
             raise ValueError(f"Invalid seed type: {type(seed)}: {seed}")
+        self.cli_argv = list(sys.argv)
         self.cli_args = " ".join(sys.argv)
         self.datapath: Optional[Path] = self.validate_datapath(datapath)
         self.test_paths: list[Path] = [self.validate_test_path(p) for p in test_paths]
-        self.tests_method = tests_method
+        self.tests_method = (
+            tests_method
+            if isinstance(tests_method, ValidationMethod)
+            else ValidationMethod.from_arg(tests_method)
+        )
         self.targets: list[str] = targets if targets is not None else [target]
         self.targets = [str(t).strip() for t in self.targets if str(t).strip() != ""]
         if len(self.targets) == 0:
             raise ValueError("Expected at least one target column name.")
+        if len(set(self.targets)) != len(self.targets):
+            raise ValueError("Target column names must be unique.")
         self.target: str = self.targets[0]
         self.grouper: Optional[str] = grouper
         self.categoricals: list[str] = categoricals
@@ -325,15 +379,31 @@ class ProgramOptions(Debug):
         # absolute Pearson correlation with the highest-scoring feature is
         # above this threshold
         self.redundant_corr_threshold: float = abs(redundant_corr_threshold)
+        if mt_agg_strategy not in {"borda", "freq"}:
+            raise ValueError("Multi-target aggregation must be 'borda' or 'freq'.")
         self.mt_agg_strategy: str = mt_agg_strategy
         self.mt_top_k: Optional[int] = int(mt_top_k) if mt_top_k is not None else None
         if self.mt_top_k is not None and self.mt_top_k <= 0:
             self.mt_top_k = None
+        self.error_consistency: bool = bool(error_consistency)
+        self.ec_folds: int = int(ec_folds)
+        self.ec_repetitions: int = int(ec_repetitions)
+        self.ec_model_seed_mode: str = str(ec_model_seed_mode).lower()
+        if self.ec_model_seed_mode not in {"vary", "fixed"}:
+            raise ValueError("EC model seed mode must be 'vary' or 'fixed'.")
+        self.ec_methods: Optional[tuple[str, ...]] = (
+            None if ec_methods is None or len(ec_methods) == 0 else tuple(ec_methods)
+        )
+        self.ec_save_predictions: bool = bool(ec_save_predictions)
+        self.ec_empty_unions: str = str(ec_empty_unions)
+        self.ec_epsilon: float = float(ec_epsilon)
+        self.ec_recurrence_threshold: float = float(ec_recurrence_threshold)
         self.is_classification: bool = is_classification
         self.classifiers: Tuple[DfAnalyzeClassifier, ...] = tuple(
             sorted(set(classifiers))
         )
         self.regressors: Tuple[DfAnalyzeRegressor, ...] = tuple(sorted(set(regressors)))
+        self.tabpfn_version = TabPFNVersion.from_arg(tabpfn_version)
         self._validate_optional_model_dependencies()
         # self.htune: bool = htune
         # self.htune_val: ValMethod = htune_val
@@ -351,6 +421,27 @@ class ProgramOptions(Debug):
         self.verbosity: Verbosity = verbosity
         self.no_warn_explosion: bool = no_warn_explosion
         self.no_preds: bool = no_preds
+        self.feat_downsample = FeatureDownsampleMethod.from_arg(feat_downsample)
+        self.n_feat_downsample = n_feat_downsample
+        self.downsample_variance_threshold = downsample_variance_threshold
+        self.downsample_save_scores = bool(downsample_save_scores)
+        self.downsample_chunk_size = int(downsample_chunk_size)
+        if self.downsample_chunk_size <= 0:
+            raise ValueError("Downsample chunk size must be positive.")
+        self.downsample_screening_fraction = float(downsample_screening_fraction)
+        if not 0.0 < self.downsample_screening_fraction < 1.0:
+            raise ValueError("Downsample screening fraction must be in (0, 1).")
+        self.large_feature_mode = bool(large_feature_mode)
+        self.assume_numeric_features = bool(assume_numeric_features)
+        self.skip_full_prepared_save_before_downsample = bool(
+            skip_full_prepared_save_before_downsample
+        )
+        self.input_format = str(input_format).lower()
+        self.svmlight_index_base = str(svmlight_index_base).lower()
+        self.device: DeviceIntent = DeviceIntent.from_arg(device)
+        self.device_install: DeviceInstall = DeviceInstall.from_arg(
+            device_install, self.device.value
+        )
         self.adaptive_error: bool = adaptive_error
         self.aer_oof_folds: int = aer_oof_folds
         self.aer_bins: int = aer_bins
@@ -399,58 +490,99 @@ class ProgramOptions(Debug):
     @property
     def models(self) -> list[Type[DfAnalyzeModel]]:
         sources = self.classifiers if self.is_classification else self.regressors
-        clses = [source.get_model() for source in sources]
+        clses = []
+        for source in sources:
+            if source.value != DfAnalyzeClassifier.TabPFN.value:
+                clses.append(source.get_model())
+                continue
+            from df_analyze.models.tabpfn import TABPFN_CLASSIFIERS, TABPFN_REGRESSORS
+
+            versions = TABPFN_CLASSIFIERS if self.is_classification else TABPFN_REGRESSORS
+            clses.append(versions[self.tabpfn_version.value])
         return clses
 
+    @property
+    def runtime(self) -> RuntimePolicy:
+        intent = getattr(self, "device", DeviceIntent.Auto)
+        policy = getattr(self, "_runtime_policy", None)
+        if policy is None or policy.intent is not intent:
+            policy = get_runtime(intent)
+            self._runtime_policy = policy
+        workload = getattr(self, "_runtime_workload", None)
+        if workload is None:
+            return policy
+        return policy.with_workload(*workload)
+
+    def set_runtime_workload(self, n_samples: int, n_features: int) -> None:
+        self._runtime_workload = (int(n_samples), int(n_features))
+
     def _validate_optional_model_dependencies(self) -> None:
-        cls_catboost = getattr(DfAnalyzeClassifier, "CatBoost", None)
-        reg_catboost = getattr(DfAnalyzeRegressor, "CatBoost", None)
-
-        requested_cls = cls_catboost is not None and cls_catboost in self.classifiers
-        requested_reg = reg_catboost is not None and reg_catboost in self.regressors
-        if not requested_cls and not requested_reg:
-            return
-
-        from df_analyze.enumerables import is_catboost_available
-
-        catboost_available = bool(is_catboost_available())
-
-        if catboost_available:
-            return
-
-        if requested_cls and cls_catboost is not None:
-            self.classifiers = tuple(
-                model for model in self.classifiers if model is not cls_catboost
-            )
-        if requested_reg and reg_catboost is not None:
-            self.regressors = tuple(
-                model for model in self.regressors if model is not reg_catboost
-            )
-
-        removed = []
-        if requested_cls:
-            removed.append("--classifiers catboost")
-        if requested_reg:
-            removed.append("--regressors catboost")
-        removed_args = ", ".join(sorted(removed))
-        warn(
-            "CatBoost was requested but the optional dependency `catboost` is not "
-            "installed. Continuing after removing it from "
-            f"{removed_args}. Install it with `pip install catboost` to enable it."
+        from df_analyze.enumerables import (
+            is_catboost_available,
+            is_kan_available,
+            is_tabpfn_available,
+            is_xgboost_available,
         )
+
+        optional_models = (
+            (
+                "CatBoost",
+                "catboost",
+                DfAnalyzeClassifier.CatBoost,
+                DfAnalyzeRegressor.CatBoost,
+                is_catboost_available,
+            ),
+            (
+                "XGBoost",
+                "xgboost",
+                DfAnalyzeClassifier.XGBoost,
+                DfAnalyzeRegressor.XGBoost,
+                is_xgboost_available,
+            ),
+            (
+                "TabPFN",
+                "tabpfn",
+                DfAnalyzeClassifier.TabPFN,
+                DfAnalyzeRegressor.TabPFN,
+                is_tabpfn_available,
+            ),
+            (
+                "KAN",
+                "pykan",
+                DfAnalyzeClassifier.KAN,
+                DfAnalyzeRegressor.KAN,
+                is_kan_available,
+            ),
+        )
+
+        for display, package, classifier, regressor, available in optional_models:
+            requested_cls = classifier in self.classifiers
+            requested_reg = regressor in self.regressors
+            if not (requested_cls or requested_reg) or available():
+                continue
+            self.classifiers = tuple(
+                model for model in self.classifiers if model is not classifier
+            )
+            self.regressors = tuple(
+                model for model in self.regressors if model is not regressor
+            )
+            selected_args = []
+            if requested_cls:
+                selected_args.append(f"--classifiers {classifier.value}")
+            if requested_reg:
+                selected_args.append(f"--regressors {regressor.value}")
+            warn(
+                f"{display} was requested but `{package}` is not installed. "
+                f"Continuing after removing it from {', '.join(selected_args)}. "
+                f"Install it with `pip install {package}` to enable it."
+            )
 
         if self.is_classification and len(self.classifiers) == 0:
             raise ArgumentError(
-                "No classifiers remain after removing CatBoost because `catboost` is not "
-                "installed. Install it with `pip install catboost` or choose a "
-                "different value for `--classifiers`."
+                "No available classifiers remain after dependency checks."
             )
         if not self.is_classification and len(self.regressors) == 0:
-            raise ArgumentError(
-                "No regressors remain after removing CatBoost because `catboost` is not "
-                "installed. Install it with `pip install catboost` or choose a "
-                "different value for `--regressors`."
-            )
+            raise ArgumentError("No available regressors remain after dependency checks.")
 
     @staticmethod
     def random(
@@ -484,8 +616,16 @@ class ProgramOptions(Debug):
         redundant_threshold = uniform(0, 0.2)
         redundant_corr_threshold = uniform(0.8, 0.95)
         is_classification = is_cls
-        classifiers = DfAnalyzeClassifier.random_n()
-        regressors = DfAnalyzeRegressor.random_n()
+        classifiers = tuple(
+            model
+            for model in DfAnalyzeClassifier.random_n()
+            if model is not DfAnalyzeClassifier.TabPFN
+        )
+        regressors = tuple(
+            model
+            for model in DfAnalyzeRegressor.random_n()
+            if model is not DfAnalyzeRegressor.TabPFN
+        )
         # htune: bool = choice([True, False])
         # htune_val: ValMethod = "kfold"
         # htune_val_size: Size = 5
@@ -692,7 +832,66 @@ class ProgramOptions(Debug):
     @staticmethod
     def from_jsonfile(file: Path) -> ProgramOptions:
         obj = jsonpickle.decode(file.read_text())
-        return cast(ProgramOptions, obj)
+        opts = cast(ProgramOptions, obj)
+        if not hasattr(opts, "targets"):
+            opts.targets = [opts.target]
+        if not hasattr(opts, "mt_agg_strategy"):
+            opts.mt_agg_strategy = "borda"
+        if not hasattr(opts, "mt_top_k"):
+            opts.mt_top_k = None
+        if not hasattr(opts, "device"):
+            opts.device = DeviceIntent.Auto
+        if not hasattr(opts, "device_install"):
+            opts.device_install = DeviceInstall.Never
+        if not hasattr(opts, "cli_argv"):
+            opts.cli_argv = list(sys.argv)
+        if not hasattr(opts, "tabpfn_version"):
+            opts.tabpfn_version = TabPFNVersion.V3
+        if not hasattr(opts, "error_consistency"):
+            opts.error_consistency = False
+        if not hasattr(opts, "ec_folds"):
+            opts.ec_folds = 5
+        if not hasattr(opts, "ec_repetitions"):
+            opts.ec_repetitions = 5
+        if not hasattr(opts, "ec_model_seed_mode"):
+            opts.ec_model_seed_mode = "vary"
+        if not hasattr(opts, "ec_methods"):
+            opts.ec_methods = None
+        if not hasattr(opts, "ec_save_predictions"):
+            opts.ec_save_predictions = False
+        if not hasattr(opts, "ec_empty_unions"):
+            opts.ec_empty_unions = "warn"
+        if not hasattr(opts, "ec_epsilon"):
+            opts.ec_epsilon = 0.0
+        if not hasattr(opts, "ec_recurrence_threshold"):
+            opts.ec_recurrence_threshold = 0.5
+        defaults = {
+            "feat_downsample": FeatureDownsampleMethod.None_,
+            "n_feat_downsample": N_FEAT_DOWNSAMPLE_DEFAULT,
+            "downsample_variance_threshold": None,
+            "downsample_save_scores": False,
+            "downsample_chunk_size": DOWNSAMPLE_CHUNK_SIZE_DEFAULT,
+            "downsample_screening_fraction": 0.25,
+            "large_feature_mode": False,
+            "assume_numeric_features": False,
+            "skip_full_prepared_save_before_downsample": False,
+            "input_format": "auto",
+            "svmlight_index_base": "auto",
+        }
+        for name, value in defaults.items():
+            if not hasattr(opts, name):
+                setattr(opts, name, value)
+        return opts
+
+    def uses_svmlight_input(self) -> bool:
+        if self.input_format == "svmlight":
+            return True
+        if self.input_format == "table" or self.datapath is None:
+            return False
+        name = self.datapath.name.lower()
+        suffixes = (".svm", ".svmlight", ".libsvm", ".binary")
+        compression = ("", ".gz", ".bz2", ".xz")
+        return any(name.endswith(suffix + comp) for suffix in suffixes for comp in compression)
 
     def _load_df(self, path: Path) -> DataFrame:
         if path is None:
@@ -717,7 +916,9 @@ class ProgramOptions(Debug):
     def load_test_dfs(self) -> list[DataFrame]:
         return [self._load_df(p) for p in self.test_paths]
 
-    def merged_df(self) -> Optional[tuple[DataFrame, ndarray, list[ndarray]]]:
+    def merged_df(
+        self, primary: Optional[DataFrame] = None
+    ) -> Optional[tuple[DataFrame, ndarray, list[ndarray]]]:
         if len(self.test_paths) == 0:
             return None
 
@@ -726,7 +927,7 @@ class ProgramOptions(Debug):
             raise RuntimeError(
                 f"Unrecognized argument to --df-tests-method: {method} (This error should be impossible)"
             )
-        df = self.load_df()
+        df = self.load_df() if primary is None else primary
         dfs = self.load_test_dfs()
 
         # track indices for re-splitting later, i.e. so we can recover the original
@@ -783,19 +984,13 @@ def parse_and_merge_args(parser: ArgumentParser, args: Optional[str] = None) -> 
     sheet_parser = deepcopy(parser)
     sentinel_parser = deepcopy(parser)
 
-    if args is None:
-        sentinels = {key: SENTINEL for key in parser.parse_known_args()[0].__dict__}
-    else:
-        sentinels = {
-            key: SENTINEL for key in parser.parse_known_args(args.split())[0].__dict__
-        }
-    sentinel_parser.set_defaults(**sentinels)
+    parse_input = None if args is None else args.split()
+    cli_args, unknown_cli_args = cli_parser.parse_known_args(parse_input)
+    if unknown_cli_args:
+        cli_parser.error(f"unrecognized arguments: {' '.join(unknown_cli_args)}")
 
-    cli_args = (
-        cli_parser.parse_known_args()[0]
-        if args is None
-        else cli_parser.parse_known_args(args.split())[0]
-    )
+    sentinels = {key: SENTINEL for key in cli_args.__dict__}
+    sentinel_parser.set_defaults(**sentinels)
 
     if cli_args.version:
         print(f"df-analyze {VERSION}")
@@ -815,11 +1010,7 @@ def parse_and_merge_args(parser: ArgumentParser, args: Optional[str] = None) -> 
                     "dataset file to `--df-tests`."
                 )
 
-    sentinel_cli_args = (
-        sentinel_parser.parse_known_args()[0]
-        if args is None
-        else sentinel_parser.parse_known_args(args.split())[0]
-    )
+    sentinel_cli_args = sentinel_parser.parse_known_args(parse_input)[0]
     explicit_cli_args = {
         key: val for key, val in sentinel_cli_args.__dict__.items() if val is not SENTINEL
     }
@@ -954,6 +1145,28 @@ def make_parser() -> ArgumentParser:
         default="classify",
         help=MODE_HELP_STR,
     )
+    parser.add_argument(
+        "--device",
+        type=DeviceIntent.parse,
+        choices=DeviceIntent.choices(),
+        default=DeviceIntent.Auto.value,
+        help=DEVICE_HELP,
+    )
+    parser.add_argument(
+        "--device-install",
+        type=DeviceInstall.parse,
+        choices=DeviceInstall.choices(),
+        default=None,
+        help=DEVICE_INSTALL_HELP,
+    )
+    parser.add_argument(
+        "--tabpfn-version",
+        type=TabPFNVersion.parse,
+        choices=TabPFNVersion.choices(),
+        metavar="{v3,v2.6,v2.5}",
+        default=TabPFNVersion.V3.value,
+        help=TABPFN_VERSION_HELP,
+    )
     # NOTE: `nargs="+"` allows repeats, must be removed after
     parser.add_argument(
         "--classifiers",
@@ -981,6 +1194,73 @@ def make_parser() -> ArgumentParser:
         default=(FeatureSelection.Filter,),
         metavar="",  # silences ugly options spam related to enums
         help=FEAT_SELECT_HELP,
+    )
+    parser.add_argument(
+        "--feat-downsample",
+        type=FeatureDownsampleMethod.parse,
+        choices=FeatureDownsampleMethod.choices(),
+        default=FeatureDownsampleMethod.None_.value,
+        metavar="",
+        help=FEAT_DOWNSAMPLE_HELP,
+    )
+    parser.add_argument(
+        "--n-feat-downsample",
+        type=int_or_percent_parser(N_FEAT_DOWNSAMPLE_DEFAULT),
+        default=N_FEAT_DOWNSAMPLE_DEFAULT,
+        help=N_FEAT_DOWNSAMPLE_HELP,
+    )
+    parser.add_argument(
+        "--downsample-variance-threshold",
+        type=float,
+        default=None,
+        help="Minimum sample variance retained by variance downsampling.",
+    )
+    parser.add_argument(
+        "--downsample-save-scores",
+        action="store_true",
+        help="Save scores for every feature instead of only the leading scores.",
+    )
+    parser.add_argument(
+        "--downsample-chunk-size",
+        type=int,
+        default=DOWNSAMPLE_CHUNK_SIZE_DEFAULT,
+        help="Maximum number of source features scored in one chunk.",
+    )
+    parser.add_argument(
+        "--downsample-screening-fraction",
+        type=float,
+        default=0.25,
+        help=DOWNSAMPLE_SCREENING_HELP,
+    )
+    parser.add_argument(
+        "--large-feature-mode",
+        action="store_true",
+        help=LARGE_FEATURE_MODE_HELP,
+    )
+    parser.add_argument(
+        "--assume-numeric-features",
+        action="store_true",
+        help=(
+            "Skip the pandas dtype check in large-feature table mode; all predictor "
+            "values must still convert to finite numbers."
+        ),
+    )
+    parser.add_argument(
+        "--skip-full-prepared-save-before-downsample",
+        action="store_true",
+        help="Do not save the full prepared matrix before downsampling.",
+    )
+    parser.add_argument(
+        "--input-format",
+        choices=("auto", "table", "svmlight"),
+        default="auto",
+        help="Input format; auto recognizes common SVMlight file suffixes.",
+    )
+    parser.add_argument(
+        "--svmlight-index-base",
+        choices=("auto", "zero", "one"),
+        default="auto",
+        help="Feature index base used to name SVMlight columns.",
     )
     # parser.add_argument(
     #     "--model-select",
@@ -1205,6 +1485,62 @@ def make_parser() -> ArgumentParser:
         type=int_or_percent_parser(default=0.4),
         default=0.4,
         help=TEST_VALSIZES_HELP,
+    )
+    parser.add_argument(
+        "--error-consistency",
+        "--ec",
+        dest="error_consistency",
+        action="store_true",
+        default=False,
+        help=ERROR_CONSISTENCY_HELP,
+    )
+    parser.add_argument(
+        "--ec-folds",
+        type=int,
+        default=5,
+        help=EC_FOLDS_HELP,
+    )
+    parser.add_argument(
+        "--ec-repetitions",
+        type=int,
+        default=5,
+        help=EC_REPETITIONS_HELP,
+    )
+    parser.add_argument(
+        "--ec-model-seed-mode",
+        choices=["vary", "fixed"],
+        default="vary",
+        help=EC_MODEL_SEED_MODE_HELP,
+    )
+    parser.add_argument(
+        "--ec-methods",
+        nargs="+",
+        default=None,
+        help=EC_METHODS_HELP,
+    )
+    parser.add_argument(
+        "--ec-save-predictions",
+        action="store_true",
+        default=False,
+        help=EC_SAVE_PREDICTIONS_HELP,
+    )
+    parser.add_argument(
+        "--ec-empty-unions",
+        choices=["0", "1", "nan", "drop", "error", "warn"],
+        default="warn",
+        help=EC_EMPTY_UNIONS_HELP,
+    )
+    parser.add_argument(
+        "--ec-epsilon",
+        type=float,
+        default=0.0,
+        help=EC_EPSILON_HELP,
+    )
+    parser.add_argument(
+        "--ec-recurrence-threshold",
+        type=float,
+        default=0.5,
+        help=EC_RECURRENCE_THRESHOLD_HELP,
     )
     parser.add_argument(
         "--mt-agg-strategy",
@@ -1445,6 +1781,9 @@ def get_parser_dict() -> ArgsDict:
         "--ordinals": (RandKind.Columns, None),
         "--drops": (RandKind.Columns, None),
         "--mode": (RandKind.ChooseOne, ["classify", "regress"]),
+        "--device": (RandKind.ChooseOne, DeviceIntent.choices()),
+        "--device-install": (RandKind.ChooseOne, DeviceInstall.choices()),
+        "--tabpfn-version": (RandKind.ChooseOne, TabPFNVersion.choices()),
         "--classifiers": (
             RandKind.ChooseN,
             DfAnalyzeClassifier.choices(),
@@ -1707,6 +2046,35 @@ def get_options(args: Optional[str] = None) -> ProgramOptions:
     parser = make_parser()
     cli_args = parse_and_merge_args(parser, args)
 
+    if cli_args.ec_folds < 2:
+        raise ArgumentError("Argument `--ec-folds` must be at least 2.")
+    if cli_args.ec_repetitions < 1:
+        raise ArgumentError("Argument `--ec-repetitions` must be at least 1.")
+    if not np.isfinite(cli_args.ec_epsilon) or cli_args.ec_epsilon < 0:
+        raise ArgumentError("Argument `--ec-epsilon` must be a finite value >= 0.")
+    if not np.isfinite(cli_args.ec_recurrence_threshold) or not (
+        0.0 <= cli_args.ec_recurrence_threshold <= 1.0
+    ):
+        raise ArgumentError(
+            "Argument `--ec-recurrence-threshold` must be between 0 and 1."
+        )
+    if cli_args.ec_methods:
+        from df_analyze.analysis.error_consistency.regression import (
+            normalize_regression_method,
+        )
+
+        normalized = []
+        for method in cli_args.ec_methods:
+            if str(method).strip().lower() == "all":
+                continue
+            try:
+                clean = normalize_regression_method(method)
+            except ValueError as error:
+                raise ArgumentError(str(error)) from error
+            if clean not in normalized:
+                normalized.append(clean)
+        cli_args.ec_methods = tuple(normalized) if normalized else None
+
     mode = str(cli_args.mode).lower()
     is_cls = True if "class" in mode else False
 
@@ -1765,13 +2133,70 @@ def get_options(args: Optional[str] = None) -> ProgramOptions:
     else:
         datapath = cli_args.df
 
-    parsed_target = " ".join(cli_args.target).strip()  # https://stackoverflow.com/a/26990349,
+    parsed_target = " ".join(
+        cli_args.target
+    ).strip()  # https://stackoverflow.com/a/26990349,
     parsed_targets_raw = (
         list(cli_args.targets) if len(cli_args.targets) > 0 else [parsed_target]
     )
     parsed_targets = [str(t).strip() for t in parsed_targets_raw if str(t).strip() != ""]
     if len(parsed_targets) == 0:
-        raise ArgumentError("Argument `--targets` must include at least one non-empty value.")
+        raise ArgumentError(
+            "Argument `--targets` must include at least one non-empty value."
+        )
+
+    input_name = "" if datapath is None else datapath.name.lower()
+    sparse_suffixes = (".svm", ".svmlight", ".libsvm", ".binary")
+    compression_suffixes = ("", ".gz", ".bz2", ".xz")
+    uses_svmlight = cli_args.input_format == "svmlight" or (
+        cli_args.input_format == "auto"
+        and any(
+            input_name.endswith(suffix + compression)
+            for suffix in sparse_suffixes
+            for compression in compression_suffixes
+        )
+    )
+    if uses_svmlight:
+        if cli_args.large_feature_mode:
+            raise ArgumentError(
+                "Arguments `--large-feature-mode` and SVMlight input are mutually "
+                "exclusive."
+            )
+        if len(parsed_targets) > 1:
+            raise ArgumentError("SVMlight input supports exactly one target.")
+        unsupported = []
+        if grouper is not None:
+            unsupported.append("--grouper")
+        if cats:
+            unsupported.append("--categoricals")
+        if ords:
+            unsupported.append("--ordinals")
+        if cli_args.drops:
+            unsupported.append("--drops")
+        if unsupported:
+            raise ArgumentError(
+                "SVMlight input does not support table column arguments: "
+                + ", ".join(unsupported)
+                + "."
+            )
+        downsample_method = FeatureDownsampleMethod.from_arg(cli_args.feat_downsample)
+        if downsample_method is FeatureDownsampleMethod.None_:
+            raise ArgumentError("SVMlight input requires `--feat-downsample`.")
+        indexed_methods = {
+            FeatureDownsampleMethod.Auto,
+            FeatureDownsampleMethod.Random,
+            FeatureDownsampleMethod.Variance,
+            FeatureDownsampleMethod.FTest,
+            FeatureDownsampleMethod.RankEnsemble,
+            FeatureDownsampleMethod.SelectorEnsemble,
+            FeatureDownsampleMethod.StableRank,
+        }
+        if downsample_method not in indexed_methods:
+            allowed = ", ".join(sorted(method.value for method in indexed_methods))
+            raise ArgumentError(
+                "SVMlight input requires an indexed feature downsampling method. "
+                f"Choose one of: {allowed}."
+            )
 
     return ProgramOptions(
         datapath=datapath,
@@ -1805,9 +2230,19 @@ def get_options(args: Optional[str] = None) -> ProgramOptions:
         redundant_corr_threshold=cli_args.redundant_corr_threshold,
         mt_agg_strategy=cli_args.mt_agg_strategy,
         mt_top_k=cli_args.mt_top_k,
+        error_consistency=cli_args.error_consistency,
+        ec_folds=cli_args.ec_folds,
+        ec_repetitions=cli_args.ec_repetitions,
+        ec_model_seed_mode=cli_args.ec_model_seed_mode,
+        ec_methods=cli_args.ec_methods,
+        ec_save_predictions=cli_args.ec_save_predictions,
+        ec_empty_unions=cli_args.ec_empty_unions,
+        ec_epsilon=cli_args.ec_epsilon,
+        ec_recurrence_threshold=cli_args.ec_recurrence_threshold,
         is_classification=is_cls,
         classifiers=classifiers,
         regressors=regressors,
+        tabpfn_version=cli_args.tabpfn_version,
         # htune=cli_args.htune,
         # htune_val=cli_args.htune_val,
         # htune_val_size=cli_args.htune_val_size,
@@ -1824,6 +2259,21 @@ def get_options(args: Optional[str] = None) -> ProgramOptions:
         verbosity=cli_args.verbosity,
         no_warn_explosion=cli_args.no_warn_explosion,
         no_preds=cli_args.no_preds,
+        feat_downsample=cli_args.feat_downsample,
+        n_feat_downsample=cli_args.n_feat_downsample,
+        downsample_variance_threshold=cli_args.downsample_variance_threshold,
+        downsample_save_scores=cli_args.downsample_save_scores,
+        downsample_chunk_size=cli_args.downsample_chunk_size,
+        downsample_screening_fraction=cli_args.downsample_screening_fraction,
+        large_feature_mode=cli_args.large_feature_mode,
+        assume_numeric_features=cli_args.assume_numeric_features,
+        skip_full_prepared_save_before_downsample=(
+            cli_args.skip_full_prepared_save_before_downsample
+        ),
+        input_format=cli_args.input_format,
+        svmlight_index_base=cli_args.svmlight_index_base,
+        device=cli_args.device,
+        device_install=cli_args.device_install,
         adaptive_error=cli_args.adaptive_error,
         aer_oof_folds=cli_args.aer_oof_folds,
         aer_bins=cli_args.aer_bins,

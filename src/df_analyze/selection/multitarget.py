@@ -88,7 +88,7 @@ def _rank_aggregate(
         if scores.empty:
             continue
         ranks = scores.rank(ascending=not higher_is_better, method="average")
-        pts = (len(ranks) - ranks + 1).astype(float).fillna(0.0)
+        pts = ((len(ranks) - ranks + 1) / len(ranks)).astype(float).fillna(0.0)
         points[target] = pts.reindex(all_features, fill_value=0.0)
     if points.empty:
         return Series(dtype=float)
@@ -100,23 +100,10 @@ def _rank_aggregate(
     return final.sort_values(ascending=False)
 
 
-def _resolve_top_k(
-    top_k: Optional[int],
-    sizes: Iterable[int],
-    min_k: int = 5,
-    max_k: int = 80,
-) -> Optional[int]:
-    if top_k is not None:
-        if top_k <= 0:
-            return None
-        return int(top_k)
-    sizes = [s for s in sizes if s > 0]
-    if not sizes:
+def _resolve_top_k(top_k: Optional[int]) -> Optional[int]:
+    if top_k is None or top_k <= 0:
         return None
-    value = int(np.median(sizes))
-    if value <= 0:
-        return None
-    return max(min_k, min(value, max_k))
+    return int(top_k)
 
 
 def _apply_min_support(
@@ -188,12 +175,10 @@ def aggregate_filter_selected(
 
     cont_scores_by_target: dict[str, Series] = {}
     cat_scores_by_target: dict[str, Series] = {}
-    selected_sizes: list[int] = []
     cont_name = None
     cat_name = None
     target_keys, _ = _resolve_target_keys(len(per_target), target_names)
     for idx, sel in enumerate(per_target):
-        selected_sizes.append(len(sel.selected))
         key = target_keys[idx]
         if sel.cont_scores is not None and not sel.cont_scores.empty:
             cont_scores_by_target[key] = sel.cont_scores
@@ -210,7 +195,7 @@ def aggregate_filter_selected(
     cont_higher = _metric_higher_is_better(cont_cls, cont_name)
     cat_higher = _metric_higher_is_better(cat_cls, cat_name)
     n_targets = len(per_target)
-    top_k_val = _resolve_top_k(top_k, selected_sizes)
+    top_k_val = _resolve_top_k(top_k)
 
     use_freq = strategy == "freq" or (
         len(cont_scores_by_target) == 0 and len(cat_scores_by_target) == 0
@@ -261,9 +246,7 @@ def aggregate_filter_selected(
     cont_scores = _mean_scores(
         cont_scores_by_target, cont_selected, cont_name, cont_higher
     )
-    cat_scores = _mean_scores(
-        cat_scores_by_target, cat_selected, cat_name, cat_higher
-    )
+    cat_scores = _mean_scores(cat_scores_by_target, cat_selected, cat_name, cat_higher)
 
     return FilterSelected(
         selected=selected,
@@ -289,7 +272,6 @@ def aggregate_embed_selected(
     target_keys, _ = _resolve_target_keys(n_targets, target_names)
     score_maps: dict[EmbedSelectionModel, dict[str, Series]] = defaultdict(dict)
     selected_by_model: dict[EmbedSelectionModel, list[list[str]]] = defaultdict(list)
-    sizes_by_model: dict[EmbedSelectionModel, list[int]] = defaultdict(list)
     is_cls_by_model: dict[EmbedSelectionModel, bool] = {}
 
     for idx, embeds in enumerate(per_target_list):
@@ -302,7 +284,6 @@ def aggregate_embed_selected(
                 scores = scores.abs()
             score_maps[embed.model][target_key] = scores
             selected_by_model[embed.model].append(embed.selected)
-            sizes_by_model[embed.model].append(len(embed.selected))
             is_cls_by_model.setdefault(embed.model, embed.is_classification)
 
     results: list[EmbedSelected] = []
@@ -317,7 +298,7 @@ def aggregate_embed_selected(
             )
             support = _support_counts(score_by_target)
             ranked = _apply_min_support(ranked, support, min_support, n_targets)
-        top_k_val = _resolve_top_k(top_k, sizes_by_model.get(model, []))
+        top_k_val = _resolve_top_k(top_k)
         if top_k_val is not None:
             ranked = ranked.head(top_k_val)
         selected = ranked.index.to_list()
@@ -353,7 +334,6 @@ def aggregate_wrapper_selected(
     target_keys, _ = _resolve_target_keys(n_targets, target_names)
     score_by_target: dict[str, Series] = {}
     selected_by_target: list[list[str]] = []
-    sizes: list[int] = []
     first: Optional[WrapperSelected] = None
     early_stop = False
     for idx, selected in enumerate(per_target_list):
@@ -364,11 +344,11 @@ def aggregate_wrapper_selected(
         early_stop = early_stop or selected.early_stop
         score_by_target[target_keys[idx]] = Series(selected.scores, dtype=float)
         selected_by_target.append(selected.selected)
-        sizes.append(len(selected.selected))
     if first is None or not score_by_target:
         return None
 
-    higher_is_better = first.is_classification
+    # cv_score orients wrapper scores so larger values are always better.
+    higher_is_better = True
     if strategy == "freq":
         counts = _feature_counts(selected_by_target)
         ranked = Series(counts, dtype=float).sort_values(ascending=False)
@@ -382,7 +362,7 @@ def aggregate_wrapper_selected(
         )
         support = _support_counts(score_by_target)
         ranked = _apply_min_support(ranked, support, min_support, n_targets)
-    top_k_val = _resolve_top_k(top_k, sizes)
+    top_k_val = _resolve_top_k(top_k)
     if top_k_val is not None:
         ranked = ranked.head(top_k_val)
     selected = ranked.index.to_list()

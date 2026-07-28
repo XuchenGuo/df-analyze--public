@@ -31,6 +31,7 @@ from df_analyze.selection.filter import (
     filter_by_univariate_associations,
     filter_by_univariate_predictions,
 )
+from df_analyze.selection.multitarget import aggregate_wrapper_selected
 from df_analyze.selection.stepwise import (
     StepwiseSelector,
     stepwise_select,
@@ -48,6 +49,62 @@ from df_analyze.testing.datasets import (
 DATA = ROOT / "data/banking/bank.json"
 RUNTIMES = ROOT / "runtimes"
 RUNTIMES.mkdir(exist_ok=True)
+
+
+def test_multitarget_wrapper_aggregation_uses_oriented_scores() -> None:
+    first = WrapperSelected(
+        method=WrapperSelection.StepUp,
+        model=WrapperSelectionModel.Linear,
+        selected=["feature_a", "feature_b"],
+        scores={"feature_a": -0.2, "feature_b": -0.8},
+        redundants=[],
+        early_stop=False,
+        is_classification=False,
+    )
+    second = WrapperSelected(
+        method=WrapperSelection.StepUp,
+        model=WrapperSelectionModel.Linear,
+        selected=["feature_a", "feature_b"],
+        scores={"feature_a": -0.1, "feature_b": -0.7},
+        redundants=[],
+        early_stop=False,
+        is_classification=False,
+    )
+
+    selected = aggregate_wrapper_selected(
+        [first, second], target_names=["a", "b"], top_k=1
+    )
+
+    assert selected is not None
+    assert selected.selected == ["feature_a"]
+
+
+def test_multitarget_aggregation_without_top_k_keeps_union() -> None:
+    first = WrapperSelected(
+        method=WrapperSelection.StepUp,
+        model=WrapperSelectionModel.Linear,
+        selected=["a", "b"],
+        scores={"a": 2.0, "b": 1.0},
+        redundants=[],
+        early_stop=False,
+        is_classification=True,
+    )
+    second = WrapperSelected(
+        method=WrapperSelection.StepUp,
+        model=WrapperSelectionModel.Linear,
+        selected=["c", "d"],
+        scores={"c": 2.0, "d": 1.0},
+        redundants=[],
+        early_stop=False,
+        is_classification=True,
+    )
+
+    selected = aggregate_wrapper_selected(
+        [first, second], target_names=["a", "b"], top_k=None
+    )
+
+    assert selected is not None
+    assert set(selected.selected) == {"a", "b", "c", "d"}
 
 
 def do_association_select(dataset: tuple[str, TestDataset]) -> FilterSelected:
@@ -155,9 +212,7 @@ def estimate_select(
             handle.write(
                 f"{'dsname':>40}  {'N':>6}  {'N_sub':>6}  {'p':>5}  {'n_iter':>6}  {'minutes':>4}\n"
             )
-        handle.write(
-            f"{dsname:>40}  {N:>6d}  {n:>6d}  {p:5d}  {m:>6d}  {minutes:3.1f}\n"
-        )
+        handle.write(f"{dsname:>40}  {N:>6d}  {n:>6d}  {p:5d}  {m:>6d}  {minutes:3.1f}\n")
         handle.flush()
 
     return minutes
@@ -223,9 +278,7 @@ def estimate_knn_backward_select(
     estimate_select(dataset, file=file, forward=False, model=model, subsample=subsample)
 
 
-def do_redundant_report(
-    dataset: tuple[str, TestDataset], capsys: CaptureFixture
-) -> None:
+def do_redundant_report(dataset: tuple[str, TestDataset], capsys: CaptureFixture) -> None:
     dsname, ds = dataset
     if dsname == "internet_usage":  # undersampled target
         return
@@ -397,9 +450,7 @@ def do_logged(
             handle.write(
                 f"{'dsname':>40}  {'N':>6}  {'N_sub':>6}  {'p':>5}  {'n_iter':>6}  {'minutes':>4}\n"
             )
-        handle.write(
-            f"{dsname:>40}  {N:>6d}  {n:>6d}  {p:5d}  {m:>6d}  {elapsed:3.1f}\n"
-        )
+        handle.write(f"{dsname:>40}  {N:>6d}  {n:>6d}  {p:5d}  {m:>6d}  {elapsed:3.1f}\n")
 
 
 @fast_ds

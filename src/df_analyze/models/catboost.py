@@ -19,6 +19,7 @@ from pandas import DataFrame, Series
 from df_analyze._constants import SEED
 from df_analyze.enumerables import Scorer
 from df_analyze.models.base import DfAnalyzeModel
+from df_analyze.runtime.hardware import RuntimeComponent
 from df_analyze.splitting import OmniKFold
 
 try:
@@ -27,14 +28,9 @@ try:
 except ImportError as exc:
     CBCatBoostClassifier = None
     CBCatBoostRegressor = None
-    _CATBOOST_GPU_DEVICE_COUNT = None
     _CATBOOST_IMPORT_ERROR = exc
 else:
     _CATBOOST_IMPORT_ERROR = None
-    try:
-        from catboost.utils import get_gpu_device_count as _CATBOOST_GPU_DEVICE_COUNT
-    except ImportError:
-        _CATBOOST_GPU_DEVICE_COUNT = None
 
 
 class CatBoostEstimator(DfAnalyzeModel):
@@ -63,23 +59,9 @@ class CatBoostEstimator(DfAnalyzeModel):
                 "CatBoost is not installed. Install it with `pip install catboost`."
             ) from _CATBOOST_IMPORT_ERROR
 
-    def _has_gpu(self) -> bool:
-        if _CATBOOST_GPU_DEVICE_COUNT is not None:
-            try:
-                return _CATBOOST_GPU_DEVICE_COUNT() > 0
-            except Exception:
-                return False
-        try:
-            import torch
-
-            return bool(torch.cuda.is_available())
-        except Exception:
-            return False
-
     def _maybe_use_gpu(self, kwargs: dict[str, Any]) -> None:
         task_type = str(kwargs.get("task_type", "")).upper()
-        has_gpu = self._has_gpu()
-        if has_gpu:
+        if self.runtime.device_for(RuntimeComponent.CatBoost) == "cuda":
             kwargs["task_type"] = "GPU"
             kwargs.setdefault("devices", "0")
             return
@@ -240,8 +222,9 @@ class CatBoostEstimator(DfAnalyzeModel):
         y_train: Union[Series, DataFrame],
         g_train: Optional[Series],
         metric: Scorer,
-        n_folds: int = 5,
+        n_folds: Optional[int] = None,
     ) -> Callable[[Trial], float]:
+        n_folds = self.resolve_tuning_cv_folds(n_folds)
         self._assert_available()
         self._set_target_cols(y_train)
         y_df = y_train.to_frame() if isinstance(y_train, Series) else y_train
@@ -253,9 +236,19 @@ class CatBoostEstimator(DfAnalyzeModel):
             grouped=g_train is not None,
             labels=None,
             warn_on_fallback=False,
+            allow_group_fallback=False,
             df_analyze_phase="Tuning internal splits",
         )
-        splits, _ = kf.split(X_train=X_train, y_train=y_split, g_train=g_train)
+        splits, _ = kf.split(
+            X_train=X_train,
+            y_train=y_split,
+            g_train=g_train,
+            multitarget_y=(
+                y_df
+                if self.is_classifier and y_df.shape[1] > 1
+                else None
+            ),
+        )
 
         def objective(trial: Trial) -> float:
             opt_args = self.optuna_args(trial)
@@ -267,6 +260,7 @@ class CatBoostEstimator(DfAnalyzeModel):
             }
             self._maybe_use_gpu(full_args)
             scores = []
+            scores_by_target: dict[str, list[float]] = {}
             for step, (idx_train, idx_test) in enumerate(splits):
                 X_tr = X_train.iloc[idx_train]
                 X_te = X_train.iloc[idx_test]
@@ -280,12 +274,21 @@ class CatBoostEstimator(DfAnalyzeModel):
                 model = self._fit_target_models(X=X_tr, y=y_fit, kwargs=full_args)
                 preds = self._predict_from_model(model, X_te)
                 pred_df = self._preds_to_df(preds, y_te, y_te.index)
-                score = self._mean_tuning_score(metric, y_te, pred_df)
+                target_scores = self._tuning_scores_by_target(
+                    metric=metric,
+                    y_true_df=y_te,
+                    y_pred_df=pred_df,
+                    y_baseline_df=y_df,
+                )
+                for target, target_score in target_scores.items():
+                    scores_by_target.setdefault(target, []).append(target_score)
+                score = float(np.nanmean(list(target_scores.values())))
 
                 scores.append(score)
                 trial.report(float(np.mean(scores)), step=step)
                 if trial.should_prune():
                     raise optuna.TrialPruned()
+            self._record_trial_target_scores(trial, scores_by_target)
             return float(np.mean(scores))
 
         return objective
@@ -303,8 +306,7 @@ class CatBoostEstimator(DfAnalyzeModel):
         self._assert_available()
         base_args = {**self.fixed_args, **self.default_args, **self.model_args}
         self._maybe_use_gpu(base_args)
-        if self._uses_gpu(base_args):
-            n_jobs = 1
+        n_jobs = self.runtime.tuning_jobs(RuntimeComponent.CatBoost, n_jobs)
         return super().htune_optuna(
             X_train=X_train,
             y_train=y_train,

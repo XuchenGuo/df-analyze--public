@@ -11,10 +11,11 @@ ROOT = Path(__file__).resolve().parent.parent.parent  # isort: skip
 sys.path.append(str(ROOT))  # isort: skip
 # fmt: on
 
-from df_analyze.models.base import DfAnalyzeModel
 from sklearn.linear_model import ElasticNet, LogisticRegression
 from sklearn.linear_model import SGDClassifier as SklearnSGDClassifier
 from sklearn.linear_model import SGDRegressor as SklearnSGDRegressor
+
+from df_analyze.models.base import DfAnalyzeModel
 
 # https://scikit-learn.org/stable/auto_examples/linear_model/plot_quantile_regression.html
 
@@ -57,7 +58,7 @@ class LRClassifier(DfAnalyzeModel):
         super().__init__(model_args)
         self.is_classifier = True
         self.model_cls = LogisticRegression
-        self.fixed_args = dict(max_iter=2000, penalty="elasticnet", solver="saga")
+        self.fixed_args = dict(max_iter=2000, solver="saga")
         self.default_args = dict(l1_ratio=0.5)
 
     def model_cls_args(self, full_args: dict[str, Any]) -> tuple[type, dict[str, Any]]:
@@ -79,7 +80,9 @@ class SGDClassifier(DfAnalyzeModel):
         super().__init__(model_args)
         self.is_classifier = True
         self.model_cls = SklearnSGDClassifier
-        self.default_args = dict(learning_rate="adaptive", penalty="l2", eta0=3e-4)
+        self.default_args = dict(
+            loss="log_loss", learning_rate="adaptive", penalty="l2", eta0=3e-4
+        )
 
     def model_cls_args(self, full_args: dict[str, Any]) -> tuple[type, dict[str, Any]]:
         return self.model_cls, full_args

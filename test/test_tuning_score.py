@@ -9,6 +9,7 @@ sys.path.append(str(ROOT))  # isort: skip
 
 import logging
 import sys
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -35,6 +36,7 @@ from df_analyze.models.linear import (
     SGDRegressor,
 )
 from df_analyze.models.svm import SVMClassifier, SVMRegressor
+from df_analyze.scoring import robust_auroc_score
 from df_analyze.testing.datasets import fake_data
 
 
@@ -84,6 +86,43 @@ def check_optuna_tune(
 
 CLS_SCORERS = [*ClassifierScorer]
 REG_SCORERS = [*RegressorScorer]
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize(
+    ("metric", "y_pred"),
+    [
+        (ClassifierScorer.PPV, np.zeros(4, dtype=int)),
+        (ClassifierScorer.NPV, np.ones(4, dtype=int)),
+    ],
+)
+def test_undefined_predictive_value_is_zero_only_for_tuning(
+    metric: ClassifierScorer, y_pred: ndarray
+) -> None:
+    y_true = np.asarray([0, 1, 0, 1])
+
+    assert metric.tuning_score(y_true, y_pred) == 0.0
+    assert np.isnan(ClassifierScorer.get_scores(y_true, y_pred, None)[metric.value])
+
+
+@pytest.mark.fast
+def test_multiclass_auroc_is_nan_when_a_fold_omits_a_class() -> None:
+    y_true = np.asarray([0, 1, 0, 1])
+    y_prob = np.asarray(
+        [
+            [0.7, 0.2, 0.1],
+            [0.2, 0.7, 0.1],
+            [0.6, 0.3, 0.1],
+            [0.1, 0.8, 0.1],
+        ]
+    )
+
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        score = robust_auroc_score(y_true, y_prob)
+
+    assert np.isnan(score)
+    assert len(recorded) == 0
 
 
 @pytest.mark.fast

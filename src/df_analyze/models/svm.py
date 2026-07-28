@@ -72,11 +72,9 @@ class SVMClassifier(SVMEstimator):
         self.needs_calibration = True
         self.model_cls = SVC
 
-    def fit(self, X_train: DataFrame, y_train: Series) -> None:
-        if self.model is None:
-            kwargs = {**self.fixed_args, **self.model_args}
-            self.model = self.model_cls(**kwargs)
-        self.model.fit(X_train, y_train)  # type: ignore
+    def fit(self, X_train: DataFrame, y_train: Series | DataFrame) -> None:
+        """Use the shared calibration and multi-target fitting path."""
+        super().fit(X_train=X_train, y_train=y_train)
 
 
 class SVMRegressor(SVMEstimator):

@@ -19,8 +19,11 @@ from pandas import DataFrame
 from df_analyze._constants import N_CAT_LEVEL_MIN
 from df_analyze.enumerables import NanHandling
 from df_analyze.preprocessing.cleaning import (
+    clean_regression_target,
+    clean_regression_targets,
     deflate_categoricals,
     encode_categoricals,
+    encode_targets,
     handle_continuous_nans,
 )
 from df_analyze.preprocessing.inspection.inspection import (
@@ -33,6 +36,70 @@ from df_analyze.testing.datasets import (
     fast_ds,
     med_ds,
 )
+
+
+def test_encode_targets_keeps_low_support_rows() -> None:
+    n = 30
+    df = DataFrame(
+        {
+            "feature": np.arange(n),
+            "target_a": [0] * 28 + [1, 1],
+            "target_b": np.tile([0, 1], n // 2),
+        }
+    )
+
+    cleaned, y, labels, _, _ = encode_targets(df, ["target_a", "target_b"], None, None)
+
+    assert len(cleaned) == n
+    assert len(y) == n
+    assert list(y.columns) == ["target_a", "target_b"]
+    assert labels["target_a"] == {0: "0", 1: "1"}
+
+
+def test_clean_regression_targets_preserves_units() -> None:
+    df = DataFrame(
+        {
+            "feature": [1, 2, 3, 4],
+            "target_a": [10.0, 20.0, "NA", 40.0],
+            "target_b": [100.0, 200.0, 300.0, 400.0],
+        }
+    )
+
+    cleaned, y, _, _ = clean_regression_targets(df, ["target_a", "target_b"], None, None)
+
+    assert cleaned["feature"].tolist() == [1, 2, 4]
+    assert y["target_a"].tolist() == [10.0, 20.0, 40.0]
+    assert y["target_b"].tolist() == [100.0, 200.0, 400.0]
+
+
+def test_clean_regression_target_preserves_units() -> None:
+    df = DataFrame({"feature": [1, 2, 3], "target": [10.0, "NA", 30.0]})
+
+    cleaned, y, _, _ = clean_regression_target(df, df["target"], None, None)
+
+    assert cleaned["feature"].tolist() == [1, 3]
+    assert y.tolist() == [10.0, 30.0]
+
+
+@pytest.mark.parametrize("value", [np.inf, -np.inf])
+def test_clean_regression_target_rejects_infinite_values(value: float) -> None:
+    df = DataFrame({"feature": [1, 2, 3], "target": [10.0, value, 30.0]})
+
+    with pytest.raises(ValueError, match="contains infinite values"):
+        clean_regression_target(df, df["target"], None, None)
+
+
+def test_clean_regression_targets_rejects_infinite_values() -> None:
+    df = DataFrame(
+        {
+            "feature": [1, 2, 3],
+            "target_a": [10.0, 20.0, 30.0],
+            "target_b": [1.0, np.inf, 3.0],
+        }
+    )
+
+    with pytest.raises(ValueError, match="'target_b' contains infinite values"):
+        clean_regression_targets(df, ["target_a", "target_b"], None, None)
 
 
 def no_cats(df: DataFrame, target: str) -> bool:

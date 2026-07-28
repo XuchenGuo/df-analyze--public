@@ -9,8 +9,6 @@ sys.path.append(str(ROOT))  # isort: skip
 sys.path.append(str(SRC))  # isort: skip
 # fmt: on
 
-import sys
-from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pytest
@@ -23,6 +21,7 @@ from transformers.models.xlm_roberta.tokenization_xlm_roberta_fast import (
     XLMRobertaTokenizerFast,
 )
 
+from df_analyze.embedding import download as download_module
 from df_analyze.embedding.cli import EmbeddingModality, EmbeddingOptions
 from df_analyze.embedding.datasets import (
     EmbeddingDataset,
@@ -30,8 +29,11 @@ from df_analyze.embedding.datasets import (
     dataset_from_opts,
 )
 from df_analyze.embedding.download import (
+    INTFLOAT_MODEL_FILES,
+    INTFLOAT_TOKENIZER_FILES,
+    SIGLIP_MODEL_FILES,
+    SIGLIP_PREPROCESSOR_FILES,
     dl_models_from_opts,
-    download_models,
     error_if_download_needed,
 )
 from df_analyze.embedding.embed import (
@@ -48,20 +50,20 @@ from df_analyze.embedding.testing import (
     vision_padding_check,
 )
 
-INTFLOAT_MULTILINGUAL_MODEL = ROOT / "downloaded_models/intfloat_multi_large/model"
-INTFLOAT_MULTILINGUAL_TOKENIZER = (
-    ROOT / "downloaded_models/intfloat_multi_large/tokenizer"
-)
-INTFLOAT_MULTILINGUAL_MODEL.mkdir(exist_ok=True, parents=True)
-INTFLOAT_MULTILINGUAL_TOKENIZER.mkdir(exist_ok=True, parents=True)
-
-SIGLIP_MODEL = ROOT / "downloaded_models/siglip_so400m_patch14_384/model"
-SIGLIP_PREPROCESSOR = ROOT / "downloaded_models/siglip_so400m_patch14_384/preprocessor"
-
 MACOS_NLP_RUNTIMES = ROOT / "nlp_embed_runtimes.parquet"
 MACOS_VISION_RUNTIMES = ROOT / "vision_embed_runtimes.parquet"
 NIAGARA_NLP_RUNTIMES = ROOT / "nlp_embed_runtimes_niagara.parquet"
 NIAGARA_VISION_RUNTIMES = ROOT / "vision_embed_runtimes_niagara.parquet"
+NLP_TEST_DATA = ROOT / "data/testing/embedding/NLP"
+HAS_NLP_TEST_DATA = any(path.is_dir() for path in NLP_TEST_DATA.glob("*"))
+VISION_TEST_DATA = ROOT / "data/testing/embedding/vision"
+HAS_VISION_TEST_DATA = any(path.is_dir() for path in VISION_TEST_DATA.glob("*"))
+HAS_NLP_MODEL = all(
+    path.is_file() for path in [*INTFLOAT_MODEL_FILES, *INTFLOAT_TOKENIZER_FILES]
+)
+HAS_VISION_MODEL = all(
+    path.is_file() for path in [*SIGLIP_MODEL_FILES, *SIGLIP_PREPROCESSOR_FILES]
+)
 
 
 @pytest.mark.fast
@@ -73,6 +75,7 @@ def test_vision_random(capsys: CaptureFixture) -> None:
 
 
 @pytest.mark.fast
+@pytest.mark.skipif(not HAS_NLP_TEST_DATA, reason="NLP test data is not installed")
 def test_main_ds_nlp_loading(capsys: CaptureFixture) -> None:
     test_dses = NLPTestingDataset.get_all()
     dses = [ds.to_embedding_dataset() for ds in test_dses]
@@ -99,6 +102,10 @@ def test_main_ds_vision_loading(capsys: CaptureFixture) -> None:
 
 
 @pytest.mark.fast
+@pytest.mark.skipif(
+    not (HAS_NLP_TEST_DATA and HAS_NLP_MODEL),
+    reason="NLP test data or model is not installed",
+)
 def test_nlp_embed(capsys: CaptureFixture) -> None:
     model, tokenizer = get_model(EmbeddingModality.NLP)
     assert isinstance(model, XLMRobertaModel)
@@ -149,7 +156,8 @@ def _main_loop(ds: EmbeddingDataset, tempdir: str, modality: EmbeddingModality) 
     # print(f"Saved embeddings to {opts.outpath}")
 
 
-@pytest.mark.fast
+@pytest.mark.slow
+@pytest.mark.skipif(not HAS_VISION_MODEL, reason="Vision model is not installed")
 def test_vision_embed(capsys: CaptureFixture) -> None:
     model, processor = get_model(EmbeddingModality.Vision)
     assert isinstance(model, SiglipModel)
@@ -173,7 +181,8 @@ def test_vision_embed(capsys: CaptureFixture) -> None:
             assert df.shape[1] == 1152 + 1
 
 
-@pytest.mark.fast
+@pytest.mark.slow
+@pytest.mark.skipif(not HAS_VISION_MODEL, reason="Vision model is not installed")
 def test_main_vision(capsys: CaptureFixture) -> None:
     with capsys.disabled():
         dses = VisionTestingDataset.get_all_cls()
@@ -191,6 +200,10 @@ def test_main_vision(capsys: CaptureFixture) -> None:
 
 
 @pytest.mark.fast
+@pytest.mark.skipif(
+    not (HAS_NLP_TEST_DATA and HAS_NLP_MODEL),
+    reason="NLP test data or model is not installed",
+)
 def test_main_nlp(capsys: CaptureFixture) -> None:
     with capsys.disabled():
         for ds in tqdm(NLPTestingDataset.get_all(), desc="Processing NLP datasets"):
@@ -205,24 +218,56 @@ def test_main_nlp(capsys: CaptureFixture) -> None:
 
 
 @pytest.mark.fast
-def test_download_models(capsys: CaptureFixture) -> None:
-    with capsys.disabled():
-        download_models()
+def test_download_models(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    present = tmp_path / "present"
+    missing = tmp_path / "missing"
+    present.touch()
+    calls = []
+    monkeypatch.setattr(download_module, "INTFLOAT_MODEL_FILES", [present])
+    monkeypatch.setattr(download_module, "INTFLOAT_TOKENIZER_FILES", [missing])
+    monkeypatch.setattr(download_module, "SIGLIP_MODEL_FILES", [present])
+    monkeypatch.setattr(download_module, "SIGLIP_PREPROCESSOR_FILES", [missing])
+    monkeypatch.setattr(
+        download_module,
+        "download_nlp_intfloat_ml_model",
+        lambda force=False: calls.append(("nlp", force)),
+    )
+    monkeypatch.setattr(
+        download_module,
+        "download_siglip_model",
+        lambda force=False: calls.append(("vision", force)),
+    )
+
+    download_module.download_models()
+
+    assert calls == [("nlp", False), ("vision", False)]
 
 
 @pytest.mark.med
+@pytest.mark.skipif(
+    not (HAS_VISION_TEST_DATA and HAS_VISION_MODEL),
+    reason="Vision test data or model is not installed",
+)
 def test_vision_padding(capsys: CaptureFixture) -> None:
     with capsys.disabled():
         vision_padding_check()
 
 
 @pytest.mark.slow
+@pytest.mark.skipif(
+    not (HAS_VISION_TEST_DATA and HAS_VISION_MODEL),
+    reason="Vision test data or model is not installed",
+)
 def test_cluster_sanity_vision(capsys: CaptureFixture) -> None:
     with capsys.disabled():
         cluster_vision_sanity_check(n_samples=32)
 
 
 @pytest.mark.slow
+@pytest.mark.skipif(
+    not (HAS_NLP_TEST_DATA and HAS_NLP_MODEL),
+    reason="NLP test data or model is not installed",
+)
 def test_cluster_sanity_nlp(capsys: CaptureFixture) -> None:
     with capsys.disabled():
         cluster_nlp_sanity_check(n_samples=128)

@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING, Optional, Type, Union
 from df_analyze.cli.parsing import (
     resolved_path,
 )
+from df_analyze.runtime.hardware import DeviceIntent, RuntimePolicy, get_runtime
+from df_analyze.runtime.install import DeviceInstall
 
 if TYPE_CHECKING:
     pass
@@ -213,6 +215,15 @@ generally be a small integer value like 2, 4, or 8.
 
 """
 
+DEVICE_HELP = """
+Runtime device: auto, cpu, or cuda. Auto uses CUDA when the installed PyTorch
+can use it. CUDA falls back to CPU with a warning when unavailable.
+"""
+
+DEVICE_INSTALL_HELP = """
+Managed CUDA PyTorch setup policy: auto, ask, or never. Defaults to never.
+"""
+
 
 class EmbeddingModality(Enum):
     NLP = "nlp"
@@ -230,6 +241,8 @@ class EmbeddingOptions(Debug):
         batch_size: Optional[int] = 2,
         download: bool = False,
         force_download: bool = False,
+        device: Union[str, DeviceIntent] = DeviceIntent.Auto,
+        device_install: Union[str, DeviceInstall, None] = None,
     ) -> None:
         # memoization-related
         # other
@@ -247,6 +260,14 @@ class EmbeddingOptions(Debug):
         self.download: bool = download
         self.force_download: bool = force_download
         self.any_download = any_download
+        self.device = DeviceIntent.from_arg(device)
+        self.device_install = DeviceInstall.from_arg(
+            device_install, self.device.value
+        )
+
+    @property
+    def runtime(self) -> RuntimePolicy:
+        return get_runtime(self.device)
 
     @staticmethod
     def validate_datapath(df_path: Optional[Path], any_download: bool) -> Optional[Path]:
@@ -280,6 +301,8 @@ class EmbeddingOptions(Debug):
             batch_size=args.batch_size,
             download=args.download,
             force_download=args.force_download,
+            device=args.device,
+            device_install=args.device_install,
         )
 
     def __str__(self) -> str:
@@ -355,6 +378,20 @@ def make_parser() -> ArgumentParser:
         type=pos_int,
         default=2,
         help=BATCH_HELP,
+    )
+    parser.add_argument(
+        "--device",
+        type=DeviceIntent.parse,
+        choices=DeviceIntent.choices(),
+        default=DeviceIntent.Auto.value,
+        help=DEVICE_HELP,
+    )
+    parser.add_argument(
+        "--device-install",
+        type=DeviceInstall.parse,
+        choices=DeviceInstall.choices(),
+        default=None,
+        help=DEVICE_INSTALL_HELP,
     )
     parser.add_argument(
         "--download",

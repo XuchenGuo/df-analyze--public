@@ -28,7 +28,11 @@ def get_n_test_samples(n_samples: Optional[int] = None) -> int:
 
 def get_reg_stratify(y: Series) -> Series:
     yy = y.to_numpy().reshape(-1, 1)
-    kb = KBinsDiscretizer(n_bins=5, encode="ordinal")
+    kb = KBinsDiscretizer(
+        n_bins=5,
+        encode="ordinal",
+        quantile_method="linear",
+    )
     strat = kb.fit_transform(yy)
     strat = strat.ravel()
     strat = Series(name=y.name, data=strat)

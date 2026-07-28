@@ -1,6 +1,7 @@
 # transforms multi-target EvaluationResults into single-target EvaluationResults especially for the adaptive error rate analysis.
 from __future__ import annotations
 
+import inspect
 from typing import Any, Optional, Union
 
 import numpy as np
@@ -125,12 +126,30 @@ def _target_names(eval_results: EvaluationResults) -> list[str]:
     return []
 
 
-def _init_model_for_target(model_cls, y_train: Series):
-    try:
-        return model_cls()
-    except TypeError:
-        n_classes = len(np.unique(np.asarray(y_train)))
-        return model_cls(num_classes=n_classes)
+def _init_model_for_target(
+    model_cls,
+    y_train: Series,
+    is_classification: bool,
+    runtime=None,
+    model_args=None,
+):
+    parameters = inspect.signature(model_cls).parameters
+    kwargs = {}
+    if "num_classes" in parameters:
+        from df_analyze.models.base import classification_output_dim
+
+        kwargs["num_classes"] = (
+            classification_output_dim(y_train) if is_classification else 1
+        )
+    if "model_args" in parameters and model_args is not None:
+        kwargs["model_args"] = dict(model_args)
+    model = model_cls(**kwargs)
+    if runtime is not None:
+        model.set_runtime(runtime)
+    set_targets = getattr(model, "_set_targets", None)
+    if callable(set_targets):
+        set_targets(y_train)
+    return model
 
 
 def _eval_results_for_target(
@@ -159,6 +178,8 @@ def _eval_results_for_target(
             per_target_df = df_target.copy()
     elif "target" in df_target.columns:
         per_target_df = df_target.copy()
+    if per_target_df is not None:
+        df_target = per_target_df.copy()
 
     target_names = _target_names(eval_results)
     target_index = None
@@ -199,31 +220,28 @@ def _eval_results_for_target(
             target_cols=target_names,
         )
 
-        model = _init_model_for_target(res.model_cls, prep_train_t.y)
+        model = _init_model_for_target(
+            res.model_cls,
+            prep_train_t.y,
+            is_classification=eval_results.is_classification,
+            runtime=getattr(res.model, "runtime", None),
+            model_args=getattr(res.model, "model_args", None),
+        )
 
         need_proba = bool(eval_results.is_classification)
-        if preds_test is None or preds_train is None or (
-            need_proba and probs_test is None
+        if (
+            preds_test is None
+            or preds_train is None
+            or (need_proba and probs_test is None)
         ):
             preds_test = Series(dtype=float)
             preds_train = Series(dtype=float)
             probs_test = None
             probs_train = None
-        score = res.score
-        y_true_t = prep_test_t.y
-        if len(preds_test) > 0:
-            if isinstance(y_true_t, Series) and len(y_true_t) == len(preds_test):
-                score = float(
-                    res.metric.tuning_score(y_true_t.to_numpy(), preds_test.to_numpy())
-                )
-            elif isinstance(y_true_t, DataFrame):
-                if y_true_t.shape[1] == 1 and len(y_true_t) == len(preds_test):
-                    score = float(
-                        res.metric.tuning_score(
-                            y_true_t.iloc[:, 0].to_numpy(), preds_test.to_numpy()
-                        )
-                    )
-
+        per_target_tuning_scores = getattr(
+            res, "per_target_tuning_scores", {}
+        )
+        score = float(per_target_tuning_scores.get(str(target), res.score))
         results.append(
             HtuneResult(
                 selection=res.selection,
@@ -239,6 +257,13 @@ def _eval_results_for_target(
                 probs_test=probs_test,
                 probs_train=probs_train,
                 target=target,
+                downsample_requested=res.downsample_requested,
+                downsample_resolved=res.downsample_resolved,
+                n_downsampled_features=res.n_downsampled_features,
+                failure_reason=res.failure_reason,
+                per_target_tuning_scores=(
+                    {str(target): score} if np.isfinite(score) else {}
+                ),
             )
         )
 

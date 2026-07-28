@@ -327,7 +327,10 @@ def fake_data(
 
     if mode == "classify":
         encoder = KBinsDiscretizer(
-            n_bins=num_classes, encode="ordinal", strategy="quantile"
+            n_bins=num_classes,
+            encode="ordinal",
+            strategy="quantile",
+            quantile_method="linear",
         )
         encoder.fit(np.concatenate([y_tr.ravel(), y_test.ravel()]).reshape(-1, 1))
         y_tr = encoder.transform(y_tr.reshape(-1, 1))

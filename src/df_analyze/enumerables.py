@@ -49,6 +49,18 @@ def is_catboost_available() -> bool:
     return find_spec("catboost") is not None
 
 
+def is_xgboost_available() -> bool:
+    return find_spec("xgboost") is not None
+
+
+def is_tabpfn_available() -> bool:
+    return find_spec("tabpfn") is not None
+
+
+def is_kan_available() -> bool:
+    return find_spec("kan") is not None
+
+
 class RandEnum(Generic[T]):
     @classmethod
     def random(cls: Type[T]) -> T:
@@ -104,7 +116,6 @@ class RandEnum(Generic[T]):
 
     @classmethod
     def from_args(cls: Type[T], args: Sequence[str]) -> tuple[T, ...]:
-        print(type(args), args)
         if args is None:
             return tuple()
         if isinstance(args, list) or isinstance(args, tuple):
@@ -154,12 +165,17 @@ class Scorer:
 
 class DfAnalyzeClassifier(RandEnum, Enum):
     CatBoost = "catboost"
+    XGBoost = "xgb"
+    TabPFN = "tabpfn"
+    DecisionTree = "dtree"
+    ExtraTrees = "et"
     KNN = "knn"
     LGBM = "lgbm"
     RF = "rf"
     LR = "lr"
     SGD = "sgd"
     MLP = "mlp"
+    KAN = "kan"
     SVM = "svm"
     GANDALF = "gandalf"
     Dummy = "dummy"
@@ -169,8 +185,17 @@ class DfAnalyzeClassifier(RandEnum, Enum):
             from df_analyze.models.catboost import CatBoostClassifier
 
             return CatBoostClassifier
+        if self is DfAnalyzeClassifier.XGBoost:
+            from df_analyze.models.xgboost import XGBoostClassifier
+
+            return XGBoostClassifier
+        if self is DfAnalyzeClassifier.TabPFN:
+            from df_analyze.models.tabpfn import TabPFNClassifierV3
+
+            return TabPFNClassifierV3
         from df_analyze.models.dummy import DummyClassifier
         from df_analyze.models.gandalf import GandalfEstimator
+        from df_analyze.models.kan import KANEstimator
         from df_analyze.models.knn import KNNClassifier
         from df_analyze.models.lgbm import (
             LightGBMClassifier,
@@ -179,14 +204,21 @@ class DfAnalyzeClassifier(RandEnum, Enum):
         from df_analyze.models.linear import LRClassifier, SGDClassifier
         from df_analyze.models.mlp import MLPEstimator
         from df_analyze.models.svm import SVMClassifier
+        from df_analyze.models.trees import (
+            DecisionTreeClassifier,
+            ExtraTreesClassifier,
+        )
 
         return {
+            DfAnalyzeClassifier.DecisionTree: DecisionTreeClassifier,
+            DfAnalyzeClassifier.ExtraTrees: ExtraTreesClassifier,
             DfAnalyzeClassifier.KNN: KNNClassifier,
             DfAnalyzeClassifier.LGBM: LightGBMClassifier,
             DfAnalyzeClassifier.RF: LightGBMRFClassifier,
             DfAnalyzeClassifier.LR: LRClassifier,
             DfAnalyzeClassifier.SGD: SGDClassifier,
             DfAnalyzeClassifier.MLP: MLPEstimator,
+            DfAnalyzeClassifier.KAN: KANEstimator,
             DfAnalyzeClassifier.SVM: SVMClassifier,
             DfAnalyzeClassifier.GANDALF: GandalfEstimator,
             DfAnalyzeClassifier.Dummy: DummyClassifier,
@@ -205,12 +237,17 @@ class DfAnalyzeClassifier(RandEnum, Enum):
 
 class DfAnalyzeRegressor(RandEnum, Enum):
     CatBoost = "catboost"
+    XGBoost = "xgb"
+    TabPFN = "tabpfn"
+    DecisionTree = "dtree"
+    ExtraTrees = "et"
     KNN = "knn"
     LGBM = "lgbm"
     RF = "rf"
     ElasticNet = "elastic"
     SGD = "sgd"
     MLP = "mlp"
+    KAN = "kan"
     SVM = "svm"
     GANDALF = "gandalf"
     Dummy = "dummy"
@@ -220,8 +257,17 @@ class DfAnalyzeRegressor(RandEnum, Enum):
             from df_analyze.models.catboost import CatBoostRegressor
 
             return CatBoostRegressor
+        if self is DfAnalyzeRegressor.XGBoost:
+            from df_analyze.models.xgboost import XGBoostRegressor
+
+            return XGBoostRegressor
+        if self is DfAnalyzeRegressor.TabPFN:
+            from df_analyze.models.tabpfn import TabPFNRegressorV3
+
+            return TabPFNRegressorV3
         from df_analyze.models.dummy import DummyRegressor
         from df_analyze.models.gandalf import GandalfEstimator
+        from df_analyze.models.kan import KANEstimator
         from df_analyze.models.knn import KNNRegressor
         from df_analyze.models.lgbm import (
             LightGBMRegressor,
@@ -230,14 +276,18 @@ class DfAnalyzeRegressor(RandEnum, Enum):
         from df_analyze.models.linear import ElasticNetRegressor, SGDRegressor
         from df_analyze.models.mlp import MLPEstimator
         from df_analyze.models.svm import SVMRegressor
+        from df_analyze.models.trees import DecisionTreeRegressor, ExtraTreesRegressor
 
         return {
+            DfAnalyzeRegressor.DecisionTree: DecisionTreeRegressor,
+            DfAnalyzeRegressor.ExtraTrees: ExtraTreesRegressor,
             DfAnalyzeRegressor.KNN: KNNRegressor,
             DfAnalyzeRegressor.LGBM: LightGBMRegressor,
             DfAnalyzeRegressor.RF: LightGBMRFRegressor,
             DfAnalyzeRegressor.ElasticNet: ElasticNetRegressor,
             DfAnalyzeRegressor.SGD: SGDRegressor,
             DfAnalyzeRegressor.MLP: MLPEstimator,
+            DfAnalyzeRegressor.KAN: KANEstimator,
             DfAnalyzeRegressor.SVM: SVMRegressor,
             DfAnalyzeRegressor.GANDALF: GandalfEstimator,
             DfAnalyzeRegressor.Dummy: DummyRegressor,
@@ -252,6 +302,22 @@ class DfAnalyzeRegressor(RandEnum, Enum):
             DfAnalyzeRegressor.SGD.value,
             DfAnalyzeRegressor.ElasticNet.value,
         )
+
+
+class TabPFNVersion(RandEnum, Enum):
+    V3 = "v3"
+    V26 = "v2_6"
+    V25 = "v2_5"
+
+    @classmethod
+    def parse(cls, value: str) -> str:
+        return cls.from_arg(value).value
+
+    @classmethod
+    def from_arg(cls, value: str | TabPFNVersion) -> TabPFNVersion:
+        if isinstance(value, cls):
+            return value
+        return cls(str(value).lower().replace(".", "_"))
 
 
 @dataclass
@@ -298,7 +364,12 @@ class ClassifierScorer(Scorer, RandEnum, Enum):
         }
         scorer = raws[item]
         kwargs = dict(average="macro") if self is ClassifierScorer.F1 else {}
-        return scorer(y_true, y_pred, **kwargs)
+        score = float(scorer(y_true, y_pred, **kwargs))
+        if self in (ClassifierScorer.PPV, ClassifierScorer.NPV) and not np.isfinite(
+            score
+        ):
+            return 0.0
+        return score
 
     def higher_is_better(self) -> bool:
         return True
@@ -445,6 +516,22 @@ class FeatureSelection(RandEnum, Enum):
     Filter = "filter"
     Embedded = "embed"
     Wrapper = "wrap"
+
+
+class FeatureDownsampleMethod(RandEnum, Enum):
+    None_ = "none"
+    Auto = "auto"
+    Random = "random"
+    Variance = "variance"
+    FTest = "f-test"
+    MutualInfo = "mutual-info"
+    Linear = "linear"
+    LGBM = "lgbm"
+    SVD = "svd"
+    SparseRandomProjection = "sparse-rp"
+    RankEnsemble = "rank-ensemble"
+    SelectorEnsemble = "selector-ensemble"
+    StableRank = "stable-rank"
 
 
 class ModelFeatureSelection(RandEnum, Enum):

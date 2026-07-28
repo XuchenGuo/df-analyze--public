@@ -30,13 +30,14 @@ def main() -> None:
     if opts.any_download:
         return
     ds = dataset_from_opts(opts)
-    model, processor = get_model(opts.modality)
+    model, processor = get_model(opts.modality, runtime=opts.runtime)
     df = get_embeddings(
         ds=ds,  # type: ignore
         processor=processor,  # type: ignore
         model=model,  # type: ignore
         batch_size=opts.batch_size,
         load_limit=opts.limit_samples,
+        runtime=opts.runtime,
     )
 
     # print(df)

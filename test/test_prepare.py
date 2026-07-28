@@ -15,6 +15,12 @@ from pandas import DataFrame
 from sklearn.utils.validation import check_X_y
 from tqdm import tqdm
 
+from df_analyze.preprocessing.inspection.inspection import inspect_data
+from df_analyze.preprocessing.prepare import (
+    _ensure_target_levels_in_training,
+    prepare_data,
+    raw_train_test_indices,
+)
 from df_analyze.testing.datasets import (
     FAST_INSPECTION,
     TestDataset,
@@ -22,6 +28,83 @@ from df_analyze.testing.datasets import (
     med_ds,
     slow_ds,
 )
+
+
+def test_multitarget_split_keeps_every_level_in_training() -> None:
+    n = 40
+    df = DataFrame(
+        {
+            "feature": np.arange(n),
+            "target_a": [1, *([0] * (n - 1))],
+            "target_b": [0, 1, *([0] * (n - 2))],
+        }
+    )
+
+    train, test, audit = raw_train_test_indices(
+        df,
+        ["target_a", "target_b"],
+        grouper=None,
+        is_classification=True,
+        test_size=0.8,
+        seed=42,
+    )
+
+    assert len(test) > 0
+    for target in ("target_a", "target_b"):
+        assert set(df.iloc[train][target]) == set(df[target])
+    if audit is not None and len(train) > int(round(n * 0.2)):
+        assert "Moved" in audit.reason
+
+
+def test_multitarget_training_coverage_moves_whole_groups() -> None:
+    y = DataFrame(
+        {
+            "target_a": [1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            "target_b": [0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
+        }
+    )
+    groups = pd.Series(np.repeat(np.arange(5), 2))
+
+    train, test, moved = _ensure_target_levels_in_training(
+        y,
+        np.array([2, 3, 4, 5]),
+        np.array([0, 1, 6, 7, 8, 9]),
+        groups,
+    )
+
+    assert moved == 4
+    assert set(groups.iloc[train]).isdisjoint(groups.iloc[test])
+    for target in y.columns:
+        assert set(y.iloc[train][target]) == set(y[target])
+
+
+def test_multitarget_preparation_report_contains_audit() -> None:
+    n = 49
+    df = DataFrame(
+        {
+            "feature": np.linspace(0.0, 1.0, n),
+            "target_a": [0] * 45 + [1] * 4,
+            "target_b": np.tile([0, 1], 25)[:n],
+        }
+    )
+    target_cols = ["target_a", "target_b"]
+    inspected, inspection = inspect_data(df, target_cols, _warn=False)
+
+    with pytest.warns(UserWarning, match="undersampled levels"):
+        prepared = prepare_data(
+            inspected,
+            target_cols,
+            grouper=None,
+            results=inspection,
+            is_classification=True,
+            _warn=False,
+        )
+
+    assert prepared.info is not None
+    assert prepared.info.multitarget_audit is not None
+    assert prepared.info.multitarget_audit.n_original_rows == n
+    assert prepared.info.multitarget_audit.n_final_rows == n
+    assert "Multi-Target Target Audit" in prepared.to_markdown()
 
 
 def do_prepare(dataset: tuple[str, TestDataset]) -> None:

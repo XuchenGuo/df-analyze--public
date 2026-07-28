@@ -1,6 +1,6 @@
 from pathlib import Path
 
-VERSION = "4.1.0"
+VERSION = "4.2.0"
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 DATADIR = ROOT / "data"
@@ -28,8 +28,6 @@ DATA_JSON = DATAFILE.parent / "mcic.json"
 CLEAN_JSON = DATAFILE.parent / "mcic_clean.json"
 UNCORRELATED = DATADIR / "mcic_uncorrelated_cols.json"
 
-CLASSIFIERS = ["rf", "svm", "dtree", "mlp", "bag", "dummy", "lgb"]
-REGRESSORS = ["linear", "rf", "svm", "adaboost", "gboost", "mlp", "knn", "lgb"]
 DIMENSION_REDUCTION = ["pca", "kpca", "umap"]
 WRAPPER_METHODS = ["step-up", "step-down"]
 UNIVARIATE_FILTER_METHODS = ["d", "auc", "pearson", "t-test", "u-test", "chi", "info"]
@@ -139,19 +137,8 @@ when running multi-target classification.
 
 Notes
 -----
-Kept separate from N_TARG_LEVEL_MIN so multi-target filtering heuristics can be
-tuned independently without changing single-target behavior.
-"""
-
-MULTITARGET_MAX_RARE_LEVEL_FRAC = 1.0 / 3.0
-"""
-Maximum fraction of multi-target dimensions in a row that may belong to
-undersampled target levels before that row is dropped.
-
-Notes
------
-Using one third means, for example, that a 3-target problem can retain rows
-with up to one rare label while still discarding rows dominated by rare labels.
+Kept separate from N_TARG_LEVEL_MIN so multi-target split warnings can be
+adjusted without changing single-target behavior.
 """
 
 N_TARG_LEVEL_MIN_INTERNAL = N_TARG_LEVEL_MIN // 2
@@ -280,3 +267,12 @@ N_FILTER_TOTAL_DEFAULT = 30
 P_FILTER_CONT_DEFAULT = 0.50
 P_FILTER_CAT_DEFAULT = 0.50
 P_FILTER_TOTAL_DEFAULT = 0.5
+
+N_FEAT_DOWNSAMPLE_DEFAULT = 1000
+DOWNSAMPLE_CHUNK_SIZE_DEFAULT = 25_000
+DOWNSAMPLE_SCORE_LIMIT = 500
+LARGE_FEATURE_THRESHOLD = 100_000
+EXTREME_FEATURE_THRESHOLD = 1_000_000
+DIRECT_DOWNSAMPLE_MAX_FEATURES = 50_000
+DOWNSAMPLE_MAX_CHUNK_BYTES = 512 * 1024**2
+DOWNSAMPLE_MAX_DENSE_BYTES = 2 * 1024**3

@@ -1,6 +1,5 @@
 import re
 import sys
-from math import ceil
 from pathlib import Path
 from shutil import get_terminal_size
 from typing import Optional
@@ -12,12 +11,11 @@ from numpy import ndarray
 from pandas import DataFrame, Series
 from sklearn.experimental import enable_iterative_imputer  # noqa
 from sklearn.impute import IterativeImputer, SimpleImputer
-from sklearn.preprocessing import LabelEncoder, MinMaxScaler, RobustScaler
+from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 from tqdm import tqdm
 
 from df_analyze._constants import (
     MAX_PERF_N_FEATURES,
-    MULTITARGET_MAX_RARE_LEVEL_FRAC,
     N_CAT_LEVEL_MIN,
     N_MULTITARGET_LEVEL_MIN,
     N_TARG_LEVEL_MIN,
@@ -195,7 +193,12 @@ def cleaning_inform(message: str) -> None:
     print(message, file=sys.stderr)
 
 
-def normalize(df: DataFrame, target: Optional[str], robust: bool = True) -> DataFrame:
+def normalize(
+    df: DataFrame,
+    target: Optional[str],
+    robust: bool = True,
+    fit_indices: Optional[ndarray] = None,
+) -> DataFrame:
     """
     Clip data to within twice of its "robust range" (range of 90% of the data),
     and then min-max normalize.
@@ -255,31 +258,41 @@ def normalize(df: DataFrame, target: Optional[str], robust: bool = True) -> Data
         X = df
 
     cols = X.columns
+    X_fit = X if fit_indices is None else X.iloc[fit_indices]
 
     # need to not normalize one-hot columns...
 
     if robust:
-        medians = np.nanmedian(X, axis=0)
+        medians = np.nanmedian(X_fit, axis=0)
         X = X - medians  # robust center
+        X_fit = X_fit - medians
 
         # clip values 2 times more extreme than 95% of the data
-        rmins = np.nanpercentile(X, 5, axis=0)
-        rmaxs = np.nanpercentile(X, 95, axis=0)
+        rmins = np.nanpercentile(X_fit, 5, axis=0)
+        rmaxs = np.nanpercentile(X_fit, 95, axis=0)
         rranges = rmaxs - rmins
         rmins -= 2 * rranges
         rmaxs += 2 * rranges
         X = np.clip(X, a_min=rmins, a_max=rmaxs)
+        X_fit = np.clip(X_fit, a_min=rmins, a_max=rmaxs)
 
-    X_norm = DataFrame(data=MinMaxScaler().fit_transform(X), columns=cols)
+    scaler = MinMaxScaler().fit(X_fit)
+    X_norm = DataFrame(data=scaler.transform(X), columns=cols, index=X.index)
     if (target in df.columns) and (target is not None):
-        X_norm = pd.concat([X, df[target]], axis=1)
+        X_norm = pd.concat([X_norm, df[target]], axis=1)
     return X_norm
 
 
-def normalize_continuous(X_cont: DataFrame, robust: bool = True) -> DataFrame:
+def normalize_continuous(
+    X_cont: DataFrame,
+    robust: bool = True,
+    fit_indices: Optional[ndarray] = None,
+) -> DataFrame:
     if X_cont.empty:
         return X_cont
-    return normalize(df=X_cont, target=None, robust=robust)
+    return normalize(
+        df=X_cont, target=None, robust=robust, fit_indices=fit_indices
+    )
 
 
 def reindex(
@@ -297,23 +310,17 @@ def reindex(
     if n_dropped == 0:
         return ix_train, ix_tests
 
-    ix_all = np.concatenate([ix_train, *ix_tests])
-    ix_remain = ix_all[idx_keep]
-    ix_train = np.intersect1d(ix_train, ix_remain)
-    ix_tests = [np.intersect1d(ix_test, ix_remain) for ix_test in ix_tests]
+    keep = np.asarray(idx_keep, dtype=bool)
+    old_to_new = np.full(len(keep), -1, dtype=int)
+    old_to_new[np.flatnonzero(keep)] = np.arange(keep.sum())
 
-    # we re-index later, so, we need to regen the indices to be increasing again
-    lengths = [len(ix) for ix in ix_tests]
-    ix_train = np.arange(len(ix_train))
-    ix_tests = []
-    last = int(ix_train[-1]) if len(ix_train) > 0 else -1
-    for length in lengths:
-        ix_next = np.arange(last + 1, last + 1 + length)
-        ix_tests.append(ix_next)
-        if len(ix_next) > 0:
-            last = int(ix_next[-1])
-
-    return ix_train, ix_tests
+    train_new = old_to_new[ix_train]
+    ix_train = train_new[train_new >= 0]
+    remapped_tests = []
+    for ix_test in ix_tests:
+        test_new = old_to_new[ix_test]
+        remapped_tests.append(test_new[test_new >= 0])
+    return ix_train, remapped_tests
 
 
 def drop_target_nans(
@@ -345,6 +352,7 @@ def handle_continuous_nans(
     results: InspectionResults,
     nans: NanHandling,
     add_indicators: bool = True,
+    fit_indices: Optional[ndarray] = None,
 ) -> tuple[DataFrame, DataFrame, int]:
     """Impute or drop nans based on values not in `cat_cols`
 
@@ -375,12 +383,15 @@ def handle_continuous_nans(
     X = df.drop(columns=results.drop_cols(), errors="ignore")
     X = X.drop(columns=cats, errors="ignore")  # now only cats and ords
 
+    X_fit = X if fit_indices is None else X.iloc[fit_indices]
+
     # construct NaN indicators
     if add_indicators:
         X_nan = X.isna().astype(float)
         X_nan.rename(columns=lambda s: f"{s}_NAN", inplace=True)
         # remove constant indicators
-        X_nan = X_nan.loc[:, X_nan.sum(axis=0) != 0]
+        fit_nan = X_nan if fit_indices is None else X_nan.iloc[fit_indices]
+        X_nan = X_nan.loc[:, fit_nan.sum(axis=0) != 0]
 
     if nans is NanHandling.Drop:
         warn(
@@ -407,15 +418,19 @@ def handle_continuous_nans(
     elif nans in [NanHandling.Mean, NanHandling.Median]:
         strategy = "mean" if nans is NanHandling.Mean else "median"
         imputer = SimpleImputer(strategy=strategy, keep_empty_features=True)
-        X_fitted = imputer.fit_transform(X)
-        X_cont = DataFrame(data=X_fitted, columns=X.columns)
+        imputer.fit(X_fit)
+        X_fitted = imputer.transform(X)
+        X_cont = DataFrame(data=X_fitted, columns=X.columns, index=X.index)
     elif nans is NanHandling.Impute:
         warn(
             "Using experimental multivariate imputation. This could take a very "
             "long time for even tiny (<500 samples, <30 features) datasets."
         )
         imputer = IterativeImputer(verbose=2, keep_empty_features=True)
-        X_cont = DataFrame(data=imputer.fit_transform(X), columns=X.columns)
+        imputer.fit(X_fit)
+        X_cont = DataFrame(
+            data=imputer.transform(X), columns=X.columns, index=X.index
+        )
     else:
         raise NotImplementedError(f"Unhandled enum case: {nans}")
 
@@ -440,7 +455,10 @@ def encode_target(
     ix_tests: Optional[list[ndarray]],
     _warn: bool = False,
 ) -> tuple[DataFrame, Series, dict[int, str], Optional[ndarray], Optional[list[ndarray]]]:
-    unqs, cnts = np.unique(unify_nans(target).astype(str), return_counts=True)
+    target = unify_nans(target)
+    target_train = target if ix_train is None else target.iloc[ix_train]
+    target_train = target_train.dropna()
+    unqs, cnts = np.unique(target_train.astype(str), return_counts=True)
     if len(unqs) <= 1:
         raise ValueError(f"Target variable {target.name} is constant.")
     idx = cnts <= N_TARG_LEVEL_MIN
@@ -458,7 +476,7 @@ def encode_target(
                 "remove all samples that belong to these labels, bringing the "
                 f"total number of classes down to {n_cls - np.sum(idx).item()}"
             )
-        idx_keep = ~target.isin(unqs[idx])
+        idx_keep = ~target.astype(str).isin(unqs[idx])
         ix_train, ix_tests = reindex(idx_keep, ix_train, ix_tests)
         df = df.copy().loc[idx_keep].reset_index(drop=True)
         # reset index extremely important for later concats
@@ -473,7 +491,20 @@ def encode_target(
     target = target[idx_keep].reset_index(drop=True)
 
     enc = LabelEncoder()
-    encoded = np.array(enc.fit_transform(target))
+    target_train = target if ix_train is None else target.iloc[ix_train]
+    if target_train.nunique() <= 1:
+        raise ValueError(
+            f"Target variable {target.name} is constant in the training data after "
+            "removing undersampled labels."
+        )
+    enc.fit(target_train)
+    try:
+        encoded = np.array(enc.transform(target))
+    except ValueError as error:
+        raise ValueError(
+            f"Target '{target.name}' contains labels in a holdout set that are "
+            "not present in its training data."
+        ) from error
     classes = enc.classes_.tolist()
     ints = np.asarray(enc.transform(classes)).tolist()
     return (
@@ -500,49 +531,13 @@ def encode_targets(
 ]:
     target_cols = as_target_list(targets)
     n_targ_level_min_mt = N_MULTITARGET_LEVEL_MIN
-    max_rare_targets_per_row = max(
-        1, ceil(len(target_cols) * MULTITARGET_MAX_RARE_LEVEL_FRAC)
-    )
     has_missing_target = Series(False, index=df.index, dtype=bool)
-    rare_target_counts = Series(0, index=df.index, dtype=np.int64)
     for col in target_cols:
         series = unify_nans(df[col])
-        vals = series.dropna()
-        if vals.empty:
-            raise ValueError(f"Target '{col}' has no valid (non-missing) samples.")
-
-        unqs, cnts = np.unique(vals.astype(str), return_counts=True)
-        if len(unqs) <= 1:
-            msg = f"Target variable {col} is constant."
-            if len(target_cols) > 1:
-                msg += " Remove this target column and re-run df-analyze."
-            raise ValueError(msg)
-        idx = cnts <= n_targ_level_min_mt
-        if np.sum(idx).item() > 0:
-            if _warn:
-                cleaning_inform(
-                    "The target variable has a number of class labels "
-                    f"({unqs[idx]}) with less than or equal to {n_targ_level_min_mt} members. This "
-                    "will cause problems with splitting in various nested k-fold "
-                    "procedures used in `df-analyze`. In addition, any estimates "
-                    "or metrics produced for such a class will not be "
-                    "statistically meaningful (i.e. the uncertainty on those "
-                    "metrics or estimates will be exceedingly large). We thus "
-                    "treat samples in these labels as low-support for this target."
-                    f"\n\nFor multi-target data, rows with missing target values are "
-                    "always removed. Rows are also removed when more than "
-                    f"{max_rare_targets_per_row} target values belong to labels with "
-                    f"fewer than or equal to {n_targ_level_min_mt} samples."
-                )
-            rare_labels = set(unqs[idx].tolist())
-        else:
-            rare_labels = set()
         is_missing = series.isna()
         has_missing_target |= is_missing
-        is_rare = (~is_missing) & series.astype(str).isin(rare_labels)
-        rare_target_counts += is_rare.astype(np.int64)
 
-    keep_mask = (~has_missing_target) & (rare_target_counts <= max_rare_targets_per_row)
+    keep_mask = ~has_missing_target
 
     ix_train, ix_tests = reindex(keep_mask, ix_train, ix_tests)
     df = df.loc[keep_mask].reset_index(drop=True)
@@ -553,8 +548,33 @@ def encode_targets(
     y_encoded = DataFrame(index=y_df_raw.index)
     for col in target_cols:
         series = unify_nans(y_df_raw[col]).astype(str)
+        series_train = series if ix_train is None else series.iloc[ix_train]
+        unqs, cnts = np.unique(series_train, return_counts=True)
+        if len(unqs) <= 1:
+            raise ValueError(
+                f"Target variable {col} is constant in the training data after "
+                "removing rows with missing multi-target labels. Remove this target "
+                "column and re-run df-analyze."
+            )
+        rare = unqs[cnts <= n_targ_level_min_mt]
+        if len(rare) > 0 and _warn:
+            cleaning_inform(
+                "The multi-target classification variable "
+                f"`{col}` has class labels ({rare.tolist()}) with less than or "
+                f"equal to {n_targ_level_min_mt} training members. These rows are "
+                "kept because removing them would also discard valid labels from "
+                "the other targets. Splits and metrics for the rare labels may be "
+                "unstable."
+            )
         enc = LabelEncoder()
-        encoded = np.array(enc.fit_transform(series))
+        enc.fit(series_train)
+        try:
+            encoded = np.array(enc.transform(series))
+        except ValueError as error:
+            raise ValueError(
+                f"Target '{col}' contains labels in a holdout set that are not "
+                "present in its training data."
+            ) from error
         classes = enc.classes_.tolist()
         ints = np.asarray(enc.transform(classes)).tolist()
         labels_map[col] = {i: cls for i, cls in zip(ints, classes)}
@@ -574,24 +594,53 @@ def clean_regression_target(
     Optional[ndarray],
     Optional[list[ndarray]],
 ]:
-    """NaN targets cannot be predicted. Remove them, and then robustly
-    normalize target to facilitate convergence and interpretation
-    of metrics
-    """
+    """Drop missing values and convert a regression target to float."""
+    target = unify_nans(target)
     idx_keep = ~target.isna()
     ix_train, ix_tests = reindex(idx_keep, ix_train, ix_tests)
     # reset index extremely important for later concats
     df = df.loc[idx_keep].reset_index(drop=True)
     target = target[idx_keep].reset_index(drop=True)
 
-    y = (
-        RobustScaler(quantile_range=(2.5, 97.5))
-        .fit_transform(target.to_numpy().reshape(-1, 1))
-        .ravel()
-    )
-    target = Series(y, name=target.name)
+    values = pd.to_numeric(target, errors="raise").astype(float)
+    numeric = values.to_numpy(dtype=float)
+    if not np.isfinite(numeric).all():
+        raise ValueError(f"Regression target '{target.name}' contains infinite values.")
+    target = Series(numeric, name=target.name)
 
     return df, target, ix_train, ix_tests
+
+
+def clean_regression_targets(
+    df: DataFrame,
+    targets: TargetSpec,
+    ix_train: Optional[ndarray],
+    ix_tests: Optional[list[ndarray]],
+) -> tuple[
+    DataFrame,
+    DataFrame,
+    Optional[ndarray],
+    Optional[list[ndarray]],
+]:
+    """Drop rows missing any regression target and preserve original units."""
+    target_cols = as_target_list(targets)
+    target_frame = DataFrame(
+        {col: unify_nans(df[col]) for col in target_cols}, index=df.index
+    )
+    keep_mask = ~target_frame.isna().any(axis=1)
+    ix_train, ix_tests = reindex(keep_mask, ix_train, ix_tests)
+
+    df = df.loc[keep_mask].reset_index(drop=True)
+    target_frame = target_frame.loc[keep_mask].reset_index(drop=True)
+    y = DataFrame(index=target_frame.index)
+    for col in target_cols:
+        values = pd.to_numeric(target_frame[col], errors="raise").astype(float)
+        numeric = values.to_numpy(dtype=float)
+        if not np.isfinite(numeric).all():
+            raise ValueError(f"Regression target '{col}' contains infinite values.")
+        y[col] = numeric
+    df[target_cols] = y
+    return df, y, ix_train, ix_tests
 
 
 def drop_cols(
@@ -639,14 +688,16 @@ def drop_unusable(
     results: InspectionResults,
     target: Optional[TargetSpec] = None,
     _warn: bool = False,
+    fit_indices: Optional[ndarray] = None,
 ) -> DataFrame:
     """Drops identifiers, datetime, constants"""
     target_cols = set(as_target_list(target)) if target is not None else set()
     df = drop_cols(df, "identifiers", results.ids, _warn=_warn)
     df = drop_cols(df, "datetime data", results.times, _warn=_warn)
     df = drop_cols(df, "constant", results.consts, _warn=_warn)
-    const_drops = df[
-        df.columns[df.map(str).apply(lambda col: len(np.unique(col)) <= 1)]
+    fit_df = df if fit_indices is None else df.iloc[fit_indices]
+    const_drops = fit_df[
+        fit_df.columns[fit_df.map(str).apply(lambda col: len(np.unique(col)) <= 1)]
     ].columns.to_list()
     const_drops = [col for col in const_drops if str(col) not in target_cols]
     if len(const_drops) > 0:
@@ -725,6 +776,7 @@ def encode_categoricals(
     grouper: Optional[str],
     results: InspectionResults,
     warn_explosion: bool = True,
+    fit_indices: Optional[ndarray] = None,
 ) -> tuple[DataFrame, DataFrame]:
     """
 
@@ -741,9 +793,11 @@ def encode_categoricals(
     df = df.drop(columns=target_cols, errors="ignore")
     df = convert_categoricals(df, target_cols, grouper=grouper)
     df = unify_nans(df)
-    df = drop_unusable(df, results, _warn=False)
+    df = drop_unusable(df, results, _warn=False, fit_indices=fit_indices)
     df = deflate_categoricals(df, grouper, results, _warn=warn_explosion)
-    df = drop_unusable(df, results, _warn=False)  # get rid of NaNs from deflation
+    df = drop_unusable(
+        df, results, _warn=False, fit_indices=fit_indices
+    )  # get rid of NaNs from deflation
     cats = [*results.cats.infos.keys(), *results.binaries.infos.keys()]
     cats = sorted(set(cats).intersection(df.columns.to_list()))
     X_cat = df.loc[:, cats].copy(deep=True)
@@ -754,6 +808,10 @@ def encode_categoricals(
         bins = sorted(set(results.binaries.cols).intersection(to_convert))
         multis = sorted(set(results.multi_cats).intersection(to_convert))
         new = df
+        fit_new = new if fit_indices is None else new.iloc[fit_indices]
+        for col in to_convert:
+            categories = fit_new[col].dropna().unique().tolist()
+            new[col] = pd.Categorical(new[col], categories=categories)
         # note `bins` includes variables that are (1) "constant-binary" (i.e.
         # either a constant value or NaN), (2) true binary (i.e. two unique
         # non-NaN values), or (3) binary plus NaN (two unique non-NaN values
@@ -765,7 +823,8 @@ def encode_categoricals(
         # (3) {0, 1} + {0, 1} NaN indicator
         #
         # i.e. by using pd.get_dummies(..., dummy_na=True, drop_first=True)
-        nan_cols = set(new.columns[new.isna().any()].to_list())
+        fit_new = new if fit_indices is None else new.iloc[fit_indices]
+        nan_cols = set(fit_new.columns[fit_new.isna().any()].to_list())
         bin_nans = sorted(nan_cols.intersection(bins))
         bin_no_nans = sorted(set(bins).difference(bin_nans))
         multi_nans = sorted(nan_cols.intersection(multis))
@@ -777,9 +836,14 @@ def encode_categoricals(
         new = pd.get_dummies(new, columns=bin_no_nans, dummy_na=False, drop_first=True)
         new = pd.get_dummies(new, columns=multi_no_nans, dummy_na=False, drop_first=False)
 
-        has_const = new.apply(lambda col: len(np.unique(col.apply(str))) == 1).any()
+        fit_encoded = new if fit_indices is None else new.iloc[fit_indices]
+        has_const = fit_encoded.apply(
+            lambda col: len(np.unique(col.apply(str))) == 1
+        ).any()
         if has_const:
-            new_consts = new.columns[new.apply(lambda col: len(np.unique(col)) == 1)]
+            new_consts = fit_encoded.columns[
+                fit_encoded.apply(lambda col: len(np.unique(col)) == 1)
+            ]
             raise ValueError(f"pd.get_dummies created constant columns: {new_consts}")
 
         if new.columns.has_duplicates:

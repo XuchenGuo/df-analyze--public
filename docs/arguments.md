@@ -55,6 +55,11 @@ options:
                         The (string) name of the target variable for either regression or
                         classification.
 
+  --targets TARGETS
+
+                        Comma-separated target columns for a multi-target classification or
+                        regression run. This takes precedence over `--target`.
+
   --grouper GROUPER [GROUPER ...]
 
                         The (string) name of the grouping variable (if one is present) which will be
@@ -109,10 +114,40 @@ options:
 
                         If "classify", do classification. If "regress", do regression.
 
+  --device {auto,cpu,cuda}
+                        Runtime device for supported models. Auto uses workload-aware
+                        thresholds for KNN, CatBoost, and XGBoost so small jobs stay on
+                        CPU; compute-heavy neural and embedding backends prefer an
+                        available accelerator. CUDA falls back to CPU with a warning
+                        when a backend is unavailable. GANDALF may use MPS in auto mode
+                        on supported Apple systems.
+
+  --device-install {auto,ask,never}
+                        Managed CUDA PyTorch setup policy. The default is never.
+                        Managed setup is available from a source checkout containing
+                        pyproject.toml and uv.lock.
+
+  --tabpfn-version {v3,v2.6,v2.5}
+                        TabPFN checkpoint version. The default is v3; v2.6 and v2.5
+                        select older supported checkpoints. The first run requires
+                        accepting the corresponding Prior Labs license and setting
+                        TABPFN_TOKEN in the same terminal.
+
   --classifiers  [ ...]
 
                         The list of classifiers to use when comparing classification performance.
-                        Can be a list of elements from: [dummy gandalf knn lgbm lr mlp rf sgd svm].
+                        Registered tokens: [catboost dummy dtree et gandalf kan knn lgbm lr mlp rf
+                        sgd svm tabpfn xgb]. The svm token is currently disabled by the CLI.
+
+                          catboost    CatBoost classifier.
+
+                          xgb         XGBoost classifier.
+
+                          tabpfn      TabPFN classifier.
+
+                          dtree       scikit-learn DecisionTreeClassifier.
+
+                          et          scikit-learn ExtraTreesClassifier.
 
                           knn         scikit-learn KNeighborsClassifier.
 
@@ -120,21 +155,36 @@ options:
 
                           rf          LightGBM random forest classifier.
 
+                          lr          scikit-learn LogisticRegression.
+
                           sgd         scikit-learn SGDClassifier.
 
                           mlp         Modern multi-layer perceptron implemented in skorch/PyTorch.
 
-                          svm         scikit-learn support vector classifer.
+                          kan         Kolmogorov-Arnold network implemented with PyKAN/skorch.
+
+                          svm         Registered for compatibility; currently disabled.
 
                           gandalf     Gated Adaptive Network for Deep Automated Learning of
                                       Features for Tabular Data: https://arxiv.org/abs/2207.08548
 
                           dummy       scikit-learn DummyClassifier.
 
-  --regressors {knn,lgbm,rf,elastic,sgd,mlp,svm,gandalf,dummy} [{knn,lgbm,rf,elastic,sgd,mlp,svm,gandalf,dummy} ...]
+  --regressors  [ ...]
 
                         The list of regressors to use when comparing regression model performance.
-                        Can be a list of elements from: [dummy elastic gandalf knn lgbm mlp rf sgd svm].
+                        Registered tokens: [catboost dummy dtree elastic et gandalf kan knn lgbm mlp
+                        rf sgd svm tabpfn xgb]. The svm token is currently disabled by the CLI.
+
+                          catboost    CatBoost regressor.
+
+                          xgb         XGBoost regressor.
+
+                          tabpfn      TabPFN regressor.
+
+                          dtree       scikit-learn DecisionTreeRegressor.
+
+                          et          scikit-learn ExtraTreesRegressor.
 
                           knn         scikit-learn KNeighborsRegressor.
 
@@ -142,11 +192,15 @@ options:
 
                           rf          LightGBM random forest regressor.
 
+                          elastic     scikit-learn ElasticNet.
+
                           sgd         scikit-learn SGDRegressor.
 
                           mlp         Modern multi-layer perceptron implemented in skorch/PyTorch.
 
-                          svm         scikit-learn support vector regressor.
+                          kan         Kolmogorov-Arnold network implemented with PyKAN/skorch.
+
+                          svm         Registered for compatibility; currently disabled.
 
                           gandalf     Gated Adaptive Network for Deep Automated Learning of
                                       Features for Tabular Data: https://arxiv.org/abs/2207.08548
@@ -178,6 +232,63 @@ options:
                         provided in the `--df` or `--spreadsheet` argument to `df-analyze.py`. This
                         is to prevent double-dipping / circular analysis that can result in
                         (extremely) biased performance estimates.
+
+  --feat-downsample {none,auto,random,variance,f-test,mutual-info,linear,lgbm,svd,sparse-rp,rank-ensemble,selector-ensemble,stable-rank}
+
+                        Reduce a wide matrix before the usual feature-selection and tuning
+                        stages. Supervised methods use a screening subset disjoint from the
+                        rows used for model tuning. The default is none.
+
+  --n-feat-downsample N_FEAT_DOWNSAMPLE
+
+                        Maximum number or fraction of features retained.
+
+  --downsample-variance-threshold DOWNSAMPLE_VARIANCE_THRESHOLD
+
+                        Minimum sample variance retained by variance downsampling.
+
+  --downsample-save-scores
+
+                        Save scores for every feature instead of only the leading scores.
+
+  --downsample-chunk-size DOWNSAMPLE_CHUNK_SIZE
+
+                        Maximum number of source features scored in one chunk.
+
+  --downsample-screening-fraction DOWNSAMPLE_SCREENING_FRACTION
+
+                        Fraction of training rows used only for supervised downsampling.
+
+  --large-feature-mode
+
+                        Split and downsample a numeric table before normal preparation.
+
+  --assume-numeric-features
+
+                        Skip the pandas dtype check in large-feature table mode; all predictor values
+                        must still convert to finite numbers.
+
+  --skip-full-prepared-save-before-downsample
+
+                        Do not save the full prepared matrix before downsampling.
+
+  --input-format {auto,table,svmlight}
+
+                        Input format; auto recognizes common SVMlight suffixes.
+
+  --svmlight-index-base {auto,zero,one}
+
+                        Feature index base used to name SVMlight columns.
+
+  --mt-agg-strategy {borda,freq}
+
+                        How to combine per-target feature-selection results. Borda combines
+                        ranks; freq emphasizes features selected for several targets.
+
+  --mt-top-k MT_TOP_K
+
+                        Keep only the top K features after multi-target aggregation. When
+                        omitted, all features that pass the aggregation criteria are retained.
 
   --embed-select  [ ...]
 
@@ -559,6 +670,33 @@ options:
                         tuning.
 
                         An integer specifies the number of samples to set aside for testing.
+
+  --error-consistency, --ec
+                        Enable repeated K-fold error consistency analysis on the final
+                        holdout set.
+  --ec-folds EC_FOLDS
+                        Number of folds in each error-consistency repetition (minimum 2).
+  --ec-repetitions EC_REPETITIONS
+                        Number of independently shuffled K-fold repetitions (minimum 1,
+                        default 5).
+  --ec-model-seed-mode {vary,fixed}
+                        Whether fitted-model RNG seeds vary deterministically by fold
+                        (split plus algorithmic instability) or stay fixed (training-
+                        subset sensitivity). Default: vary.
+  --ec-methods EC_METHODS [EC_METHODS ...]
+                        Regression EC metrics to compute. The default is all seven methods.
+  --ec-save-predictions
+                        Save the holdout prediction and residual/error matrices used by EC.
+  --ec-empty-unions {0,1,nan,drop,error,warn}
+                        Classification policy when neither model in a pair makes an error.
+                        The default is warn, which records the undefined comparison as NaN.
+  --ec-epsilon EC_EPSILON
+                        Non-negative denominator stabilization for regression ratio metrics.
+  --ec-recurrence-threshold EC_RECURRENCE_THRESHOLD
+                        Error-rate threshold used to label high recurrence in the joint
+                        adaptive-error and error-consistency report. This is a
+                        configurable heuristic, not a universal scientific cutoff.
+                        Default: 0.5.
 
   --outdir OUTDIR
                         Specifies location of all results, as well as cache files for slow

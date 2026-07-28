@@ -9,8 +9,8 @@ from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from typing import Any, Literal, Optional, Tuple, Union, cast
 from typing import Generator as Gen
-from typing import Literal, Optional, Tuple, Union, cast
 from warnings import warn
 
 import jsonpickle
@@ -21,7 +21,7 @@ from numpy.random import Generator
 from pandas import DataFrame, Series
 from sklearn.experimental import enable_iterative_imputer  # noqa
 from sklearn.model_selection import ShuffleSplit, StratifiedShuffleSplit
-from sklearn.preprocessing import KBinsDiscretizer, RobustScaler
+from sklearn.preprocessing import KBinsDiscretizer
 
 from df_analyze._constants import (
     N_CAT_LEVEL_MIN,
@@ -31,9 +31,10 @@ from df_analyze._constants import (
     UNIVARIATE_PRED_MAX_N_SAMPLES,
 )
 from df_analyze.analysis.univariate.describe import describe_all_features
-from df_analyze.enumerables import NanHandling, ValidationMethod
+from df_analyze.enumerables import FeatureDownsampleMethod, NanHandling, ValidationMethod
 from df_analyze.preprocessing.cleaning import (
     clean_regression_target,
+    clean_regression_targets,
     deflate_categoricals,
     drop_target_nans,
     drop_unusable,
@@ -42,7 +43,6 @@ from df_analyze.preprocessing.cleaning import (
     encode_targets,
     handle_continuous_nans,
     normalize_continuous,
-    reindex,
 )
 from df_analyze.preprocessing.inspection.inspection import (
     ClsTargetInfo,
@@ -53,13 +53,20 @@ from df_analyze.preprocessing.inspection.inspection import (
     unify_nans,
 )
 from df_analyze.preprocessing.targets import TargetSpec, as_target_list
-from df_analyze.splitting import ApproximateStratifiedGroupSplit, y_split_label
+from df_analyze.splitting import (
+    ApproximateStratifiedGroupSplit,
+    MultiTargetSplitInfo,
+    regression_split_label,
+    y_split_label,
+    y_split_label_info,
+)
 from df_analyze.timing import timed
 
 
 @dataclass
 class PrepFiles:
     X_raw: str = "X.parquet"
+    X_tabpfn_raw: str = "X_tabpfn.parquet"
     X_cont_raw: str = "X_cont.parquet"
     X_cat_raw: str = "X_cat.parquet"
     y_raw: str = "y.parquet"
@@ -73,6 +80,7 @@ class PrepFiles:
 @dataclass
 class PrepFilesTrain:
     X_raw: str = "X_train.parquet"
+    X_tabpfn_raw: str = "X_train_tabpfn.parquet"
     X_cont_raw: str = "X_train_cont.parquet"
     X_cat_raw: str = "X_train_cat.parquet"
     y_raw: str = "y_train.parquet"
@@ -81,15 +89,211 @@ class PrepFilesTrain:
     info: str = "info.json"
 
 
+def usable_training_indices(
+    df: DataFrame,
+    target: TargetSpec,
+    is_classification: bool,
+    indices: ndarray,
+) -> ndarray:
+    """Return training rows that remain after target cleaning."""
+    target_cols = as_target_list(target)
+    targets = unify_nans(df.iloc[indices][target_cols].copy())
+    keep = ~targets.isna().any(axis=1)
+
+    if is_classification and len(target_cols) == 1:
+        values = targets.loc[keep, target_cols[0]].astype(str)
+        levels, counts = np.unique(values, return_counts=True)
+        rare = levels[counts <= N_TARG_LEVEL_MIN]
+        if len(rare) > 0:
+            keep &= ~targets[target_cols[0]].astype(str).isin(rare)
+    return np.asarray(indices, dtype=int)[keep.to_numpy()]
+
+
+def _ensure_target_levels_in_training(
+    y: DataFrame,
+    idx_train: ndarray,
+    idx_test: ndarray,
+    groups: Optional[Series] = None,
+) -> tuple[ndarray, ndarray, int]:
+    train = np.asarray(idx_train, dtype=int)
+    test = np.asarray(idx_test, dtype=int)
+    moved = np.array([], dtype=int)
+    for target in y.columns:
+        train_levels = set(y.iloc[train][target].astype(str))
+        missing = ~y.iloc[test][target].astype(str).isin(train_levels)
+        if not missing.any():
+            continue
+        rows = test[missing.to_numpy()]
+        if groups is not None:
+            moved_groups = groups.iloc[rows].unique()
+            rows = test[groups.iloc[test].isin(moved_groups).to_numpy()]
+        moved = np.union1d(moved, rows).astype(int)
+        train = np.union1d(train, rows).astype(int)
+        test = np.setdiff1d(test, rows).astype(int)
+    if len(test) == 0:
+        raise ValueError(
+            "Could not create a non-empty holdout while keeping every target level "
+            "in the training data."
+        )
+    return np.sort(train), np.sort(test), len(moved)
+
+
+def raw_train_test_indices(
+    df: DataFrame,
+    target: TargetSpec,
+    grouper: Optional[str],
+    is_classification: bool,
+    test_size: Union[int, float],
+    seed: int | None,
+) -> tuple[ndarray, ndarray, Optional[MultiTargetSplitInfo]]:
+    """Split rows before fitting any predictor preprocessing."""
+    target_cols = as_target_list(target)
+    targets = unify_nans(df[target_cols].copy())
+    rows = usable_training_indices(
+        df,
+        target,
+        is_classification,
+        np.arange(len(df), dtype=int),
+    )
+    if len(rows) < 2:
+        raise ValueError("Not enough samples remain to create a train/test split.")
+    if isinstance(test_size, int):
+        test_size = test_size / len(rows)
+    train_size = 1 - test_size
+
+    y = targets.iloc[rows].reset_index(drop=True)
+    split_audit: Optional[MultiTargetSplitInfo] = None
+    if grouper is None:
+        if is_classification:
+            if len(target_cols) > 1:
+                split_y, split_audit = y_split_label_info(y)
+            else:
+                split_y = y.iloc[:, 0].astype(str)
+            splitter = StratifiedShuffleSplit(
+                train_size=train_size, n_splits=1, random_state=seed
+            )
+            idx_train, idx_test = next(
+                splitter.split(split_y.to_frame(), split_y)
+            )
+        else:
+            splitter = ShuffleSplit(
+                train_size=train_size, n_splits=1, random_state=seed
+            )
+            idx_train, idx_test = next(splitter.split(y))
+    else:
+        groups = df.iloc[rows][grouper].reset_index(drop=True)
+        splitter = ApproximateStratifiedGroupSplit(
+            train_size=train_size,
+            is_classification=is_classification,
+            grouped=True,
+            labels=None,
+            seed=seed,
+            warn_on_fallback=True,
+            allow_group_fallback=False,
+            warn_on_large_size_diff=True,
+            df_analyze_phase="Initial holdout splitting",
+        )
+        if is_classification and len(target_cols) > 1:
+            split_y, split_audit = y_split_label_info(y)
+        elif is_classification:
+            split_y = y.iloc[:, 0].astype(str)
+        else:
+            split_y = regression_split_label(
+                y if len(target_cols) > 1 else y.iloc[:, 0]
+            )
+        (idx_train, idx_test), _ = splitter.split(
+            split_y.to_frame(), split_y, groups
+        )
+
+    if is_classification and len(target_cols) > 1:
+        local_groups = (
+            None
+            if grouper is None
+            else df.iloc[rows][grouper].reset_index(drop=True)
+        )
+        idx_train, idx_test, moved = _ensure_target_levels_in_training(
+            y,
+            idx_train,
+            idx_test,
+            local_groups,
+        )
+        if moved > 0:
+            message = (
+                f"Moved {moved} holdout rows to training so every multi-target "
+                "classification level is represented in the training data."
+            )
+            warn(message)
+            if split_audit is not None:
+                split_audit.reason = f"{split_audit.reason} {message}"
+
+    return rows[idx_train], rows[idx_test], split_audit
+
+
 @dataclass
 class PrepFilesTest:
     X_raw: str = "X_test.parquet"
+    X_tabpfn_raw: str = "X_test_tabpfn.parquet"
     X_cont_raw: str = "X_test_cont.parquet"
     X_cat_raw: str = "X_test_cat.parquet"
     y_raw: str = "y_test.parquet"
     g_raw: str = "g.parquet"
     labels: str = "labels.parquet"
     info: str = "info.json"
+
+
+@dataclass
+class MultiTargetAudit:
+    target_names: list[str]
+    is_classification: bool
+    n_original_rows: int
+    n_final_rows: int
+    missing_by_target: dict[str, int]
+    class_counts_by_target: dict[str, dict[str, int]]
+    low_support_labels_by_target: dict[str, dict[str, int]]
+
+    @property
+    def n_missing_target_rows(self) -> int:
+        return self.n_original_rows - self.n_final_rows
+
+    def to_markdown(self) -> str:
+        task = "classification" if self.is_classification else "regression"
+        sections = [
+            "# Multi-Target Target Audit\n\n",
+            f"Task type: {task}\n",
+            f"Targets: {', '.join(self.target_names)}\n",
+            f"Original rows: {self.n_original_rows}\n",
+            f"Final rows: {self.n_final_rows}\n",
+            f"Rows dropped due to a missing target: {self.n_missing_target_rows}\n\n",
+        ]
+        missing = DataFrame(
+            {
+                "target": list(self.missing_by_target),
+                "missing rows": list(self.missing_by_target.values()),
+            }
+        )
+        sections.extend(["## Missing Targets\n\n", missing.to_markdown(index=False)])
+
+        if self.is_classification:
+            rows = []
+            for target, counts in self.class_counts_by_target.items():
+                low_support = self.low_support_labels_by_target.get(target, {})
+                for label, count in counts.items():
+                    rows.append(
+                        {
+                            "target": target,
+                            "level": label,
+                            "count": count,
+                            "low support": label in low_support,
+                        }
+                    )
+            if rows:
+                sections.extend(
+                    [
+                        "\n\n## Target Level Counts\n\n",
+                        DataFrame(rows).to_markdown(index=False),
+                    ]
+                )
+        return "".join(sections)
 
 
 @dataclass
@@ -101,6 +305,8 @@ class PreparationInfo:
     n_cont_indicator_added: int
     target_info: Optional[Union[RegTargetInfo, ClsTargetInfo]]
     runtimes: dict[str, float]
+    multitarget_audit: Optional[MultiTargetAudit] = None
+    split_audit: Optional[MultiTargetSplitInfo] = None
 
     def to_markdown(self) -> str:
         sections = []
@@ -131,6 +337,13 @@ class PreparationInfo:
             ).to_markdown()
         )
 
+        multitarget_audit = getattr(self, "multitarget_audit", None)
+        split_audit = getattr(self, "split_audit", None)
+        if multitarget_audit is not None:
+            sections.extend(["\n\n", multitarget_audit.to_markdown()])
+        if split_audit is not None:
+            sections.extend(["\n\n", split_audit.to_markdown()])
+
         return "".join(sections)
 
     def to_json(self, path: Path) -> None:
@@ -142,6 +355,56 @@ class PreparationInfo:
         if content.strip().replace("\n", "") == "":
             return None
         return cast(PreparationInfo, jsonpickle.decode(content))
+
+
+def _decoded_target_level(
+    target: str,
+    value: Any,
+    labels: Optional[Union[dict[int, str], dict[str, dict[int, str]]]],
+) -> str:
+    if labels is None or not all(isinstance(item, dict) for item in labels.values()):
+        return str(value)
+    mapping = cast(dict[str, dict[int, str]], labels).get(target, {})
+    try:
+        return str(mapping.get(int(value), value))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _build_multitarget_audit(
+    raw_targets: DataFrame,
+    y: DataFrame,
+    labels: Optional[Union[dict[int, str], dict[str, dict[int, str]]]],
+    is_classification: bool,
+) -> MultiTargetAudit:
+    missing = raw_targets.isna()
+    counts_by_target: dict[str, dict[str, int]] = {}
+    low_support_by_target: dict[str, dict[str, int]] = {}
+
+    if is_classification:
+        for col in y.columns:
+            target = str(col)
+            counts: dict[str, int] = {}
+            low_support: dict[str, int] = {}
+            for encoded, count in y[col].value_counts().sort_index().items():
+                label = _decoded_target_level(target, encoded, labels)
+                count_int = int(count)
+                counts[label] = count_int
+                if count_int <= N_MULTITARGET_LEVEL_MIN:
+                    low_support[label] = count_int
+            counts_by_target[target] = counts
+            if low_support:
+                low_support_by_target[target] = low_support
+
+    return MultiTargetAudit(
+        target_names=[str(col) for col in raw_targets.columns],
+        is_classification=is_classification,
+        n_original_rows=int(len(raw_targets)),
+        n_final_rows=int(len(y)),
+        missing_by_target={str(col): int(missing[col].sum()) for col in raw_targets},
+        class_counts_by_target=counts_by_target,
+        low_support_labels_by_target=low_support_by_target,
+    )
 
 
 def viable_subsample(
@@ -237,6 +500,8 @@ class PreparedData:
         is_classification: Optional[bool] = None,
         X_cont: Optional[DataFrame] = None,
         X_cat: Optional[DataFrame] = None,
+        X_tabpfn: Optional[DataFrame] = None,
+        feature_lineage: Optional[dict[str, str]] = None,
         labels: Optional[Union[dict[int, str], dict[str, dict[int, str]]]] = None,
         ix_train: Optional[ndarray] = None,
         ix_tests: Optional[list[ndarray]] = None,
@@ -293,6 +558,18 @@ class PreparedData:
         if validate:
             X, X_cont, X_cat, y = self.validate(X, X_cont, X_cat, y)
 
+        if X_tabpfn is None:
+            X_tabpfn = X.copy(deep=True)
+        elif len(X_tabpfn) != len(X):
+            raise ValueError(
+                f"TabPFN data number of samples ({len(X_tabpfn)}) does not "
+                f"match number of samples in processed data ({len(X)})"
+            )
+        else:
+            X_tabpfn = X_tabpfn.copy(deep=True)
+        X_tabpfn.reset_index(drop=True, inplace=True)
+        X_tabpfn.index = X.index.copy(deep=True)
+
         if groups is not None:
             if len(groups) != len(X):
                 raise ValueError(
@@ -304,12 +581,14 @@ class PreparedData:
             groups.index = X.index.copy(deep=True)
 
         self.X = self.rename_cols(X)
+        self.X_tabpfn = self.rename_cols(X_tabpfn)
         self.X_cont: Optional[DataFrame] = (
             None if X_cont is None else self.rename_cols(X_cont)
         )
         self.X_cat: Optional[DataFrame] = (
             None if X_cat is None else self.rename_cols(X_cat)
         )
+        self.feature_lineage = feature_lineage or self._infer_feature_lineage()
         if isinstance(y, DataFrame):
             self.y: Union[Series, DataFrame] = y
             self.target_cols = y.columns.tolist()
@@ -342,6 +621,76 @@ class PreparedData:
             return int(max(self.y[col].nunique() for col in self.y.columns))
         return len(np.unique(self.y))
 
+    def _infer_feature_lineage(self) -> dict[str, str]:
+        raw_cols = sorted(
+            (str(col) for col in self.X_tabpfn.columns), key=len, reverse=True
+        )
+        raw_set = set(raw_cols)
+        cat_cols = sorted(
+            (() if self.X_cat is None else (str(col) for col in self.X_cat.columns)),
+            key=len,
+            reverse=True,
+        )
+        lineage: dict[str, str] = {}
+        for processed in (str(col) for col in self.X.columns):
+            if processed in raw_set:
+                lineage[processed] = processed
+                continue
+            source = next(
+                (
+                    raw
+                    for raw in raw_cols
+                    if processed == f"{raw}_NAN"
+                    or processed.startswith(f"{raw}_NAN_")
+                ),
+                None,
+            )
+            if source is None:
+                source = next(
+                    (
+                        raw
+                        for raw in cat_cols
+                        if processed.startswith(f"{raw}_")
+                        or processed.startswith(f"{raw}__")
+                    ),
+                    None,
+                )
+            if source is None:
+                source = next(
+                    (
+                        raw
+                        for raw in raw_cols
+                        if processed.startswith(f"{raw}_")
+                        or processed.startswith(f"{raw}__")
+                    ),
+                    processed,
+                )
+            lineage[processed] = source
+        return lineage
+
+    @staticmethod
+    def _is_tabpfn_model(model: Any) -> bool:
+        cls = model if isinstance(model, type) else model.__class__
+        return cls.__name__.startswith("TabPFN")
+
+    def model_matrix(
+        self,
+        model: Any,
+        selected_cols: Optional[list[str] | slice] = None,
+    ) -> DataFrame:
+        if not self._is_tabpfn_model(model):
+            if selected_cols is None or isinstance(selected_cols, slice):
+                return self.X
+            return self.X.loc[:, [col for col in selected_cols if col in self.X]]
+        if selected_cols is None or isinstance(selected_cols, slice):
+            return self.X_tabpfn
+        mapped: list[str] = []
+        for col in selected_cols:
+            source = self.feature_lineage.get(str(col), str(col))
+            if source in self.X_tabpfn.columns and source not in mapped:
+                mapped.append(source)
+        return self.X_tabpfn.loc[:, mapped]
+
     def get_splits(
         self, test_size: Union[int, float] = 0.4, seed: int | None = SEED
     ) -> Union[
@@ -371,9 +720,9 @@ class PreparedData:
         ix_all = [self.ix_train, *self.ix_tests]
         ix_pairs = []
         for i, ix in enumerate(ix_all):
-            ix_train = ix
-            ix_tests = ix_all[:i] + ix_all[i + 1 :]
-            ix_test = np.concatenate(ix_tests)
+            ix_test = ix
+            ix_trains = ix_all[:i] + ix_all[i + 1 :]
+            ix_train = np.concatenate(ix_trains)
             ix_pairs.append((ix_train, ix_test))
 
         for ix_train, ix_test in ix_pairs:
@@ -385,13 +734,14 @@ class PreparedData:
         seed: int | None = SEED,
     ) -> tuple[PreparedData, PreparedData]:
         y = self.y.copy()
+        split_audit: Optional[MultiTargetSplitInfo] = None
         if self.groups is None:
             if self.is_classification:
                 ss = StratifiedShuffleSplit(
                     train_size=train_size, n_splits=1, random_state=seed
                 )
                 if isinstance(y, DataFrame):
-                    split_y = y_split_label(y)
+                    split_y, split_audit = y_split_label_info(y)
                     idx_train, idx_test = next(ss.split(split_y.to_frame(), split_y))
                 else:
                     idx_train, idx_test = next(ss.split(y.to_frame(), y))
@@ -406,16 +756,17 @@ class PreparedData:
                 labels=self.split_labels,
                 seed=seed,
                 warn_on_fallback=True,
+                allow_group_fallback=False,
                 warn_on_large_size_diff=True,
                 df_analyze_phase="Initial holdout splitting",
             )
             if self.is_classification and isinstance(y, DataFrame):
-                split_y = y_split_label(y)
+                split_y, split_audit = y_split_label_info(y)
                 (idx_train, idx_test), group_fail = ss.split(
                     split_y.to_frame(), split_y, self.groups
                 )
             else:
-                split_y = y.mean(axis=1) if isinstance(y, DataFrame) else y
+                split_y = regression_split_label(y)
                 (idx_train, idx_test), group_fail = ss.split(
                     split_y.to_frame(), split_y, self.groups
                 )
@@ -426,9 +777,15 @@ class PreparedData:
         prep_test = self.subsample(idx_test)
         prep_test.phase = "test"
 
+        if split_audit is not None:
+            if prep_train.info is not None:
+                prep_train.info.split_audit = deepcopy(split_audit)
+            if prep_test.info is not None:
+                prep_test.info.split_audit = deepcopy(split_audit)
+
         return prep_train, prep_test
 
-    def subsample(self, idx: ndarray) -> PreparedData:
+    def subsample(self, idx: ndarray, validate: bool = True) -> PreparedData:
         try:
             X_sub = self.X.iloc[idx].reset_index(drop=True)
         except IndexError as e:
@@ -445,6 +802,8 @@ class PreparedData:
             info_sub = None
         return PreparedData(
             X=X_sub,
+            X_tabpfn=self.X_tabpfn.iloc[idx].reset_index(drop=True),
+            feature_lineage=self.feature_lineage,
             X_cont=None if X_cont is None else X_cont.iloc[idx].reset_index(drop=True),
             X_cat=None if X_cat is None else X_cat.iloc[idx].reset_index(drop=True),
             y=self.y.iloc[idx].copy().reset_index(drop=True),
@@ -453,6 +812,44 @@ class PreparedData:
             inspection=self.inspection,
             info=info_sub,
             is_classification=self.is_classification,
+            validate=validate,
+        )
+
+    def with_features(self, X: DataFrame, feature_origin: str) -> PreparedData:
+        info = None if self.info is None else deepcopy(self.info)
+        if info is not None:
+            info.final_shape = X.shape
+            info.runtimes.setdefault(f"feature downsampling ({feature_origin})", 0.0)
+        is_projection = feature_origin in {
+            FeatureDownsampleMethod.SVD.value,
+            FeatureDownsampleMethod.SparseRandomProjection.value,
+        }
+        if is_projection:
+            lineage = {str(col): str(col) for col in X.columns}
+            X_tabpfn = X
+        else:
+            lineage = {
+                str(col): self.feature_lineage.get(str(col), str(col))
+                for col in X.columns
+            }
+            raw_cols: list[str] = []
+            for source in lineage.values():
+                if source in self.X_tabpfn.columns and source not in raw_cols:
+                    raw_cols.append(source)
+            X_tabpfn = self.X_tabpfn.loc[:, raw_cols]
+        return PreparedData(
+            X=X,
+            X_tabpfn=X_tabpfn,
+            feature_lineage=lineage,
+            X_cont=X,
+            X_cat=None,
+            y=self.y.copy(),
+            groups=None if self.groups is None else self.groups.copy(),
+            labels=self.labels,
+            inspection=self.inspection,
+            info=info,
+            is_classification=self.is_classification,
+            phase=self.phase,
             validate=True,
         )
 
@@ -481,6 +878,8 @@ class PreparedData:
 
         return PreparedData(
             X=self.X,
+            X_tabpfn=self.X_tabpfn,
+            feature_lineage=self.feature_lineage,
             X_cont=self.X_cont,
             X_cat=self.X_cat,
             y=y_col,
@@ -502,7 +901,12 @@ class PreparedData:
         rng: Optional[Generator] = None,
     ) -> tuple[PreparedData, ndarray]:
         rng = rng or np.random.default_rng()
-        X, X_cont, X_cat = self.X, self.X_cont, self.X_cat
+        X, X_tabpfn, X_cont, X_cat = (
+            self.X,
+            self.X_tabpfn,
+            self.X_cont,
+            self.X_cat,
+        )
         y = self.y
 
         g = self.groups
@@ -528,6 +932,7 @@ class PreparedData:
             else:
                 idx = viable_subsample(df=X, target=y, n_sub=n_sub, rng=rng)
             X = X.iloc[idx]
+            X_tabpfn = X_tabpfn.iloc[idx]
             if X_cont is not None:
                 X_cont = X_cont.iloc[idx]
             if X_cat is not None:
@@ -536,9 +941,13 @@ class PreparedData:
                 g = g.iloc[idx]
             y = y.iloc[idx]
         else:
-            kb = KBinsDiscretizer(n_bins=5, encode="ordinal")
+            kb = KBinsDiscretizer(
+                n_bins=5,
+                encode="ordinal",
+                quantile_method="linear",
+            )
             if isinstance(y, DataFrame):
-                y_vals = y.mean(axis=1)
+                y_vals = regression_split_label(y)
             else:
                 y_vals = y
             strat = kb.fit_transform(y_vals.to_numpy().reshape(-1, 1))
@@ -546,6 +955,7 @@ class PreparedData:
             ss = StratifiedShuffleSplit(n_splits=1, train_size=n_train)
             idx = next(ss.split(strat, strat))[0]
             X = cast(DataFrame, self.X.iloc[idx, :].copy(deep=True))
+            X_tabpfn = self.X_tabpfn.iloc[idx, :].copy(deep=True)
             y = self.y.loc[idx].copy(deep=True)
             if X_cont is not None:
                 X_cont = X_cont.loc[idx, :].copy(deep=True)
@@ -556,6 +966,8 @@ class PreparedData:
 
         return PreparedData(
             X=X,
+            X_tabpfn=X_tabpfn,
+            feature_lineage=self.feature_lineage,
             X_cont=X_cont,
             X_cat=X_cat,
             y=y,
@@ -697,6 +1109,7 @@ class PreparedData:
     def save_raw(self, root: Path) -> None:
         try:
             self.X.to_parquet(root / self.files.X_raw)
+            self.X_tabpfn.to_parquet(root / self.files.X_tabpfn_raw)
             if self.X_cont is not None:
                 self.X_cont.to_parquet(root / self.files.X_cont_raw)
             if self.X_cat is not None:
@@ -731,6 +1144,10 @@ class PreparedData:
     def from_saved(root: Path, inspection: InspectionResults) -> PreparedData:
         files = PrepFiles()
         X = pd.read_parquet(root / files.X_raw)
+        tabpfn_path = root / files.X_tabpfn_raw
+        X_tabpfn = (
+            pd.read_parquet(tabpfn_path) if tabpfn_path.exists() else X.copy()
+        )
         X_cont = pd.read_parquet(root / files.X_cont_raw)
         X_cat = pd.read_parquet(root / files.X_cat_raw)
         y_raw = pd.read_parquet(root / files.y_raw)
@@ -738,7 +1155,9 @@ class PreparedData:
         g_raw = pd.read_parquet(gfile) if gfile.exists() else None
         y: Union[Series, DataFrame]
         if y_raw.shape[1] == 1:
-            y = Series(name=y_raw.columns[0], data=y_raw.values.ravel(), index=y_raw.index)
+            y = Series(
+                name=y_raw.columns[0], data=y_raw.values.ravel(), index=y_raw.index
+            )
         else:
             y = y_raw
         g = (
@@ -759,7 +1178,8 @@ class PreparedData:
                 }
         else:
             labels = None
-        info = PreparationInfo.from_json(root / files.info)
+        info_path = root / files.info
+        info = PreparationInfo.from_json(info_path) if info_path.exists() else None
         if info is not None:
             is_cls = info.is_classification
         else:
@@ -781,6 +1201,7 @@ class PreparedData:
 
         return PreparedData(
             X=X,
+            X_tabpfn=X_tabpfn,
             X_cont=X_cont,
             X_cat=X_cat,
             y=y,
@@ -860,6 +1281,8 @@ def prepare_data(
     df = timer(unify_nans)(df)
     df = timer(convert_categoricals)(df=df, target=target_cols, grouper=grouper)
     info: Optional[Union[RegTargetInfo, ClsTargetInfo]] = None
+    multitarget_audit: Optional[MultiTargetAudit] = None
+    raw_targets = df[target_cols].copy() if len(target_cols) > 1 else None
     n_targ_drop = 0
     labels: Optional[Union[dict[int, str], dict[str, dict[int, str]]]]
     if is_classification:
@@ -870,6 +1293,10 @@ def prepare_data(
             )
             n_targ_drop = orig_n - df_no_y.shape[0]
             df = pd.concat([df_no_y, y], axis=1)
+            if raw_targets is not None:
+                multitarget_audit = _build_multitarget_audit(
+                    raw_targets, y, labels, is_classification=True
+                )
         else:
             df, n_targ_drop, ix_train, ix_tests = timer(drop_target_nans)(
                 df, target_cols[0], ix_train, ix_tests
@@ -879,21 +1306,15 @@ def prepare_data(
             )
     else:
         if len(target_cols) > 1:
-            y_df_raw = df[target_cols].copy()
-            keep_mask = ~y_df_raw.isna().any(axis=1)
-            n_targ_drop = int((~keep_mask).sum())
-            ix_train, ix_tests = reindex(keep_mask, ix_train, ix_tests)
-            df = df.loc[keep_mask].reset_index(drop=True)
-            y_df_raw = y_df_raw.loc[keep_mask].reset_index(drop=True)
-            y = DataFrame(index=y_df_raw.index)
-            for col in target_cols:
-                scaled = (
-                    RobustScaler(quantile_range=(2.5, 97.5))
-                    .fit_transform(y_df_raw[[col]])
-                    .ravel()
+            orig_n = len(df)
+            df, y, ix_train, ix_tests = timer(clean_regression_targets)(
+                df, target_cols, ix_train, ix_tests
+            )
+            n_targ_drop = orig_n - len(df)
+            if raw_targets is not None:
+                multitarget_audit = _build_multitarget_audit(
+                    raw_targets, y, labels=None, is_classification=False
                 )
-                y[col] = scaled
-            df[target_cols] = y
         else:
             df, n_targ_drop, ix_train, ix_tests = timer(drop_target_nans)(
                 df, target_cols[0], ix_train, ix_tests
@@ -909,15 +1330,33 @@ def prepare_data(
         )
         if len(target_cols) == 1 and i == 0:
             info = target_info
-    df = timer(drop_unusable)(df, results, target=target_cols, _warn=_warn)
+    fit_indices = ix_train
+    df = timer(drop_unusable)(
+        df,
+        results,
+        target=target_cols,
+        _warn=_warn,
+        fit_indices=fit_indices,
+    )
+    X_tabpfn = df.drop(
+        columns=[*target_cols, *([] if grouper is None else [grouper])],
+        errors="ignore",
+    ).reset_index(drop=True)
+    tabpfn_categoricals = set(results.cats.infos) | set(results.binaries.infos)
+    for col in tabpfn_categoricals.intersection(X_tabpfn.columns):
+        X_tabpfn[col] = X_tabpfn[col].astype("category")
     df, X_cont, n_ind_added = handle_continuous_nans(
         df=df,
         target=target_cols,
         grouper=grouper,
         results=results,
         nans=NanHandling.Median,
+        fit_indices=fit_indices,
     )
-    X_cont = normalize_continuous(X_cont, robust=True)
+    X_cont = normalize_continuous(
+        X_cont, robust=True, fit_indices=fit_indices
+    )
+    df[X_cont.columns] = X_cont
 
     df = timer(deflate_categoricals)(df, grouper, results, _warn=_warn)
     df, X_cat = timer(encode_categoricals)(
@@ -926,6 +1365,7 @@ def prepare_data(
         grouper=grouper,
         results=results,
         warn_explosion=_warn,
+        fit_indices=fit_indices,
     )
 
     X = df.drop(columns=target_cols).reset_index(drop=True)
@@ -936,6 +1376,7 @@ def prepare_data(
         g = None
     return PreparedData(
         X=X,
+        X_tabpfn=X_tabpfn,
         X_cont=X_cont,
         X_cat=X_cat,
         y=y,
@@ -952,6 +1393,7 @@ def prepare_data(
             target_info=info,
             runtimes=times,
             is_classification=is_classification,
+            multitarget_audit=multitarget_audit,
         ),
         inspection=results,
         is_classification=is_classification,

@@ -7,6 +7,8 @@
 - **prepared**: summary of data preparation (compute times, final data shape
   after encoding and drops)
 - **features**: information about the features
+- **features/downsampling**: selected source columns or projected component
+  metadata, score tables, runtimes, and the resolved downsampling method
 - **features/associations**: univariate (statistical) associations of each
   feature with the target variable
 - **features/predictions**: predictive performance on the target for each
@@ -21,8 +23,75 @@
   (currently only step-up and backward)
 - **results**: final tables of predictive performance after feature selection
   and tuning
+- **results/error_consistency**: repeated K-fold error consistency summaries,
+  per-configuration diagnostics, trial scores, and plots
 - **tuning**: (currently unused) params for each tuned model and each
   selection method
+
+For multi-target runs, target-specific feature reports are stored in subfolders
+named after each target. The `prepared` directory also contains the target and
+split audits. Final results include:
+
+- `final_performances_per_target.csv`
+- `results_report_target_<target>.md`
+- `performance_long_table_per_target.csv`
+- `multitarget_split_report.md` (or one file per external-test fold)
+
+Multi-target regression tuning normalizes error scores per target before
+aggregation. Final MAE, MSE, and RMSE values are not normalized; when targets
+have different units, compare their per-target tables or the scale-free R²
+metrics.
+
+Final holdout cross-validation uses at most five folds. Grouped runs reduce the
+fold count when the holdout contains fewer than five distinct groups, while
+preserving group-disjoint folds. `final_cv_folds` records the count actually
+used. The value column named `5-fold` is retained for output compatibility and
+must be interpreted using `final_cv_folds`. Fewer than five folds also produces
+a warning because the resulting estimate can be unstable.
+
+When `--error-consistency` is enabled, `results/error_consistency` contains:
+
+See [Error consistency and repeated K-fold design](error_consistency.md) for the
+formulas, aggregation rules, randomness controls, and interpretation limits.
+
+- `summary.csv`: EC values for every target, model, selection, and EC method,
+  together with `scientific_status`, `reference_url`, and `inferential_status`.
+  Classification error IoU identifies its published reference; regression
+  residual-consistency methods are marked as experimental descriptive diagnostics.
+- `performance_summary.csv`: mean and sample standard deviation of the repeated
+  K-fold models on the common holdout
+- `trial_scores.csv`: predictive score from every repeated fold model
+- `trial_design.csv`: repetition/fold split and model seeds, split sizes, and
+  group-overlap audit for successful configurations; grouped configurations that
+  require a non-grouped fallback are skipped
+- `fold_assignments.csv`: exact validation-fold assignment of every training-row
+  position in every repetition (the training fold is its complement)
+- `correlation_summary.csv` and `model_ec_ranking.csv`: target-specific
+  performance/stability diagnostics
+- `target_ec_trend.csv`: target-level EC trend summaries
+- `metadata.json` and `README.md`: run metadata and interpretation guidance
+- `plots/`: EC distributions, EC/performance comparisons, and a correlation
+  heatmap when the required data are available
+- `<target>/<model>/<selection>_<embed-selector>/`: pairwise matrices, sample diagnostics,
+  trial scores, exact fold assignments, difficult/unstable sample tables,
+  optional group diagnostics, and pairwise plots. Pairwise values label
+  within- versus between-repetition comparisons. `--ec-save-predictions`
+  additionally writes `trial_predictions.csv` and
+  `residual_or_error_matrix.csv`.
+
+When adaptive error and EC are both enabled,
+`results/adaptive_error/tables` also contains
+`risk_stability_report.csv`, `risk_stability_summary.csv`, and
+`risk_stability_skipped.csv`.
+
+For multiple external test sets these files are nested under `testXX`. Error
+consistency holds feature selection and tuned hyperparameters fixed; it measures
+refit stability and is not a nested re-selection analysis.
+
+`ec_model_pair_sd` is the sample standard deviation of model-pair EC means.
+`ec_pooled_value_sd` (and the legacy `ec_sd`) pools pair-by-sample values for
+samplewise regression methods. These are descriptive dispersions of dependent
+comparisons, not standard errors or confidence intervals.
 
 ## Output Files
 

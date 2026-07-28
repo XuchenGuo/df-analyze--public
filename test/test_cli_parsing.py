@@ -36,7 +36,10 @@ from df_analyze.enumerables import (
 )
 from df_analyze.testing.datasets import ALL_DATASETS, TEST_DATASETS, TestDataset, all_ds
 
-PATH = list(TEST_DATASETS.values())[0].datapath
+pytestmark = pytest.mark.skipif(
+    not TEST_DATASETS, reason="Optional parquet test datasets are not available."
+)
+PATH = next(iter(TEST_DATASETS.values())).datapath if TEST_DATASETS else Path()
 
 
 @pytest.mark.fast

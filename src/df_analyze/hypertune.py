@@ -61,6 +61,7 @@ from df_analyze.models.dummy import DummyClassifier, DummyRegressor
 from df_analyze.testing.datasets import TestDataset
 
 if TYPE_CHECKING:
+    from df_analyze.downsampling.containers import FeatureDownsampleResult
     from df_analyze.models.base import DfAnalyzeModel
 import jsonpickle
 
@@ -76,6 +77,7 @@ from df_analyze.hypertune_io import (
     _serialize_probs,
 )
 from df_analyze.models.gandalf import GandalfEstimator
+from df_analyze.models.kan import KANEstimator
 from df_analyze.models.mlp import MLPEstimator
 from df_analyze.preprocessing.prepare import PreparedData
 from df_analyze.saving import add_fold_idx
@@ -110,6 +112,11 @@ class HtuneResult:
     probs_test: ProbArray
     probs_train: ProbArray
     target: Optional[str] = None
+    downsample_requested: str = "none"
+    downsample_resolved: str = "none"
+    n_downsampled_features: int = 0
+    failure_reason: Optional[str] = None
+    per_target_tuning_scores: dict[str, float] = field(default_factory=dict)
 
     @no_type_check  # Pyright mucks up the conditionals here...
     def __eq__(self, other: object) -> bool:
@@ -135,6 +142,10 @@ class HtuneResult:
             and probs_test_equal
             and probs_train_equal
             and self.target == other.target
+            and self.downsample_requested == other.downsample_requested
+            and self.downsample_resolved == other.downsample_resolved
+            and self.n_downsampled_features == other.n_downsampled_features
+            and self.per_target_tuning_scores == other.per_target_tuning_scores
         )
         return bool(ret)
 
@@ -149,6 +160,14 @@ class HtuneResult:
                 "params": str(jsonpickle.encode(self.params)),
                 "metric": self.metric.value,
                 "score": self.score,
+                "downsample_requested": self.downsample_requested,
+                "downsample": self.downsample_resolved,
+                "n_downsampled_features": self.n_downsampled_features,
+                "failure_reason": self.failure_reason,
+                "per_target_tuning_scores": json.dumps(
+                    self.per_target_tuning_scores,
+                    sort_keys=True,
+                ),
             },
             index=[0],
         )
@@ -203,6 +222,7 @@ class HtuneResult:
             "probs_dtype": probs_dtype,
             "probs_kind": probs_kind,
             "target": self.target,
+            "per_target_tuning_scores": self.per_target_tuning_scores,
         }
         return json.dumps(obj)
 
@@ -225,6 +245,10 @@ class HtuneResult:
             probs_test=self.probs_test,
             probs_train=self.probs_train,
             target=self.target,
+            downsample_requested=self.downsample_requested,
+            downsample_resolved=self.downsample_resolved,
+            n_downsampled_features=self.n_downsampled_features,
+            per_target_tuning_scores=self.per_target_tuning_scores,
         )
 
     @staticmethod
@@ -312,6 +336,10 @@ class PredResult:
     probs_test: ProbArray
     probs_train: ProbArray
     target: Optional[str] = None
+    downsample_requested: str = "none"
+    downsample_resolved: str = "none"
+    n_downsampled_features: int = 0
+    per_target_tuning_scores: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -397,8 +425,14 @@ class EvaluationResults:
         col = valset
         idx = ~self.df.mean(axis=1, numeric_only=True).isna()
         index_cols = ["model", "selection", "embed_selector"]
+        if "downsample" in self.df.columns:
+            if "downsample_requested" in self.df.columns:
+                index_cols.append("downsample_requested")
+            index_cols.extend(["downsample", "n_downsampled_features"])
         if "target" in self.df.columns:
             index_cols.append("target")
+        if "final_cv_folds" in self.df.columns:
+            index_cols.append("final_cv_folds")
         df = (
             self.df.loc[idx]
             .drop(columns=cols)
@@ -423,13 +457,26 @@ class EvaluationResults:
         tab_train = df_train.to_markdown(tablefmt="simple", floatfmt="0.3f", index=False)
         tab_hold = df_hold.to_markdown(tablefmt="simple", floatfmt="0.3f", index=False)
         tab_fold = df_fold.to_markdown(tablefmt="simple", floatfmt="0.3f", index=False)
+        fold_counts = (
+            pd.to_numeric(self.df["final_cv_folds"], errors="coerce")
+            .dropna()
+            .astype(int)
+            .unique()
+            if "final_cv_folds" in self.df.columns
+            else np.asarray([5])
+        )
+        fold_heading = (
+            f"{int(fold_counts[0])}-fold"
+            if len(fold_counts) == 1
+            else "adaptive-fold"
+        )
         text = (
             "# Final Model Performances\n\n"
             "## Training set performance\n\n"
             f"{tab_train}\n\n"
             "## Holdout set performance\n\n"
             f"{tab_hold}\n\n"
-            "## 5-fold performance on holdout set\n\n"
+            f"## {fold_heading} performance on holdout set\n\n"
             f"{tab_fold}\n\n"
         )
         return text
@@ -562,6 +609,12 @@ class EvaluationResults:
                 probs_test=probs_test,
                 probs_train=probs_train,
                 target=result.get("target"),
+                per_target_tuning_scores={
+                    str(target): float(score)
+                    for target, score in result.get(
+                        "per_target_tuning_scores", {}
+                    ).items()
+                },
             )
             pred_results.append(pred_result)
         return pred_results
@@ -614,20 +667,20 @@ def evaluate_tuned(
     prepared: PreparedData,
     prep_train: PreparedData,
     prep_test: PreparedData,
-    assoc_filtered: FilterSelected,
+    assoc_filtered: Optional[FilterSelected],
     pred_filtered: Optional[FilterSelected],
     model_selected: ModelSelected,
     options: ProgramOptions,
+    downsample_result: Optional[FeatureDownsampleResult] = None,
 ) -> EvaluationResults:
-    model_cls: Union[Type[DfAnalyzeModel], Type[MLPEstimator]]
+    model_cls: Union[Type[DfAnalyzeModel], Type[MLPEstimator], Type[KANEstimator]]
     results: list[HtuneResult]
     dfs: list[DataFrame]
     per_target_dfs: list[DataFrame]
 
-    selections: dict[str, Optional[list[str]]] = {
-        "none": None,
-        "assoc": assoc_filtered.selected,
-    }
+    selections: dict[str, Optional[list[str]]] = {"none": None}
+    if assoc_filtered is not None:
+        selections["assoc"] = assoc_filtered.selected
     if pred_filtered is not None:
         selections["pred"] = pred_filtered.selected
 
@@ -643,45 +696,76 @@ def evaluate_tuned(
         metric = options.htune_cls_metric
     else:
         metric = options.htune_reg_metric
+    n_downsampled_features = (
+        prep_train.X.shape[1]
+        if downsample_result is None
+        else downsample_result.n_features_out
+    )
 
     dfs, results, per_target_dfs = [], [], []
     for model_cls in options.models:
         for selection, cols in selections.items():
             selected_cols = _get_cols(selection=selection, selected=cols)
             X_train, X_test = _get_splits(prep_train, prep_test, selection, selected_cols)
+            is_tabpfn_model = prep_train._is_tabpfn_model(model_cls)
+            if is_tabpfn_model:
+                X_train = prep_train.model_matrix(model_cls, selected_cols)
+                X_test = prep_test.model_matrix(model_cls, selected_cols)
             if X_train.empty or X_test.empty:
                 raise ValueError(
                     f"Error when subsetting features for model '{model_cls.shortname}'. Got:\n"
                     f"cols: {cols}\n"
                     f"selected_cols: {selected_cols}\n"
                 )
-            if X_train.isna().any().any() or X_test.isna().any().any():
+            if not is_tabpfn_model and (
+                X_train.isna().any().any() or X_test.isna().any().any()
+            ):
                 raise ValueError(
                     f"Got NaNs when subsetting features for model '{model_cls.shortname}'. Got:\n"
                     f"cols: {cols}\n"
                     f"selected_cols: {selected_cols}\n"
                 )
 
-            if model_cls is MLPEstimator:
+            if model_cls in (MLPEstimator, KANEstimator):
                 model = model_cls(num_classes=prepared.num_classes)  # type: ignore
             elif model_cls is GandalfEstimator:
                 model = model_cls(num_classes=prepared.num_classes)  # type: ignore
             else:
                 model = model_cls()  # type: ignore
+            model.set_runtime(options.runtime)
 
             is_embed = "embed" in selection
             embed_model = embed_models[selection] if is_embed else None
             print(f"Tuning {model.longname} for selection={selection}")
             try:
+                tuning_rows = (
+                    downsample_result.tuning_rows
+                    if downsample_result is not None and downsample_result.tuning_rows
+                    else list(range(len(X_train)))
+                )
+                X_tune = X_train.iloc[tuning_rows]
+                y_tune = prep_train.y.iloc[tuning_rows]
+                g_tune = (
+                    None
+                    if prep_train.groups is None
+                    else prep_train.groups.iloc[tuning_rows]
+                )
                 study = model.htune_optuna(
-                    X_train=X_train,
-                    y_train=prep_train.y,
-                    g_train=prep_train.groups,
+                    X_train=X_tune,
+                    y_train=y_tune,
+                    g_train=g_tune,
                     n_trials=options.htune_trials,
                     metric=metric,  # type: ignore
                     n_jobs=-1,
                     verbosity=optuna.logging.ERROR,
                 )
+                if len(tuning_rows) < len(X_train):
+                    model.refit_tuned(
+                        X=X_train,
+                        y=prep_train.y,
+                        g=prep_train.groups,
+                        tuned_args=study.best_params,
+                    )
                 (
                     df,
                     preds_train,
@@ -711,6 +795,20 @@ def evaluate_tuned(
                     preds_test=preds_test,
                     probs_train=probs_train,
                     probs_test=probs_test,
+                    downsample_requested=(
+                        "none"
+                        if downsample_result is None
+                        else downsample_result.requested_method
+                    ),
+                    downsample_resolved=(
+                        "none"
+                        if downsample_result is None
+                        else downsample_result.resolved_method
+                    ),
+                    n_downsampled_features=n_downsampled_features,
+                    per_target_tuning_scores=dict(
+                        model.per_target_tuning_scores
+                    ),
                 )
                 results.append(result)
                 if df_target is not None and len(df_target) > 0:
@@ -719,6 +817,11 @@ def evaluate_tuned(
                     df_target["selection"] = selection
                     df_target["embed_selector"] = (
                         embed_model.value if embed_model is not None else "none"
+                    )
+                    df_target["downsample_requested"] = result.downsample_requested
+                    df_target["downsample"] = result.downsample_resolved
+                    df_target["n_downsampled_features"] = (
+                        result.n_downsampled_features
                     )
                     per_target_dfs.append(df_target)
             except Exception as e:
@@ -748,6 +851,18 @@ def evaluate_tuned(
                     preds_test=Series(),
                     probs_train=None,
                     probs_test=None,
+                    downsample_requested=(
+                        "none"
+                        if downsample_result is None
+                        else downsample_result.requested_method
+                    ),
+                    downsample_resolved=(
+                        "none"
+                        if downsample_result is None
+                        else downsample_result.resolved_method
+                    ),
+                    n_downsampled_features=n_downsampled_features,
+                    failure_reason=str(e),
                 )
                 results.append(result)
                 if isinstance(prep_test.y, DataFrame):
@@ -768,6 +883,11 @@ def evaluate_tuned(
                                         if embed_model is not None
                                         else "none"
                                     ),
+                                    "downsample_requested": result.downsample_requested,
+                                    "downsample": result.downsample_resolved,
+                                    "n_downsampled_features": (
+                                        result.n_downsampled_features
+                                    ),
                                 }
                             )
                     if len(rows) > 0:
@@ -777,6 +897,17 @@ def evaluate_tuned(
             df["embed_selector"] = (
                 embed_model.value if embed_model is not None else "none"
             )
+            df["downsample_requested"] = (
+                "none"
+                if downsample_result is None
+                else downsample_result.requested_method
+            )
+            df["downsample"] = (
+                "none"
+                if downsample_result is None
+                else downsample_result.resolved_method
+            )
+            df["n_downsampled_features"] = n_downsampled_features
             dfs.append(df)
     df = pd.concat(dfs, axis=0, ignore_index=True)
     per_target_df = (
@@ -1073,7 +1204,7 @@ def hypertune_classifier(
     # HYPERTUNING
     objective = OBJECTIVES[classifier]
     study = optuna.create_study(
-        direction="maximize", sampler=optuna.samplers.TPESampler()
+        direction="maximize", sampler=optuna.samplers.TPESampler(seed=SEED)
     )
     optuna.logging.set_verbosity(verbosity)
     if classifier == "mlp":

@@ -115,7 +115,6 @@ def _write_ensemble_error_metrics(
     n_test: int,
     n_bins: int,
 ) -> tuple[Optional[float], Optional[float], Optional[float]]:
-    meta_dir = metrics_path.parent
     valid_mask = np.isfinite(p_err_test) & np.isfinite(incorrect_test)
     n_valid = int(valid_mask.sum())
     global_error_test = None
@@ -380,9 +379,7 @@ def _write_ensemble_coverage_curve(
     p_err_test: np.ndarray,
     correct_test: np.ndarray,
 ) -> Optional[pd.DataFrame]:
-    curve_test = build_coverage_accuracy_curve_rank(
-        risk=p_err_test, correct=correct_test
-    )
+    curve_test = build_coverage_accuracy_curve_rank(risk=p_err_test, correct=correct_test)
     if curve_test.empty:
         _write_not_available_csv(
             s_tables / "coverage_accuracy_curve.csv", reason="No test samples."

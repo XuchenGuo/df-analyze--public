@@ -23,6 +23,7 @@ from pandas import DataFrame
 if TYPE_CHECKING:
     from df_analyze.analysis.univariate.associate import AssocResults
     from df_analyze.analysis.univariate.predict.predict import PredResults
+    from df_analyze.downsampling.containers import FeatureDownsampleResult
     from df_analyze.hypertune import EvaluationResults
     from df_analyze.preprocessing.cleaning import RenameInfo
     from df_analyze.preprocessing.inspection.inspection import InspectionResults
@@ -32,6 +33,19 @@ if TYPE_CHECKING:
 from df_analyze.utils import Debug
 
 JOBLIB = "__JOBLIB_CACHE__"
+
+
+def windows_io_path(path: Path) -> Path:
+    """Return a Windows extended-length path suitable for filesystem I/O."""
+    if os.name != "nt":
+        return path
+
+    raw = os.path.abspath(str(path))
+    if raw.startswith("\\\\?\\"):
+        return Path(raw)
+    if raw.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + raw.lstrip("\\"))
+    return Path("\\\\?\\" + raw)
 
 
 class FileType(Enum):
@@ -54,6 +68,7 @@ class ProgramDirs(Debug):
     inspection: Optional[Path] = None
     prepared: Optional[Path] = None
     features: Optional[Path] = None
+    downsampling: Optional[Path] = None
     descriptions: Optional[Path] = None
     associations: Optional[Path] = None
     predictions: Optional[Path] = None
@@ -82,6 +97,7 @@ class ProgramDirs(Debug):
             inspection=root / "inspection",
             prepared=root / "prepared",
             features=root / "features",
+            downsampling=root / "features/downsampling",
             descriptions=root / "features/descriptions",
             associations=root / "features/associations",
             predictions=root / "features/predictions",
@@ -255,7 +271,7 @@ class ProgramDirs(Debug):
         if target is None:
             return base
         target_dir = base / self._safe_target_name(target)
-        target_dir.mkdir(exist_ok=True, parents=True)
+        windows_io_path(target_dir).mkdir(exist_ok=True, parents=True)
         return target_dir
 
     @staticmethod
@@ -268,6 +284,8 @@ class ProgramDirs(Debug):
         idx_cols = ["model", "selection"]
         if "embed_selector" in df.columns:
             idx_cols.append("embed_selector")
+        if "final_cv_folds" in df.columns:
+            idx_cols.append("final_cv_folds")
         wide = (
             df.drop(columns=drop_cols, errors="ignore")
             .pivot_table(index=idx_cols, columns="metric", values=valset, aggfunc="mean")
@@ -303,13 +321,26 @@ class ProgramDirs(Debug):
         tab_train = train.to_markdown(tablefmt="simple", floatfmt="0.3f", index=False)
         tab_hold = hold.to_markdown(tablefmt="simple", floatfmt="0.3f", index=False)
         tab_fold = fold.to_markdown(tablefmt="simple", floatfmt="0.3f", index=False)
+        fold_counts = (
+            pd.to_numeric(df_target["final_cv_folds"], errors="coerce")
+            .dropna()
+            .astype(int)
+            .unique()
+            if "final_cv_folds" in df_target.columns
+            else [5]
+        )
+        fold_heading = (
+            f"{int(fold_counts[0])}-fold"
+            if len(fold_counts) == 1
+            else "adaptive-fold"
+        )
         return (
             f"# Final Model Performances For Target `{target_name}`\n\n"
             "## Training set performance\n\n"
             f"{tab_train}\n\n"
             "## Holdout set performance\n\n"
             f"{tab_hold}\n\n"
-            "## 5-fold performance on holdout set\n\n"
+            f"## {fold_heading} performance on holdout set\n\n"
             f"{tab_fold}\n\n"
         )
 
@@ -372,7 +403,7 @@ class ProgramDirs(Debug):
             out = add_fold_idx(
                 self.results / "final_performances_per_target.csv", fold_idx=fold_idx
             )
-            long_df.to_csv(out, index=False)
+            long_df.to_csv(windows_io_path(out), index=False)
         except Exception as e:
             warn(
                 "Got exception when attempting to save per-target final "
@@ -398,7 +429,7 @@ class ProgramDirs(Debug):
                     self.results / f"results_report_target_{safe_target}.md",
                     fold_idx=fold_idx,
                 )
-                out.write_text(text, encoding="utf-8")
+                windows_io_path(out).write_text(text, encoding="utf-8")
         except Exception as e:
             warn(
                 "Got exception when attempting to save per-target markdown "
@@ -418,7 +449,7 @@ class ProgramDirs(Debug):
                 self.results / f"main_metric_by_target_{metric}.csv",
                 fold_idx=fold_idx,
             )
-            wide.to_csv(out, index=False)
+            wide.to_csv(windows_io_path(out), index=False)
         except Exception as e:
             warn(
                 "Got exception when attempting to save per-target main-metric "
@@ -569,7 +600,7 @@ class ProgramDirs(Debug):
             return
         out = add_fold_idx(out_dir / "predictions_report.md", fold_idx=fold_idx)
         try:
-            out.write_text(report, encoding="utf-8")
+            windows_io_path(out).write_text(report, encoding="utf-8")
         except Exception as e:
             warn(
                 "Got exception when attempting to save predictions report. "
@@ -587,7 +618,7 @@ class ProgramDirs(Debug):
             return
         out = add_fold_idx(out_dir / "associations_report.md", fold_idx=fold_idx)
         try:
-            out.write_text(report, encoding="utf-8")
+            windows_io_path(out).write_text(report, encoding="utf-8")
         except Exception as e:
             warn(
                 "Got exception when attempting to save associations report. "
@@ -603,15 +634,16 @@ class ProgramDirs(Debug):
         out_dir = self._target_output_dir(self.predictions, target)
         if out_dir is None:
             return
+        io_dir = windows_io_path(out_dir)
         try:
-            preds.save_raw(out_dir, fold_idx=fold_idx)
+            preds.save_raw(io_dir, fold_idx=fold_idx)
         except Exception as e:
             warn(
                 "Got exception when attempting to save raw predictions. "
                 f"Details:\n{e}\n{traceback.format_exc()}"
             )
         try:
-            preds.save_tables(out_dir, fold_idx=fold_idx)
+            preds.save_tables(io_dir, fold_idx=fold_idx)
         except Exception as e:
             warn(
                 "Got exception when attempting to save prediction csv tables. "
@@ -627,15 +659,16 @@ class ProgramDirs(Debug):
         out_dir = self._target_output_dir(self.associations, target)
         if out_dir is None:
             return
+        io_dir = windows_io_path(out_dir)
         try:
-            assocs.save_raw(out_dir, fold_idx=fold_idx)
+            assocs.save_raw(io_dir, fold_idx=fold_idx)
         except Exception as e:
             warn(
                 "Got exception when attempting to save raw associations. "
                 f"Details:\n{e}\n{traceback.format_exc()}"
             )
         try:
-            assocs.save_tables(out_dir, fold_idx=fold_idx)
+            assocs.save_tables(io_dir, fold_idx=fold_idx)
         except Exception as e:
             warn(
                 "Got exception when attempting to save association csv tables. "
@@ -647,17 +680,19 @@ class ProgramDirs(Debug):
         desc_cont: Optional[DataFrame],
         desc_cat: Optional[DataFrame],
         desc_target: DataFrame,
+        target_name: Optional[str] = None,
     ) -> None:
-        if self.descriptions is None:
+        out_dir = self._target_output_dir(self.descriptions, target_name)
+        if out_dir is None:
             return
 
-        conts = self.descriptions / "continuous_features.csv"
-        cats = self.descriptions / "categorical_features.csv"
-        target = self.descriptions / "target.csv"
+        conts = out_dir / "continuous_features.csv"
+        cats = out_dir / "categorical_features.csv"
+        target = out_dir / "target.csv"
 
         if desc_cont is not None:
             try:
-                desc_cont.to_csv(conts)
+                desc_cont.to_csv(windows_io_path(conts))
             except Exception as e:
                 warn(
                     "Got exception when attempting to save continuous feature "
@@ -666,7 +701,7 @@ class ProgramDirs(Debug):
 
         if desc_cat is not None:
             try:
-                desc_cat.to_csv(cats)
+                desc_cat.to_csv(windows_io_path(cats))
             except Exception as e:
                 warn(
                     "Got exception when attempting to save categorical feature "
@@ -674,29 +709,69 @@ class ProgramDirs(Debug):
                 )
 
         try:
-            desc_target.to_csv(target)
+            desc_target.to_csv(windows_io_path(target))
         except Exception as e:
             warn(
                 "Got exception when attempting to save target "
                 f"descriptions. Details:\n{e}\n{traceback.format_exc()}"
             )
 
-    def save_prepared_raw(self, prepared: PreparedData) -> None:
+    def save_downsampling(
+        self,
+        result: FeatureDownsampleResult,
+        fold_idx: Optional[int] = None,
+    ) -> None:
+        if self.downsampling is None:
+            return
+        try:
+            report = add_fold_idx(
+                self.downsampling / "downsampling_report.md", fold_idx
+            )
+            metadata = add_fold_idx(
+                self.downsampling / "downsampling.json", fold_idx
+            )
+            selected = add_fold_idx(
+                self.downsampling / "selected_features.csv", fold_idx
+            )
+            report.write_text(result.to_markdown(), encoding="utf-8")
+            metadata.write_text(result.to_json() + "\n", encoding="utf-8")
+            result.selected_frame().to_csv(selected, index=False)
+            scores = result.scores_frame()
+            if scores is not None:
+                score_path = add_fold_idx(
+                    self.downsampling / "feature_scores.csv", fold_idx
+                )
+                scores.to_csv(score_path, index=False)
+        except Exception as e:
+            warn(
+                "Got exception when attempting to save feature downsampling results. "
+                f"Details:\n{e}\n{traceback.format_exc()}"
+            )
+
+    def save_prepared_raw(
+        self, prepared: PreparedData, fold_idx: Optional[int] = None
+    ) -> None:
         if self.prepared is None:
             return
         try:
-            prepared.save_raw(self.prepared)
+            root = self.prepared
+            if fold_idx is not None:
+                root = root / f"test{fold_idx:02d}"
+                root.mkdir(exist_ok=True, parents=True)
+            prepared.save_raw(root)
         except Exception as e:
             warn(
                 "Got exception when attempting to prepared data. "
                 f"Details:\n{e}\n{traceback.format_exc()}"
             )
 
-    def save_prep_report(self, report: Optional[str]) -> None:
+    def save_prep_report(
+        self, report: Optional[str], fold_idx: Optional[int] = None
+    ) -> None:
         if (self.prepared is None) or (report is None):
             return
 
-        out = self.prepared / "preparation_report.md"
+        out = add_fold_idx(self.prepared / "preparation_report.md", fold_idx)
         try:
             out.write_text(report, encoding="utf-8")
         except Exception as e:
@@ -705,14 +780,38 @@ class ProgramDirs(Debug):
                 f"Details:\n{e}\n{traceback.format_exc()}"
             )
 
-    def save_inspect_reports(self, inspection: InspectionResults) -> None:
+    def save_multitarget_split_report(
+        self, report: Optional[str], fold_idx: Optional[int]
+    ) -> None:
+        if self.prepared is None or report is None:
+            return
+        name = (
+            "multitarget_split_report.md"
+            if fold_idx is None
+            else f"multitarget_split_report_fold_{fold_idx}.md"
+        )
+        try:
+            (self.prepared / name).write_text(report, encoding="utf-8")
+        except Exception as e:
+            warn(
+                "Got exception when attempting to save multi-target split report. "
+                f"Details:\n{e}\n{traceback.format_exc()}"
+            )
+
+    def save_inspect_reports(
+        self, inspection: InspectionResults, fold_idx: Optional[int] = None
+    ) -> None:
         if self.inspection is None:
             return
         try:
             short = inspection.short_report()
             full = inspection.full_report()
-            out_short = self.inspection / "short_inspection_report.md"
-            out_full = self.inspection / "full_inspection_report.md"
+            out_short = add_fold_idx(
+                self.inspection / "short_inspection_report.md", fold_idx
+            )
+            out_full = add_fold_idx(
+                self.inspection / "full_inspection_report.md", fold_idx
+            )
             out_short.write_text(short, encoding="utf-8")
             if full is not None:
                 out_full.write_text(full, encoding="utf-8")
@@ -722,12 +821,14 @@ class ProgramDirs(Debug):
                 f"Details:\n{e}\n{traceback.format_exc()}"
             )
 
-    def save_inspect_tables(self, inspection: InspectionResults) -> None:
+    def save_inspect_tables(
+        self, inspection: InspectionResults, fold_idx: Optional[int] = None
+    ) -> None:
         if self.inspection is None:
             return
         try:
             df = inspection.basic_df()
-            out = self.inspection / "inferred_types.csv"
+            out = add_fold_idx(self.inspection / "inferred_types.csv", fold_idx)
             df.to_csv(out)
         except Exception as e:
             warn(
@@ -814,7 +915,7 @@ class ProgramDirs(Debug):
             "# Final Model Performances Summary Across Test Sets\n\n"
             "## Holdout set performances\n\n"
             f"{tab_hold}\n\n"
-            "## 5-fold performance on holdout sets\n\n"
+            "## Final cross-validation performance on holdout sets\n\n"
             f"{tab_fold}\n\n"
             "## Training set performances\n\n"
             f"{tab_train}\n\n"

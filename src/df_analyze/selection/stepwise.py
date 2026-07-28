@@ -22,6 +22,7 @@ from df_analyze.models.knn import KNNClassifier, KNNRegressor
 from df_analyze.models.lgbm import LightGBMClassifier, LightGBMRegressor
 from df_analyze.models.linear import ElasticNetRegressor, SGDClassifierSelector
 from df_analyze.preprocessing.prepare import PreparedData
+from df_analyze.runtime.hardware import RuntimeComponent, RuntimePolicy, get_runtime
 
 
 @dataclass
@@ -86,6 +87,7 @@ def get_dfanalyze_score(
     candidate: str,
     is_forward: bool,
     test: bool,
+    runtime: Optional[RuntimePolicy] = None,
 ) -> float:
     includes = selected.copy()
     includes.add(candidate)
@@ -94,6 +96,7 @@ def get_dfanalyze_score(
     X_new = X_new.copy()
     g = None if g is None else g.copy()
     model = model_cls()
+    model.set_runtime(runtime or get_runtime("cpu"))
 
     return model.cv_score(X_new, y.copy(), g, test=test, metric=metric)
 
@@ -138,6 +141,11 @@ class StepwiseSelector:
         self.n_iterations = (
             self.n_features if self.is_forward else self.total_feats - self.n_features
         )
+
+    def _candidate_n_jobs(self) -> int:
+        if self.options.wrapper_model is WrapperSelectionModel.KNN:
+            return self.options.runtime.tuning_jobs(RuntimeComponent.KNN, -1)
+        return -1
 
     def fit(self) -> None:
         ddesc = "Forward" if self.is_forward else "Backward"
@@ -206,7 +214,7 @@ class StepwiseSelector:
 
         # loop only over un-flagged features
         candidates = list(self.to_consider.copy())
-        all_scores: list[float] = Parallel(n_jobs=-1)(
+        all_scores: list[float] = Parallel(n_jobs=self._candidate_n_jobs())(
             delayed(get_dfanalyze_score)(  # type: ignore
                 model_cls=model_cls,
                 X=self.prepared.X,
@@ -217,6 +225,7 @@ class StepwiseSelector:
                 candidate=candidate,
                 is_forward=self.is_forward,
                 test=self.test,
+                runtime=self.options.runtime,
             )
             for candidate in tqdm(
                 candidates,
@@ -267,7 +276,7 @@ class StepwiseSelector:
             model_cls = SGDClassifierSelector if is_cls else ElasticNetRegressor
 
         candidates = list(self.to_consider.copy())
-        scores: list[float] = Parallel(n_jobs=-1)(
+        scores: list[float] = Parallel(n_jobs=self._candidate_n_jobs())(
             delayed(get_dfanalyze_score)(  # type: ignore
                 model_cls=model_cls,
                 X=self.prepared.X,
@@ -278,6 +287,7 @@ class StepwiseSelector:
                 candidate=candidate,
                 is_forward=self.is_forward,
                 test=self.test,
+                runtime=self.options.runtime,
             )
             for candidate in tqdm(
                 candidates,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import Any, Optional
 
 import numpy as np
@@ -22,15 +23,18 @@ from df_analyze.analysis.adaptive_error.proba import (
     predict_scores,
     scores_to_proba,
 )
+from df_analyze.models.base import classification_output_dim
 from df_analyze.splitting import OmniKFold
 
 
-def _init_model(model_cls: type, y_train: pd.Series) -> Any:
-    try:
-        return model_cls()
-    except TypeError:
-        n_classes = len(np.unique(np.asarray(y_train)))
-        return model_cls(num_classes=n_classes)
+def _init_model(model_cls: type, y_train: pd.Series, model_args=None) -> Any:
+    parameters = inspect.signature(model_cls).parameters
+    kwargs = {}
+    if "num_classes" in parameters:
+        kwargs["num_classes"] = classification_output_dim(y_train)
+    if "model_args" in parameters and model_args:
+        kwargs["model_args"] = dict(model_args)
+    return model_cls(**kwargs)
 
 
 def build_oof_for_result(
@@ -69,7 +73,14 @@ def build_oof_for_result(
         g_tr = groups.iloc[idx_train] if groups is not None else None
         X_val = X_train.iloc[idx_val]
 
-        model = _init_model(result.model_cls, y_train)
+        model = _init_model(
+            result.model_cls,
+            y_train,
+            model_args=getattr(result.model, "model_args", None),
+        )
+        runtime = getattr(result.model, "runtime", None)
+        if runtime is not None:
+            model.set_runtime(runtime)
         model.refit_tuned(X_tr, y_tr, g=g_tr, tuned_args=result.params)
         tuned_model = getattr(model, "tuned_model", None)
         if tuned_model is None:

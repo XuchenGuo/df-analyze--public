@@ -31,20 +31,29 @@ from df_analyze.embedding.download import (
     load_siglip_offline,
 )
 from df_analyze.embedding.utils import avg_pool, batched
+from df_analyze.runtime.hardware import RuntimeComponent, RuntimePolicy, get_runtime
+
+
+def _embedding_device(runtime: Optional[RuntimePolicy]) -> str:
+    return (runtime or get_runtime()).device_for(RuntimeComponent.Embedding)
 
 
 def get_model(
     modality: EmbeddingModality,
+    runtime: Optional[RuntimePolicy] = None,
 ) -> Union[
     tuple[XLMRobertaModel, XLMRobertaTokenizerFast], tuple[SiglipModel, SiglipProcessor]
 ]:
-    # no idea WTF is going on here, why I can't compare enums properly...
+    device = _embedding_device(runtime)
     if EmbeddingModality(modality.value) is EmbeddingModality.NLP:
-        return load_nlp_intfloat_ml_model_offline()
+        model, processor = load_nlp_intfloat_ml_model_offline()
     elif EmbeddingModality(modality.value) is EmbeddingModality.Vision:
-        return load_siglip_offline()
+        model, processor = load_siglip_offline()
     else:
         raise ValueError(f"Unrecognized modality: {modality}")
+    model.to(device)
+    model.eval()
+    return model, processor
 
 
 def get_nlp_tokenizations(
@@ -115,7 +124,11 @@ def get_nlp_embeddings(
     batch_size: int = 32,
     load_limit: Optional[int] = None,
     num_texts: Optional[int] = None,
+    runtime: Optional[RuntimePolicy] = None,
 ) -> DataFrame:
+    device = _embedding_device(runtime)
+    model.to(device)
+    model.eval()
     X = ds.X(limit=load_limit)
     y = ds.y(limit=load_limit)
 
@@ -158,13 +171,14 @@ def get_nlp_embeddings(
                 truncation=True,
                 return_tensors="pt",
             )
+            batch_dict = batch_dict.to(device)
             mask = batch_dict["attention_mask"]
             assert isinstance(mask, Tensor)
 
             outputs = model(**batch_dict)
             embeddings = avg_pool(outputs.last_hidden_state, attention_mask=mask)
             # embeddings = F.normalize(embeddings, p=2, dim=1)  # shape [B, 1024]
-            all_embeddings.append(embeddings)
+            all_embeddings.append(embeddings.detach().cpu())
 
     embeddings = torch.cat(all_embeddings)
     N, p = embeddings.shape
@@ -182,7 +196,11 @@ def get_vision_embeddings(
     batch_size: int = 2,
     load_limit: Optional[int] = None,
     num_imgs: Optional[int] = None,
+    runtime: Optional[RuntimePolicy] = None,
 ) -> DataFrame:
+    device = _embedding_device(runtime)
+    model.to(device)
+    model.eval()
     X, y = ds.X(limit=load_limit), ds.y(limit=load_limit)
 
     all_imgs = X.tolist()
@@ -209,6 +227,7 @@ def get_vision_embeddings(
                 # max_length=1024,  # leave at default, only add this if needed
                 return_tensors="pt",  # type: ignore
             )
+            processed = processed.to(device)
             outputs = model.vision_model(
                 **processed, output_hidden_states=False, output_attentions=False
             )
@@ -216,7 +235,7 @@ def get_vision_embeddings(
 
             # embeddings = avg_pool(embeddings2)
             # embeddings = F.normalize(embeddings, p=2, dim=1)  # shape [B, 1024]
-            all_embeddings.append(embeddings)
+            all_embeddings.append(embeddings.detach().cpu())
 
     embeddings = torch.cat(all_embeddings)
     N, p = embeddings.shape
@@ -246,6 +265,7 @@ def get_embeddings(
     batch_size: Optional[int] = 2,
     load_limit: Optional[int] = None,
     max_samples: Optional[int] = None,
+    runtime: Optional[RuntimePolicy] = None,
 ) -> DataFrame: ...
 
 
@@ -257,6 +277,7 @@ def get_embeddings(
     batch_size: Optional[int] = 2,
     load_limit: Optional[int] = None,
     max_samples: Optional[int] = None,
+    runtime: Optional[RuntimePolicy] = None,
 ) -> DataFrame: ...
 
 
@@ -267,6 +288,7 @@ def get_embeddings(
     batch_size: Optional[int] = 2,
     load_limit: Optional[int] = None,
     max_samples: Optional[int] = None,
+    runtime: Optional[RuntimePolicy] = None,
 ) -> DataFrame:
     batch_size = batch_size or 2
     if isinstance(ds, VisionDataset):
@@ -277,6 +299,7 @@ def get_embeddings(
             batch_size=batch_size,
             load_limit=load_limit,
             num_imgs=max_samples,
+            runtime=runtime,
         )
     elif isinstance(ds, NLPDataset):
         return get_nlp_embeddings(
@@ -286,6 +309,7 @@ def get_embeddings(
             batch_size=batch_size,
             load_limit=load_limit,
             num_texts=max_samples,
+            runtime=runtime,
         )
     else:
         raise ValueError(f"Unrecognized dataset type: {ds}")

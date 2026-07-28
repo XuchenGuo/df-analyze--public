@@ -26,9 +26,34 @@ from pandas import DataFrame, Series
 from df_analyze.cli.cli import ProgramOptions
 from df_analyze.hypertune import EvaluationResults
 from df_analyze.preprocessing.inspection.inspection import InspectionResults
+from df_analyze.saving import ProgramDirs, windows_io_path
 from df_analyze.selection.embedded import EmbedSelected
 from df_analyze.selection.wrapper import WrapperSelected
 from df_analyze.testing.datasets import TestDataset, fast_ds
+
+
+def test_target_markdown_reports_resolved_final_cv_folds() -> None:
+    scores = DataFrame(
+        {
+            "model": ["dummy"],
+            "selection": ["none"],
+            "metric": ["acc"],
+            "trainset": [0.8],
+            "holdout": [0.7],
+            "5-fold": [0.6],
+        }
+    )
+
+    compatibility_report = ProgramDirs()._target_markdown(
+        scores, target_name="target", is_classification=True
+    )
+    assert "## 5-fold performance on holdout set" in compatibility_report
+
+    scores["final_cv_folds"] = 3
+    adaptive_report = ProgramDirs()._target_markdown(
+        scores, target_name="target", is_classification=True
+    )
+    assert "## 3-fold performance on holdout set" in adaptive_report
 
 
 @fast_ds
@@ -210,6 +235,10 @@ def test_eval_preds_save(dataset: Tuple[str, TestDataset]) -> None:
         for _ in range(10):
             options = ProgramOptions.random(ds, outdir=outdir)
             selected = EvaluationResults.random(ds, options)
+            for idx, result in enumerate(selected.results):
+                result.per_target_tuning_scores = {
+                    "target_a": 0.25 + (idx / 1000)
+                }
             preds = [result.to_preds() for result in selected.results]
 
             selected.save(root=outdir, fold_idx=None)
@@ -294,3 +323,22 @@ def test_descs_save(dataset: Tuple[str, TestDataset]) -> None:
         ) from e
     finally:
         tempdir.cleanup()
+
+
+def test_target_feature_descriptions_support_long_paths(tmp_path: Path) -> None:
+    base = tmp_path / ("long-output-component-" * 8)
+    windows_io_path(base).mkdir(parents=True)
+    dirs = ProgramDirs(descriptions=base)
+    frame = DataFrame({"value": [1.0]})
+
+    dirs.save_feature_descriptions(
+        frame,
+        frame,
+        frame,
+        target_name="scholarship_holder",
+    )
+
+    target_dir = base / "scholarship_holder"
+    assert windows_io_path(target_dir / "continuous_features.csv").is_file()
+    assert windows_io_path(target_dir / "categorical_features.csv").is_file()
+    assert windows_io_path(target_dir / "target.csv").is_file()

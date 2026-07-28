@@ -109,7 +109,7 @@ def embed_select_features(
                 y_train=y,
                 g_train=g,
                 metric=metric,
-                n_trials=100,
+                n_trials=options.htune_trials,
                 n_jobs=-1,
             )
             # `coefs` are floats if Linear, int32 if LGBM

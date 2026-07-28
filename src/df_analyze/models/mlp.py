@@ -58,6 +58,7 @@ from tqdm import tqdm
 
 from df_analyze.enumerables import Scorer
 from df_analyze.models.base import DfAnalyzeModel
+from df_analyze.runtime.hardware import RuntimeComponent, cleanup_torch_accelerator
 from df_analyze.splitting import OmniKFold
 
 """
@@ -205,6 +206,7 @@ class MLPEstimator(DfAnalyzeModel):
     shortname = "mlp"
     longname = "Multilayer Perceptron"
     timeout_s = 3600
+    tuning_cv_folds = 3
 
     def __init__(self, num_classes: int, model_args: Mapping | None = None) -> None:
         super().__init__(model_args)
@@ -213,6 +215,7 @@ class MLPEstimator(DfAnalyzeModel):
         # class NeuralNetRegressor: pass
         self.model_cls = NeuralNetClassifier if self.is_classifier else NeuralNetRegressor
         self.model: Union[NeuralNetClassifier, NeuralNetRegressor]
+        self.target_cols: list[str] = []
         self.fixed_args = dict(
             module=SkorchMLP,
             # https://github.com/skorch-dev/skorch/issues/477#issuecomment-493660800
@@ -223,9 +226,79 @@ class MLPEstimator(DfAnalyzeModel):
             max_epochs=50,
             batch_size=BATCH_SIZE,
             # iterator_train__num_workers=1,  # for some reason causes huge slow
-            device="cpu",
+            device=self.runtime.device_for(RuntimeComponent.MLP),
             verbose=0,
         )
+
+    def _configure_runtime(self) -> None:
+        self.fixed_args["device"] = self.runtime.device_for(RuntimeComponent.MLP)
+
+    def _cleanup_after_fold(self) -> None:
+        cleanup_torch_accelerator(self.runtime, RuntimeComponent.MLP)
+
+    def _set_target_cols(self, y: Union[Series, DataFrame]) -> None:
+        if isinstance(y, DataFrame):
+            self.target_cols = [str(col) for col in y.columns]
+        else:
+            self.target_cols = [str(y.name) if y.name is not None else "target"]
+
+    def _target_num_classes(self, y: Series) -> int:
+        if not self.is_classifier:
+            return 1
+        values = np.asarray(y.dropna())
+        try:
+            encoded = values.astype(int)
+            if np.array_equal(values, encoded) and encoded.min() >= 0:
+                return max(2, int(encoded.max()) + 1)
+        except (TypeError, ValueError):
+            pass
+        return max(2, int(np.unique(values).shape[0]))
+
+    def _new_target_estimator(self, y: Series) -> MLPEstimator:
+        model = type(self)(
+            num_classes=self._target_num_classes(y), model_args=self.model_args
+        )
+        model.set_runtime(self.runtime)
+        return model
+
+    def _fit_target_estimators(
+        self,
+        X: DataFrame,
+        y: DataFrame,
+        tuned_args: Optional[Mapping] = None,
+    ) -> dict[str, MLPEstimator]:
+        models: dict[str, MLPEstimator] = {}
+        for col in y.columns:
+            target = str(col)
+            model = self._new_target_estimator(y[col])
+            if tuned_args is None:
+                model.fit(X, y[col])
+            else:
+                model.refit_tuned(X, y[col], tuned_args=tuned_args)
+            models[target] = model
+        return models
+
+    def _predict_target_estimators(
+        self, models: dict[str, MLPEstimator], X: DataFrame, tuned: bool
+    ) -> DataFrame:
+        predictions = {}
+        for target in self.target_cols:
+            model = models[target]
+            pred = model.tuned_predict(X) if tuned else model.predict(X)
+            predictions[target] = np.asarray(pred).reshape(-1)
+        return DataFrame(predictions, index=X.index, columns=self.target_cols)
+
+    def _predict_target_proba(
+        self, models: dict[str, MLPEstimator], X: DataFrame, tuned: bool
+    ) -> dict[str, ndarray]:
+        return {
+            target: np.asarray(
+                models[target].predict_proba(X)
+                if tuned
+                else models[target].predict_proba_untuned(X)
+            )
+            for target in self.target_cols
+        }
 
     def model_cls_args(self, full_args: dict[str, Any]) -> tuple[type, dict[str, Any]]:
         return self.model_cls, full_args
@@ -281,7 +354,13 @@ class MLPEstimator(DfAnalyzeModel):
             yt = torch.from_numpy(y.to_numpy()).to(dtype=torch.float32)
         return Xt, yt
 
-    def fit(self, X_train: DataFrame, y_train: Series) -> None:
+    def fit(self, X_train: DataFrame, y_train: Union[Series, DataFrame]) -> None:
+        self._set_target_cols(y_train)
+        if isinstance(y_train, DataFrame) and y_train.shape[1] > 1:
+            self.model = self._fit_target_estimators(X_train, y_train)  # type: ignore[assignment]
+            return
+        if isinstance(y_train, DataFrame):
+            y_train = y_train.iloc[:, 0]
         if self.model is None:
             kwargs = {**self.fixed_args, **self.default_args, **self.model_args}
             self.model = self.model_cls(**kwargs)
@@ -299,10 +378,18 @@ class MLPEstimator(DfAnalyzeModel):
     def refit_tuned(
         self,
         X: DataFrame,
-        y: Series,
+        y: Union[Series, DataFrame],
         g: Optional[Series] = None,
         tuned_args: Optional[Mapping] = None,
     ) -> None:
+        self._set_target_cols(y)
+        if isinstance(y, DataFrame) and y.shape[1] > 1:
+            self.tuned_model = self._fit_target_estimators(
+                X, y, tuned_args=tuned_args or {}
+            )
+            return
+        if isinstance(y, DataFrame):
+            y = y.iloc[:, 0]
         tuned_args = tuned_args or {}
         kwargs = {
             **self.fixed_args,
@@ -314,33 +401,51 @@ class MLPEstimator(DfAnalyzeModel):
         Xt, yt = self._to_torch(X, y)
         self.tuned_model.fit(Xt, yt)  # type: ignore
 
-    def predict(self, X: DataFrame) -> ndarray:
+    def predict(self, X: DataFrame) -> Union[ndarray, DataFrame]:
+        if isinstance(self.model, dict):
+            return self._predict_target_estimators(self.model, X, tuned=False)
         Xt = self._to_torch(X)
         return self.model.predict(Xt)
 
-    def tuned_predict(self, X: DataFrame) -> ndarray:
+    def tuned_predict(self, X: DataFrame) -> Union[ndarray, DataFrame]:
         if self.tuned_model is None:
             raise RuntimeError(
                 "Need to call `model.tune()` before calling `.tuned_predict()`"
             )
+        if isinstance(self.tuned_model, dict):
+            return self._predict_target_estimators(self.tuned_model, X, tuned=True)
         Xt = self._to_torch(X)
         return self.tuned_model.predict(Xt)
 
-    def predict_proba_untuned(self, X: DataFrame) -> ndarray:
+    def predict_proba_untuned(self, X: DataFrame) -> Union[ndarray, dict[str, ndarray]]:
         if self.model is None:
             raise RuntimeError(
                 "Need to call `model.fit()` before calling `.predict_proba_untuned()`"
             )
+        if isinstance(self.model, dict):
+            return self._predict_target_proba(self.model, X, tuned=False)
         Xt = self._to_torch(X)
         return self.model.predict_proba(Xt)
 
-    def predict_proba(self, X: DataFrame) -> ndarray:
+    def predict_proba(self, X: DataFrame) -> Union[ndarray, dict[str, ndarray]]:
         if self.tuned_model is None:
             raise RuntimeError(
                 "Need to call `model.tune()` before calling `.predict_proba()`"
             )
+        if isinstance(self.tuned_model, dict):
+            return self._predict_target_proba(self.tuned_model, X, tuned=True)
         Xt = self._to_torch(X)
         return self.tuned_model.predict_proba(Xt)
+
+    def tuned_scores(self, X: DataFrame, y: Union[Series, DataFrame]) -> float:
+        if isinstance(self.tuned_model, dict):
+            if not isinstance(y, DataFrame):
+                raise ValueError("Expected DataFrame targets for a multi-target model.")
+            scores = [
+                self.tuned_model[str(col)].tuned_scores(X, y[col]) for col in y.columns
+            ]
+            return float(np.mean(scores))
+        return super().tuned_scores(X, y)
 
     def _to_model_args(self, optuna_args: Mapping, X_train: DataFrame) -> dict[str, Any]:
         final_args: Mapping = {**deepcopy(optuna_args)}
@@ -357,11 +462,91 @@ class MLPEstimator(DfAnalyzeModel):
     def optuna_objective(
         self,
         X_train: DataFrame,
-        y_train: Series,
+        y_train: Union[Series, DataFrame],
         g_train: Optional[Series],
         metric: Scorer,
-        n_folds: int = 3,
+        n_folds: Optional[int] = None,
     ) -> Callable[[Trial], float]:
+        n_folds = self.resolve_tuning_cv_folds(n_folds)
+        self._set_target_cols(y_train)
+        if isinstance(y_train, DataFrame) and y_train.shape[1] > 1:
+            y_split = self._split_target_for_cv(y_train)
+            target_data = []
+            for col in y_train.columns:
+                target = y_train[col]
+                model = self._new_target_estimator(target)
+                X_target, y_target = model._to_torch(X_train, target)
+                target_data.append((model, target, X_target, y_target))
+
+            def objective(trial: Trial) -> float:
+                kf = OmniKFold(
+                    n_splits=n_folds,
+                    is_classification=self.is_classifier,
+                    grouped=g_train is not None,
+                    labels=None,
+                    warn_on_fallback=False,
+                    allow_group_fallback=False,
+                    df_analyze_phase="Tuning internal splits",
+                )
+                splits = kf.split(
+                    X_train,
+                    y_split,
+                    g_train,
+                    multitarget_y=(
+                        y_train if self.is_classifier else None
+                    ),
+                )[0]
+                opt_args = self.optuna_args(trial)
+                target_args = []
+                for model, target, X_target, y_target in target_data:
+                    model_args = model._to_model_args(opt_args, X_train)
+                    full_args = {
+                        **model.fixed_args,
+                        **model.default_args,
+                        **model.model_args,
+                        **model_args,
+                    }
+                    target_args.append(
+                        (model, target, X_target, y_target, full_args)
+                    )
+
+                scores = []
+                scores_by_target: dict[str, list[float]] = {}
+                for step, (idx_train, idx_test) in enumerate(splits):
+                    fold_scores = []
+                    for model, target, X_target, y_target, full_args in target_args:
+                        estimator = None
+                        try:
+                            estimator = model.model_cls(**full_args)
+                            estimator.fit(X_target[idx_train], y_target[idx_train])
+                            preds = estimator.predict(X_target[idx_test])
+                            score = metric.tuning_score(
+                                y_target[idx_test].numpy(), preds
+                            )
+                            fold_scores.append(
+                                self._scale_tuning_score(metric, target, score)
+                            )
+                            target_name = (
+                                str(target.name)
+                                if target.name is not None
+                                else f"target_{len(fold_scores) - 1}"
+                            )
+                            scores_by_target.setdefault(target_name, []).append(
+                                fold_scores[-1]
+                            )
+                        finally:
+                            estimator = None
+                            model._cleanup_after_fold()
+                    scores.append(float(np.mean(fold_scores)))
+                    trial.report(float(np.mean(scores)), step=step)
+                    if trial.should_prune():
+                        raise optuna.TrialPruned()
+                self._record_trial_target_scores(trial, scores_by_target)
+                return float(np.mean(scores))
+
+            return objective
+        if isinstance(y_train, DataFrame):
+            y_train = y_train.iloc[:, 0]
         X, y = self._to_torch(X_train, y_train)
 
         def objective(trial: Trial) -> float:
@@ -371,26 +556,36 @@ class MLPEstimator(DfAnalyzeModel):
                 grouped=g_train is not None,
                 labels=None,
                 warn_on_fallback=False,
+                allow_group_fallback=False,
                 df_analyze_phase="Tuning internal splits",
             )
             opt_args = self.optuna_args(trial)
             model_args = self._to_model_args(opt_args, X_train)
-            full_args = {**self.fixed_args, **self.default_args, **model_args}
+            full_args = {
+                **self.fixed_args,
+                **self.default_args,
+                **self.model_args,
+                **model_args,
+            }
             scores = []
             for step, (idx_train, idx_test) in enumerate(
                 kf.split(X_train, y_train, g_train)[0]
             ):
                 X_tr, y_tr = X[idx_train], y[idx_train]
                 X_test, y_test = X[idx_test], y[idx_test]
-                estimator = self.model_cls(**full_args)
-                estimator.fit(X_tr, y_tr)
-                preds = estimator.predict(X_test)
-                score = metric.tuning_score(y_test.numpy(), preds)
-                scores.append(score)
-                # allows pruning
-                trial.report(float(np.mean(scores)), step=step)
-                if trial.should_prune():
-                    raise optuna.TrialPruned()
+                estimator = None
+                try:
+                    estimator = self.model_cls(**full_args)
+                    estimator.fit(X_tr, y_tr)
+                    preds = estimator.predict(X_test)
+                    score = metric.tuning_score(y_test.numpy(), preds)
+                    scores.append(score)
+                    trial.report(float(np.mean(scores)), step=step)
+                    if trial.should_prune():
+                        raise optuna.TrialPruned()
+                finally:
+                    estimator = None
+                    self._cleanup_after_fold()
             return float(np.mean(scores))
 
             # estimator = self.model_cls(**full_args)
@@ -421,7 +616,7 @@ class MLPEstimator(DfAnalyzeModel):
     def htune_optuna(
         self,
         X_train: DataFrame,
-        y_train: Series,
+        y_train: Union[Series, DataFrame],
         g_train: Optional[Series],
         metric: Scorer,
         n_trials: int = 100,
@@ -458,6 +653,7 @@ class MLPEstimator(DfAnalyzeModel):
         else:
             override_jobs = 2  # seems to work / be least harmful on both tested
 
+        override_jobs = self.runtime.tuning_jobs(RuntimeComponent.MLP, override_jobs)
         return super().htune_optuna(
             X_train=X_train,
             y_train=y_train,
