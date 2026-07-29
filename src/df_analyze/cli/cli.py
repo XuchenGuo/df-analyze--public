@@ -240,8 +240,8 @@ class ProgramOptions(Debug):
         wrapper_select: Optional[WrapperSelection],
         wrapper_model: WrapperSelectionModel,
         # n_feat: int,
-        n_filter_cont: Union[int, float],
-        n_filter_cat: Union[int, float],
+        n_filter_cont: Optional[Union[int, float]],
+        n_filter_cat: Optional[Union[int, float]],
         n_feat_filter: Union[int, float],
         n_feat_wrapper: Union[int, float, None],
         filter_assoc_cont_cls: ContClsStats,
@@ -363,8 +363,8 @@ class ProgramOptions(Debug):
         self.wrapper_select: Optional[WrapperSelection] = wrapper_select
         self.wrapper_model: WrapperSelectionModel = wrapper_model
         # self.n_feat: int = n_feat
-        self.n_filter_cont: Union[int, float] = n_filter_cont
-        self.n_filter_cat: Union[int, float] = n_filter_cat
+        self.n_filter_cont: Optional[Union[int, float]] = n_filter_cont
+        self.n_filter_cat: Optional[Union[int, float]] = n_filter_cat
         self.n_feat_filter: Union[int, float] = n_feat_filter
         self.n_feat_wrapper: Union[int, float, None] = n_feat_wrapper
         self.filter_assoc_cont_cls: ContClsStats = filter_assoc_cont_cls
@@ -1355,13 +1355,13 @@ def make_parser() -> ArgumentParser:
     parser.add_argument(
         "--n-filter-cont",
         type=int_or_percent_parser(default=P_FILTER_CONT_DEFAULT),
-        default=P_FILTER_CONT_DEFAULT,
+        default=None,
         help=N_FEAT_CONT_FILTER_HELP,
     )
     parser.add_argument(
         "--n-filter-cat",
         type=int_or_percent_parser(default=P_FILTER_CAT_DEFAULT),
-        default=P_FILTER_CAT_DEFAULT,
+        default=None,
         help=N_FEAT_CAT_FILTER_HELP,
     )
     parser.add_argument(

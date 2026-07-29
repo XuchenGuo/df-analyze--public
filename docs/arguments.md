@@ -390,9 +390,11 @@ options:
                         Number or percentage (as a value in [0, 1]) of total features of any kind
                         (categorical or continuous) to select via filter-based feature selection.
 
-                        Note only two of two of the three options:`--n-feat-filter`,
-                        `--n-filter-cont`, and  `--n-filter-cat` may be specified at once,
-                        otherwise the `--n-feat-filter` argument will be ignored.
+                        Only two of the three options `--n-feat-filter`,
+                        `--n-filter-cont`, and `--n-filter-cat` may be specified at once.
+                        If all three are supplied, `--n-feat-filter` is ignored. When
+                        only the total is supplied, it is allocated between continuous
+                        and categorical features in proportion to their available counts.
 
 
   --n-feat-wrapper N_FEAT_WRAPPER
@@ -407,9 +409,11 @@ options:
                         Number or percentage (as a value in [0, 1]) of continuous features to select
                         via filter-based feature selection.
 
-                        Note only two of two of the three options:`--n-feat-filter`,
-                        `--n-filter-cont`, and  `--n-filter-cat` may be specified at once,
-                        otherwise the `--n-feat-filter` argument will be ignored.
+                        Only two of the three options `--n-feat-filter`,
+                        `--n-filter-cont`, and `--n-filter-cat` may be specified at once.
+                        If all three are supplied, `--n-feat-filter` is ignored. When
+                        only the total is supplied, it is allocated between continuous
+                        and categorical features in proportion to their available counts.
 
 
   --n-filter-cat N_FILTER_CAT
@@ -417,9 +421,11 @@ options:
                         Number or percentage (as a value in [0, 1]) of categorical features to select
                         via filter-based feature selection.
 
-                        Note only two of two of the three options:`--n-feat-filter`,
-                        `--n-filter-cont`, and  `--n-filter-cat` may be specified at once,
-                        otherwise the `--n-feat-filter` argument will be ignored.
+                        Only two of the three options `--n-feat-filter`,
+                        `--n-filter-cont`, and `--n-filter-cat` may be specified at once.
+                        If all three are supplied, `--n-feat-filter` is ignored. When
+                        only the total is supplied, it is allocated between continuous
+                        and categorical features in proportion to their available counts.
 
 
   --filter-method

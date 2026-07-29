@@ -220,6 +220,96 @@ def n_total_select_default(
     )
 
 
+def _resolve_filter_counts(
+    prepared: PreparedData,
+    n_cont: Optional[Union[int, float]],
+    n_cat: Optional[Union[int, float]],
+    n_total: Optional[Union[int, float]],
+) -> tuple[int, int]:
+    """Resolve the documented two-of-three filter feature-count contract."""
+    available_cont = int(prepared.X_cont.shape[1])
+    available_cat = int(prepared.X_cat.shape[1])
+
+    if n_cont is not None and n_cat is not None:
+        resolved_cont = n_cont_select_default(prepared, n_cont)
+        resolved_cat = n_cat_select_default(prepared, n_cat)
+        if n_total is not None:
+            resolved_total = n_total_select_default(prepared, n_total)
+            if resolved_total != resolved_cont + resolved_cat:
+                warn(
+                    "When specifying all of `n_cat`, `n_cont`, and `n_total`, "
+                    "will ignore count specified for `n_total`."
+                )
+        return resolved_cont, resolved_cat
+
+    resolved_total = n_total_select_default(prepared, n_total)
+    resolved_total = min(resolved_total, available_cont + available_cat)
+
+    if n_cont is not None:
+        resolved_cont = min(
+            n_cont_select_default(prepared, n_cont),
+            resolved_total,
+        )
+        resolved_cat = min(available_cat, resolved_total - resolved_cont)
+        return resolved_cont, resolved_cat
+
+    if n_cat is not None:
+        resolved_cat = min(
+            n_cat_select_default(prepared, n_cat),
+            resolved_total,
+        )
+        resolved_cont = min(available_cont, resolved_total - resolved_cat)
+        return resolved_cont, resolved_cat
+
+    available_total = available_cont + available_cat
+    if available_total == 0 or resolved_total == 0:
+        return 0, 0
+
+    resolved_cont = round(resolved_total * available_cont / available_total)
+    resolved_cont = min(available_cont, max(0, resolved_cont))
+    resolved_cat = min(available_cat, resolved_total - resolved_cont)
+    if resolved_cont + resolved_cat < resolved_total:
+        resolved_cont = min(
+            available_cont,
+            resolved_total - resolved_cat,
+        )
+    return resolved_cont, resolved_cat
+
+
+def _collapse_association_scores(
+    scores: Series,
+    feature_columns: list[str],
+    *,
+    higher_is_better: bool,
+) -> Series:
+    """Collapse per-target-level association rows back to source features."""
+    columns = sorted((str(col) for col in feature_columns), key=len, reverse=True)
+    buckets: dict[str, list[float]] = {col: [] for col in columns}
+    for row_name, value in scores.items():
+        row = str(row_name)
+        source = row if row in buckets else None
+        if source is None:
+            source = next(
+                (col for col in columns if row.startswith(f"{col}__")),
+                None,
+            )
+        if source is not None:
+            buckets[source].append(float(value))
+
+    collapsed: dict[str, float] = {}
+    for feature, values in buckets.items():
+        if not values:
+            continue
+        finite = [value for value in values if np.isfinite(value)]
+        if not finite:
+            collapsed[feature] = float("nan")
+        elif higher_is_better:
+            collapsed[feature] = max(finite)
+        else:
+            collapsed[feature] = min(finite)
+    return Series(collapsed, name=scores.name, dtype=float)
+
+
 def filter_by_univariate_associations(
     prepared: PreparedData,
     associations: AssocResults,
@@ -259,39 +349,39 @@ def filter_by_univariate_associations(
             idx_keep = cat_stats[ps] > 0.05
             cat_stats = cat_stats.loc[idx_keep]
 
-    if all(n is not None for n in [n_cat, n_cont, n_total]):
-        if n_total != n_cat + n_cont:  # type: ignore
-            warn(
-                "When specifying all of `n_cat`, `n_cont`, and `n_total`, will "
-                "ignore count specified for `n_total`."
-            )
-    if n_cat is None:
-        n_cat = n_cat_select_default(prepared, n_cat)
-    if n_cont is None:
-        n_cont = n_cont_select_default(prepared, n_cont)
-    if n_total is None:
-        n_total = n_total_select_default(prepared, n_total)
+    resolved_cont, resolved_cat = _resolve_filter_counts(
+        prepared,
+        n_cont=n_cont,
+        n_cat=n_cat,
+        n_total=n_total,
+    )
 
     if cont_stats is not None:
-        cont_stats = (
-            cont_stats.abs()
-            .loc[:, cont_metric.value]
-            .sort_values(ascending=not cont_metric.higher_is_better())
+        cont_higher = cont_metric.higher_is_better()
+        cont_stats = _collapse_association_scores(
+            cont_stats.abs().loc[:, cont_metric.value],
+            [str(col) for col in prepared.X_cont.columns],
+            higher_is_better=cont_higher,
+        ).sort_values(
+            ascending=not cont_higher,
         )
     if cat_stats is not None:
-        cat_stats = (
-            cat_stats.abs()
-            .loc[:, cat_metric.value]
-            .sort_values(ascending=not cat_metric.higher_is_better())
+        cat_higher = cat_metric.higher_is_better()
+        cat_stats = _collapse_association_scores(
+            cat_stats.abs().loc[:, cat_metric.value],
+            [str(col) for col in prepared.X_cat.columns],
+            higher_is_better=cat_higher,
+        ).sort_values(
+            ascending=not cat_higher,
         )
 
     cont_cols = []
     if cont_stats is not None:
-        cont_cols = cont_stats.index.to_list()
+        cont_cols = cont_stats.index.to_list()[:resolved_cont]
 
     cat_cols = []
     if cat_stats is not None:
-        cat_cols = cat_stats.index.to_list()
+        cat_cols = cat_stats.index.to_list()[:resolved_cat]
 
     return FilterSelected(
         selected=cont_cols + cat_cols,
@@ -309,6 +399,7 @@ def filter_by_univariate_predictions(
     cat_metric: ClsScore = ClsScore.default(),
     n_cont: Optional[Union[int, float]] = None,
     n_cat: Optional[Union[int, float]] = None,
+    n_total: Optional[Union[int, float]] = None,
     significant_only: bool = False,
 ) -> FilterSelected:
     cont_preds = predictions.conts
@@ -323,8 +414,12 @@ def filter_by_univariate_predictions(
         metric = cont_metric
     higher_is_better = metric.higher_is_better()
 
-    n_cat = n_cat_select_default(prepared, n_cat)
-    n_cont = n_cont_select_default(prepared, n_cont)
+    resolved_cont, resolved_cat = _resolve_filter_counts(
+        prepared,
+        n_cont=n_cont,
+        n_cat=n_cat,
+        n_total=n_total,
+    )
 
     if cont_preds is not None:
         idx = cont_preds["model"] == "dummy"
@@ -359,16 +454,16 @@ def filter_by_univariate_predictions(
 
     if cont_scores is not None:
         if cont_scores.var() != 0:
-            conts = cont_scores.index.to_list()[:n_cont]
+            conts = cont_scores.index.to_list()[:resolved_cont]
         else:
-            conts = cont_scores.index.to_list()
+            conts = cont_scores.index.to_list()[:resolved_cont]
     else:
         conts = []
     if cat_scores is not None:
         if cat_scores.var() != 0:
-            cats = cat_scores.index.to_list()[:n_cat]
+            cats = cat_scores.index.to_list()[:resolved_cat]
         else:
-            cats = cat_scores.index.to_list()
+            cats = cat_scores.index.to_list()[:resolved_cat]
     else:
         cats = []
 
@@ -427,6 +522,7 @@ def filter_select_features(
             cat_metric=options.filter_pred_cls_score,
             n_cont=options.n_filter_cont,
             n_cat=options.n_filter_cat,
+            n_total=options.n_feat_filter,
             significant_only=False,
         )
     else:

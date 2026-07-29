@@ -525,9 +525,11 @@ NaN value.
 # """
 
 N_FEAT_NOTE = """
-Note only two of two of the three options:`--n-feat-filter`,
-`--n-filter-cont`, and  `--n-filter-cat` may be specified at once,
-otherwise the `--n-feat-filter` argument will be ignored.
+Only two of the three options `--n-feat-filter`, `--n-filter-cont`, and
+`--n-filter-cat` may be specified at once. If all three are supplied,
+`--n-feat-filter` is ignored. When only the total is supplied, it is allocated
+between continuous and categorical features in proportion to their available
+counts.
 """
 
 N_FEAT_TOTAL_FILTER_HELP = f"""

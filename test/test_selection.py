@@ -19,8 +19,12 @@ from _pytest.capture import CaptureFixture
 from pandas import DataFrame, Series
 
 from df_analyze._constants import ROOT
-from df_analyze.analysis.univariate.associate import CatAssociation, ContAssociation
-from df_analyze.cli.cli import ProgramOptions
+from df_analyze.analysis.univariate.associate import (
+    AssocResults,
+    CatAssociation,
+    ContAssociation,
+)
+from df_analyze.cli.cli import ProgramOptions, get_options
 from df_analyze.enumerables import (
     ClsScore,
     EmbedSelectionModel,
@@ -53,6 +57,123 @@ from df_analyze.testing.datasets import (
 DATA = ROOT / "data/banking/bank.json"
 RUNTIMES = ROOT / "runtimes"
 RUNTIMES.mkdir(exist_ok=True)
+
+
+@pytest.mark.fast
+def test_total_filter_count_is_respected_for_continuous_features() -> None:
+    columns = [f"feature_{idx}" for idx in range(6)]
+    prepared = SimpleNamespace(
+        X_cont=DataFrame(np.zeros((4, 6)), columns=columns),
+        X_cat=DataFrame(index=range(4)),
+        is_classification=True,
+    )
+    associations = AssocResults(
+        conts=DataFrame(
+            {"mut_info": [0.1, 0.6, 0.3, 0.5, 0.2, 0.4]},
+            index=columns,
+        ),
+        cats=None,
+        is_classification=True,
+    )
+
+    selected = filter_by_univariate_associations(
+        prepared,
+        associations,
+        n_total=3,
+    )
+
+    assert selected.selected == ["feature_1", "feature_3", "feature_5"]
+
+
+@pytest.mark.fast
+def test_total_filter_count_is_allocated_across_feature_types() -> None:
+    cont_columns = [f"cont_{idx}" for idx in range(4)]
+    cat_columns = [f"cat_{idx}" for idx in range(2)]
+    prepared = SimpleNamespace(
+        X_cont=DataFrame(np.zeros((4, 4)), columns=cont_columns),
+        X_cat=DataFrame(np.zeros((4, 2)), columns=cat_columns),
+        is_classification=True,
+    )
+    associations = AssocResults(
+        conts=DataFrame(
+            {"mut_info": [0.4, 0.3, 0.2, 0.1]},
+            index=cont_columns,
+        ),
+        cats=DataFrame(
+            {"mut_info": [0.6, 0.5]},
+            index=cat_columns,
+        ),
+        is_classification=True,
+    )
+
+    selected = filter_by_univariate_associations(
+        prepared,
+        associations,
+        n_total=3,
+    )
+
+    assert selected.selected == ["cont_0", "cont_1", "cat_0"]
+
+
+@pytest.mark.fast
+def test_class_level_associations_count_as_one_source_feature() -> None:
+    columns = ["first", "second", "third"]
+    prepared = SimpleNamespace(
+        X_cont=DataFrame(np.zeros((4, 3)), columns=columns),
+        X_cat=DataFrame(index=range(4)),
+        is_classification=True,
+    )
+    associations = AssocResults(
+        conts=DataFrame(
+            {
+                "mut_info": [
+                    0.8,
+                    0.7,
+                    0.6,
+                    0.5,
+                    0.4,
+                    0.3,
+                ]
+            },
+            index=[
+                "first__target.0",
+                "first__target.1",
+                "second__target.0",
+                "second__target.1",
+                "third__target.0",
+                "third__target.1",
+            ],
+        ),
+        cats=None,
+        is_classification=True,
+    )
+
+    selected = filter_by_univariate_associations(
+        prepared,
+        associations,
+        n_total=2,
+    )
+
+    assert selected.selected == ["first", "second"]
+    assert selected.cont_scores is not None
+    assert selected.cont_scores.to_dict() == {"first": 0.8, "second": 0.6, "third": 0.4}
+
+
+@pytest.mark.fast
+def test_cli_total_filter_count_does_not_set_type_specific_defaults(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "input.csv"
+    DataFrame({"feature": [0, 1], "target": [0, 1]}).to_csv(path, index=False)
+
+    options = get_options(
+        f"--df {path} --target target --feat-select filter --n-feat-filter 2 "
+        f"--outdir {tmp_path / 'outputs'}"
+    )
+
+    assert options.n_feat_filter == 2
+    assert options.n_filter_cont is None
+    assert options.n_filter_cat is None
 
 
 @pytest.mark.fast

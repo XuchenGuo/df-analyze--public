@@ -2,13 +2,22 @@ from __future__ import annotations
 
 import os
 import random
+import warnings
 from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
 import torch
+from sklearn.ensemble import ExtraTreesClassifier
 
+from df_analyze.analysis.adaptive_error.base_models_runner import (
+    _init_model_output_dirs,
+)
+from df_analyze.analysis.adaptive_error.confidence_metrics import (
+    tree_leaf_support_conf,
+    tree_vote_agreement_conf,
+)
 from df_analyze.analysis.error_consistency.backend import (
     ECBackendDecision,
     resolve_ec_backend,
@@ -52,6 +61,7 @@ from df_analyze.runtime.hardware import (
     HardwareCapabilities,
     RuntimePolicy,
 )
+from df_analyze.saving import windows_io_path
 from df_analyze.splitting import OmniKFold
 
 
@@ -259,6 +269,50 @@ def test_ec_detail_plot_supports_a_long_windows_output_path(tmp_path) -> None:
     assert len(str(legacy_plot.resolve())) > 260
     assert len(str(plot.resolve())) < 260
     assert plot.exists()
+
+
+@pytest.mark.fast
+@pytest.mark.skipif(os.name != "nt", reason="Windows MAX_PATH regression")
+def test_adaptive_error_model_outputs_support_a_long_windows_path(tmp_path) -> None:
+    padding = max(1, 220 - len(str(tmp_path.resolve())))
+    model_dir = (
+        tmp_path
+        / ("x" * padding)
+        / "results"
+        / "adaptive_error"
+        / "models"
+        / "et"
+    )
+    output_dirs = _init_model_output_dirs(model_dir)
+    metadata = model_dir / "metadata" / "confidence_metric_selection.json"
+
+    (output_dirs.meta / metadata.name).write_text("{}", encoding="utf-8")
+
+    assert len(str(metadata.resolve())) > 260
+    assert windows_io_path(metadata).read_text(encoding="utf-8") == "{}"
+
+
+@pytest.mark.fast
+def test_tree_vote_agreement_avoids_sklearn_feature_name_warnings() -> None:
+    X = pd.DataFrame(
+        {
+            "first": [0.0, 0.1, 0.9, 1.0],
+            "second": [1.0, 0.9, 0.1, 0.0],
+        }
+    )
+    y = np.asarray([0, 0, 1, 1])
+    estimator = ExtraTreesClassifier(n_estimators=5, random_state=0).fit(X, y)
+    y_pred = estimator.predict(X)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        agreement = tree_vote_agreement_conf(estimator, X, y_pred)
+        leaf_support = tree_leaf_support_conf(estimator, X, n_train=len(X))
+
+    assert agreement is not None
+    assert agreement.tolist() == pytest.approx([1.0, 1.0, 1.0, 1.0])
+    assert leaf_support is not None
+    assert leaf_support.tolist() == pytest.approx([0.5, 0.5, 0.5, 0.5])
 
 
 @pytest.mark.fast

@@ -37,6 +37,7 @@ from df_analyze.analysis.adaptive_error.risk_control_writer import (
     _write_risk_control_threshold,
 )
 from df_analyze.analysis.adaptive_error.test_stage import _evaluate_test_stage
+from df_analyze.saving import windows_io_path
 
 
 @dataclass
@@ -49,20 +50,20 @@ class _ModelOutputDirs:
 
 
 def _init_model_output_dirs(out_dir: Path) -> _ModelOutputDirs:
-    out_dir.mkdir(parents=True, exist_ok=True)
+    windows_io_path(out_dir).mkdir(parents=True, exist_ok=True)
     m_plots = out_dir / "plots"
     m_tables = out_dir / "tables"
     m_preds = out_dir / "predictions"
     m_meta = out_dir / "metadata"
     m_reports = out_dir / "reports"
     for d in (m_plots, m_tables, m_preds, m_meta, m_reports):
-        d.mkdir(parents=True, exist_ok=True)
+        windows_io_path(d).mkdir(parents=True, exist_ok=True)
     return _ModelOutputDirs(
-        plots=m_plots,
-        tables=m_tables,
-        preds=m_preds,
-        meta=m_meta,
-        reports=m_reports,
+        plots=windows_io_path(m_plots),
+        tables=windows_io_path(m_tables),
+        preds=windows_io_path(m_preds),
+        meta=windows_io_path(m_meta),
+        reports=windows_io_path(m_reports),
     )
 
 
@@ -287,7 +288,7 @@ def run_base_model_analyses(
     ensemble_models: list[dict[str, Any]] = []
 
     models_dir = base_dir / "models"
-    models_dir.mkdir(parents=True, exist_ok=True)
+    windows_io_path(models_dir).mkdir(parents=True, exist_ok=True)
 
     y_train = prep_train.y
     y_test = prep_test.y
