@@ -101,7 +101,7 @@ The manner in which to use the specified test sets for validation. Available
 options are:
 
   lodo        Leave-One-Dataset-Out. Assuming --df-train=file0, and that
-              --df-tests=file1,file2,...,fileN, then df-analyze runs N+1 full
+              --df-test=file1,file2,...,fileN, then df-analyze runs N+1 full
               runs of the feature selection, tuning, and validation pipeline,
               for the sets:
 
@@ -109,6 +109,8 @@ options are:
               X_train_1={{file1}}, X_test_1=concat({{file0, file2, ..., fileN}})
                                          ...
               X_train_N={{fileN}}, X_test_N=concat({{file0, file2, ..., fileN-1}})
+
+              The current CLI option name for the test files is --df-tests.
 
               Note: In the case of a single test file, this is just 2-fold. For
               more than 2 test files, expect this option to potentially be very
@@ -159,8 +161,11 @@ Comma-separated target columns for multi-target runs.
 GROUP_HELP_STR = """
 The (string) name of the grouping variable (if one is present) which will be
 used to ensure samples within the same group do not end up in both train and
-test splits. Grouped analyses stop if adequate group-disjoint classification
-folds cannot be created; they do not silently fall back to row-wise splitting.
+test splits. I.e. the name of the feature that will be passed into scikit-learn
+GroupStratifiedKFold.
+
+Grouped analyses stop if adequate group-disjoint classification folds cannot be
+created; they do not silently fall back to row-wise splitting.
 
 """
 
@@ -231,13 +236,21 @@ Managed setup is available from a source checkout with pyproject.toml and
 uv.lock.
 """
 
-CLASSIFIER_CHOICES = DfAnalyzeClassifier.choices()
+CLASSIFIER_CHOICES = (
+    DfAnalyzeClassifier.choices()
+)
 
-CLASSIFIER_DEFAULTS = DfAnalyzeClassifier.defaults()
+CLASSIFIER_DEFAULTS = (
+    DfAnalyzeClassifier.defaults()
+)
 
-REGRESSOR_CHOICES = DfAnalyzeRegressor.choices()
+REGRESSOR_CHOICES = (
+    DfAnalyzeRegressor.choices()
+)
 
-REGRESSOR_DEFAULTS = DfAnalyzeRegressor.defaults()
+REGRESSOR_DEFAULTS = (
+    DfAnalyzeRegressor.defaults()
+)
 
 
 CLS_HELP_STR = f"""
@@ -245,22 +258,47 @@ The list of classifiers to use when comparing classification performance.
 Can be a list of elements from: [{" ".join(sorted(CLASSIFIER_CHOICES))}].
 Defaults are: [{" ".join(CLASSIFIER_DEFAULTS)}].
 
+  knn         scikit-learn KNeighborsClassifier.
+
+  lgbm        LightGBM boosted decision tree classifier.
+
+  rf          LightGBM random forest classifier.
+
+  sgd         scikit-learn SGDClassifier.
+
+  mlp         Modern multi-layer perceptron implemented in skorch/PyTorch.
+
+  svm         scikit-learn support vector classifer.
+
+  gandalf     Gated Adaptive Network for Deep Automated Learning of
+              Features for Tabular Data: https://arxiv.org/abs/2207.08548
+
+  dummy       scikit-learn DummyClassifier.
+
+  knn         scikit-learn KNeighborsClassifier.
+
+  lgbm        LightGBM boosted decision tree classifier.
+
+  rf          LightGBM random forest classifier.
+
+  sgd         scikit-learn SGDClassifier.
+
+  mlp         Modern multi-layer perceptron implemented in skorch/PyTorch.
+
+  svm         scikit-learn support vector classifer.
+
+  gandalf     Gated Adaptive Network for Deep Automated Learning of
+              Features for Tabular Data: https://arxiv.org/abs/2207.08548
+
+  dummy       scikit-learn DummyClassifier.
+
   catboost    CatBoost classifier.
   xgb         XGBoost classifier.
   tabpfn      Versioned TabPFN foundation-model classifier.
   dtree       scikit-learn DecisionTreeClassifier.
   et          scikit-learn ExtraTreesClassifier.
-  knn         scikit-learn KNeighborsClassifier.
-  lgbm        LightGBM boosted decision tree classifier.
-  rf          LightGBM random forest classifier.
   lr          scikit-learn LogisticRegression.
-  sgd         scikit-learn SGDClassifier.
-  mlp         Modern multi-layer perceptron implemented in skorch/PyTorch.
   kan         Official pykan Kolmogorov-Arnold Network.
-  svm         scikit-learn support vector classifier.
-  gandalf     Gated Adaptive Network for Deep Automated Learning of
-              Features for Tabular Data: https://arxiv.org/abs/2207.08548
-  dummy       scikit-learn DummyClassifier.
 
 """
 
@@ -269,22 +307,47 @@ The list of regressors to use when comparing regression model performance.
 Can be a list of elements from: [{" ".join(sorted(REGRESSOR_CHOICES))}].
 Defaults are: [{" ".join(REGRESSOR_DEFAULTS)}].
 
+  knn         scikit-learn KNeighborsRegressor.
+
+  lgbm        LightGBM boosted decision tree regressor.
+
+  rf          LightGBM random forest regressor.
+
+  sgd         scikit-learn SGDRegressor.
+
+  mlp         Modern multi-layer perceptron implemented in skorch/PyTorch.
+
+  svm         scikit-learn support vector regressor.
+
+  gandalf     Gated Adaptive Network for Deep Automated Learning of
+              Features for Tabular Data: https://arxiv.org/abs/2207.08548
+
+  dummy       scikit-learn DummyRegressor.
+
+  knn         scikit-learn KNeighborsRegressor.
+
+  lgbm        LightGBM boosted decision tree regressor.
+
+  rf          LightGBM random forest regressor.
+
+  sgd         scikit-learn SGDRegressor.
+
+  mlp         Modern multi-layer perceptron implemented in skorch/PyTorch.
+
+  svm         scikit-learn support vector regressor.
+
+  gandalf     Gated Adaptive Network for Deep Automated Learning of
+              Features for Tabular Data: https://arxiv.org/abs/2207.08548
+
+  dummy       scikit-learn DummyRegressor.
+
   catboost    CatBoost regressor.
   xgb         XGBoost regressor.
   tabpfn      Versioned TabPFN foundation-model regressor.
   dtree       scikit-learn DecisionTreeRegressor.
   et          scikit-learn ExtraTreesRegressor.
-  knn         scikit-learn KNeighborsRegressor.
-  lgbm        LightGBM boosted decision tree regressor.
-  rf          LightGBM random forest regressor.
   elastic     scikit-learn ElasticNet.
-  sgd         scikit-learn SGDRegressor.
-  mlp         Modern multi-layer perceptron implemented in skorch/PyTorch.
   kan         Official pykan Kolmogorov-Arnold Network.
-  svm         scikit-learn support vector regressor.
-  gandalf     Gated Adaptive Network for Deep Automated Learning of
-              Features for Tabular Data: https://arxiv.org/abs/2207.08548
-  dummy       scikit-learn DummyRegressor.
 
 """
 
