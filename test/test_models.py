@@ -724,6 +724,13 @@ class TestSGDLinear:
 
 @pytest.mark.fast
 class TestKNN:
+    def test_knn_grid_preserves_public_metrics(self) -> None:
+        assert KNNClassifier().grid["metric"] == [
+            "cosine",
+            "l2",
+            "correlation",
+        ]
+
     def test_knn_cls(self) -> None:
         model = KNNClassifier()
         check_basics(model, "classify")

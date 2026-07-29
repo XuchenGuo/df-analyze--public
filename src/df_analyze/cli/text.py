@@ -105,10 +105,10 @@ options are:
               runs of the feature selection, tuning, and validation pipeline,
               for the sets:
 
-              X_test_0={{file0}}, X_train_0=concat({{file1, file2, ..., fileN}})
-              X_test_1={{file1}}, X_train_1=concat({{file0, file2, ..., fileN}})
+              X_train_0={{file0}}, X_test_0=concat({{file1, file2, ..., fileN}})
+              X_train_1={{file1}}, X_test_1=concat({{file0, file2, ..., fileN}})
                                          ...
-              X_test_N={{fileN}}, X_train_N=concat({{file0, file2, ..., fileN-1}})
+              X_train_N={{fileN}}, X_test_N=concat({{file0, file2, ..., fileN-1}})
 
               Note: In the case of a single test file, this is just 2-fold. For
               more than 2 test files, expect this option to potentially be very

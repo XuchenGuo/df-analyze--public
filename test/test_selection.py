@@ -10,9 +10,13 @@ sys.path.append(str(ROOT))  # isort: skip
 
 from random import randint
 from time import perf_counter
+from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
+import numpy as np
+import pytest
 from _pytest.capture import CaptureFixture
+from pandas import DataFrame, Series
 
 from df_analyze._constants import ROOT
 from df_analyze.analysis.univariate.associate import CatAssociation, ContAssociation
@@ -49,6 +53,52 @@ from df_analyze.testing.datasets import (
 DATA = ROOT / "data/banking/bank.json"
 RUNTIMES = ROOT / "runtimes"
 RUNTIMES.mkdir(exist_ok=True)
+
+
+@pytest.mark.fast
+def test_embedded_selection_preserves_public_trial_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.tuned_model = SimpleNamespace(coef_=np.array([1.0, 0.0]))
+
+        def htune_optuna(self, **kwargs: Any) -> None:
+            calls.append(kwargs)
+
+    class FakeSelector:
+        def __init__(self, model: Any, prefit: bool) -> None:
+            assert prefit
+
+        def get_support(self) -> np.ndarray:
+            return np.array([True, False])
+
+    monkeypatch.setattr(
+        "df_analyze.selection.embedded.SGDClassifierSelector", FakeModel
+    )
+    monkeypatch.setattr(
+        "df_analyze.selection.embedded.SelectFromModel", FakeSelector
+    )
+    prepared = SimpleNamespace(
+        X=DataFrame({"first": [0.0, 1.0], "second": [1.0, 0.0]}),
+        y=Series([0, 1], name="target"),
+        groups=None,
+        is_classification=True,
+    )
+    options = SimpleNamespace(
+        is_classification=True,
+        embed_select=(EmbedSelectionModel.Linear,),
+        htune_cls_metric=object(),
+        htune_reg_metric=None,
+        htune_trials=1,
+    )
+
+    selected = embed_select_features(prepared, options)
+
+    assert calls[0]["n_trials"] == 100
+    assert selected[0].selected == ["first"]
 
 
 def test_multitarget_wrapper_aggregation_uses_oriented_scores() -> None:

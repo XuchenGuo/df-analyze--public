@@ -79,12 +79,12 @@ def test_external_sparse_targets_use_training_label_mapping():
     assert test.tolist() == [1]
 
 
-def test_sparse_lodo_trains_on_all_other_partitions(tmp_path: Path):
+def test_sparse_lodo_uses_each_partition_as_training_set(tmp_path: Path):
     paths = [tmp_path / f"part_{idx}.svmlight" for idx in range(3)]
     rng = np.random.default_rng(22)
-    for path in paths:
-        X = sparse.csr_matrix(rng.normal(size=(50, 12)))
-        y = np.arange(50) % 2
+    for path, n_rows in zip(paths, [50, 60, 70]):
+        X = sparse.csr_matrix(rng.normal(size=(n_rows, 12)))
+        y = np.arange(n_rows) % 2
         dump_svmlight_file(X, y, str(path), zero_based=True)
     options = SimpleNamespace(
         datapath=paths[0],
@@ -107,9 +107,9 @@ def test_sparse_lodo_trains_on_all_other_partitions(tmp_path: Path):
 
     assert len(outputs) == 3
     assert [(len(train.X), len(test.X)) for train, test, _ in outputs] == [
-        (100, 50),
-        (100, 50),
-        (100, 50),
+        (50, 130),
+        (60, 120),
+        (70, 110),
     ]
 
 

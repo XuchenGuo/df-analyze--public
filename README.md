@@ -61,6 +61,8 @@
     - [`📂 results`](#-results)
   - [Complete Listing](#complete-listing)
 - [Limitations](#limitations)
+  - [One Target Variable per Invocation / Run](#one-target-variable-per-invocation--run)
+    - [Multi-Target Extension](#multi-target-extension)
   - [Dataset Size](#dataset-size)
   - [Inappropriate Data](#inappropriate-data)
   - [Inappropriate Tasks](#inappropriate-tasks)
@@ -379,6 +381,27 @@ interactive prompt, or leave the default `never` to keep the current
 environment unchanged. CatBoost and XGBoost do not require this managed
 PyTorch environment.
 
+### Verifying CUDA and GPU Visibility
+
+The device router can only use hardware that the relevant backend can see.
+These read-only checks help distinguish an unavailable NVIDIA driver from a
+PyTorch- or CatBoost-specific installation problem:
+
+| Check | Command | Expected result |
+|---|---|---|
+| NVIDIA driver visibility | `nvidia-smi` | GPU name, driver version, memory information, and runtime status |
+| PyTorch CUDA visibility | `python -c "import torch; print(torch.cuda.is_available()); print(torch.version.cuda)"` | `True` when the installed PyTorch build can use CUDA; the second value is that build's CUDA runtime |
+| CatBoost GPU visibility | `python -c "from catboost.utils import get_gpu_device_count; print(get_gpu_device_count())"` | A positive number when CatBoost sees one or more GPUs |
+
+For compatibility and installation details, use the
+[NVIDIA CUDA compatibility documentation](https://docs.nvidia.com/deploy/cuda-compatibility/),
+the [PyTorch CUDA availability reference](https://docs.pytorch.org/docs/stable/generated/torch.cuda.is_available.html),
+and the [official PyTorch installation selector](https://pytorch.org/get-started/locally/).
+If the NVIDIA driver is too old for the CUDA family used by the installed
+PyTorch build, CUDA may not initialize even though an NVIDIA GPU is present.
+Run the checks in the same environment and terminal that will launch
+`df-analyze`.
+
 
 ## Quick Start and Examples
 
@@ -487,6 +510,14 @@ multi-target learning.
 Use `--targets` with comma-separated column names to analyze several outcomes
 in one run:
 
+Conceptually, multi-target analysis maps one feature matrix **X** to a target
+vector **y** = (y1, y2, ...). Continuous targets form a multi-output regression
+task; categorical targets form a multi-output classification task. This is
+useful for related outcomes such as several clinical endpoints or laboratory
+measurements recorded for the same subject. Some estimators learn the targets
+jointly, while the per-target adapter fits independent models; the selected
+backend determines which behavior is used.
+
 ```shell
 python df-analyze.py \
     --df data.csv \
@@ -538,6 +569,21 @@ the original target units.
 Final cross-validation uses up to five folds. For grouped data it may use fewer
 folds when the holdout contains fewer than five groups, but it never splits a
 group across folds. The actual number is recorded as `final_cv_folds`.
+
+Important multi-target outputs include:
+
+| Path | Description |
+|---|---|
+| `prepared/y.parquet` | Prepared target table; classification targets use encoded integers and regression targets retain their original units |
+| `prepared/labels.parquet` | Per-target classification label maps used to translate encoded integers back to original labels |
+| `features/associations/<target>/` | Per-target univariate association outputs |
+| `features/predictions/<target>/` | Per-target univariate prediction outputs when prediction output is enabled |
+| `results/results_report.md` | Overall final-evaluation report |
+| `results/results_report_target_<target>.md` | Readable report for one target |
+| `results/final_performances.csv` | Aggregate final-performance table |
+| `results/final_performances_per_target.csv` | Compact per-target performance table |
+| `results/performance_long_table_per_target.csv` | Long-form per-target metric table |
+| `results/main_metric_by_target_acc.csv` or `results/main_metric_by_target_mae.csv` | Main metric for each classification or regression target |
 
 ## Using a `df-analyze`-formatted Spreadsheet
 
@@ -1083,8 +1129,10 @@ $$\mathcal{D} = (\mathbf{X}, y) = \texttt{(X, y)},$$
 2. Target Encoding
    1. Categorical [targets are deflated](#categorical-target-deflation) and
       label encoded to values in $[0, n]$
-   2. Continuous targets are converted to numeric values and kept in their
-      original units
+   2. A single continuous target keeps the original public behavior and is
+      robustly normalized using its 2.5th and 97.5th percentiles
+   3. Multiple continuous targets are converted to numeric values and kept in
+      their original units
 
 #### Categorical Deflation
 
@@ -1120,9 +1168,17 @@ the time.
 
 ##### Categorical Target Deflation
 
-For a single categorical target, classes with 20 or fewer samples are removed.
-This is a low minimum for nested validation, but it avoids folds with too few
-examples to produce useful performance estimates.
+As above, target categorical variables are deflated, except when a target
+class has less than 30 samples. This deflation arguably should be *much* more
+aggressive: when doing e.g. 5-fold analyses on a dataset with such a target
+variable, each test fold would be expected to be 20% of the samples, so about
+6 representatives of this class. This is highly unlikely to result in
+reliable performance estimates for this class, and so only introduces noise
+to final performance metrics.
+
+For the current single-target implementation, classes with 20 or fewer samples
+are removed. This deliberately conservative minimum avoids folds with too few
+examples while preserving the original single-target cleaning behavior.
 
 Multi-target classification is handled differently. Removing a row because one
 target has a rare class would also remove valid labels from the other targets,
@@ -1260,6 +1316,26 @@ training data. The final holdout labels are used only for reporting and risk
 evaluation. In a multi-target classification run, the analysis is performed
 separately for each target.
 
+The AER pipeline:
+
+1. Refits tuned model settings and creates out-of-fold (OOF) predictions from
+   the training partition.
+2. Builds or normalizes class probabilities and compares applicable external
+   calibrators: none, temperature scaling, Platt scaling, binary isotonic, or
+   one-vs-rest isotonic.
+3. Constructs the confidence signals supported by the estimator, including
+   probability margin, tree-vote agreement, tree-leaf support, KNN vote,
+   distance-weighted KNN confidence, and KNN minimum-distance confidence.
+4. With `--aer-confidence-metric auto`, selects the signal with the lowest
+   cross-fitted Brier score for predicting whether the model is wrong.
+5. Fits confidence to expected error using OOF bins, shrinks noisy bins toward
+   the global error rate, smooths the curve by default, and can optionally
+   enforce monotonicity.
+6. Applies only the learned mapping to the holdout set, producing an expected
+   error estimate for each sample.
+7. Computes risk-controlled operating points using exact one-sided
+   Clopper-Pearson bounds with a Bonferroni adjustment over scanned thresholds.
+
 The most useful controls are:
 
 - `--aer-oof-folds`: number of out-of-fold splits
@@ -1267,6 +1343,37 @@ The most useful controls are:
 - `--aer-min-bin-count`: minimum observations in a retained bin
 - `--aer-confidence-metric`: confidence measure used by the lookup
 - `--aer-top-k`: maximum number of tuned models to analyze
+
+The complete set of base AER controls retained from the original guide is:
+
+| Flag | Default | Description |
+|---|---:|---|
+| `--adaptive-error` | `False` | Enable AER analysis |
+| `--aer-oof-folds` | `5` | OOF splits used for AER fitting and cross-fitting |
+| `--aer-bins` | `20` | Nominal number of confidence bins |
+| `--aer-min-bin-count` | `10` | Minimum observations before bins are merged or reduced |
+| `--aer-prior-strength` | `2.0` | Beta-prior shrinkage toward the global error rate |
+| `--no-aer-smooth` | off | Disable the default local smoothing |
+| `--aer-monotonic` | `False` | Enforce a monotonic confidence-to-error mapping |
+| `--aer-adaptive-binning` | `False` | Use quantile-like adaptive instead of fixed-width bins |
+| `--aer-confidence-metric` | `auto` | Select a confidence signal; `auto` uses cross-fitted Brier score |
+| `--aer-nmin` | `1` | Minimum accepted observations at a risk-controlled threshold |
+| `--aer-target-error` | `0.05` | Target error rate for risk-control summaries |
+| `--aer-alpha` | `0.05` | Significance level for the exact upper bound |
+| `--aer-top-k` | `0` | Analyze at most the top *k* usable base models; `0` means all |
+| `--no-preds` | off | Replace large per-sample prediction outputs with placeholders |
+
+Available base-model confidence signals are:
+
+| Metric | Meaning |
+|---|---|
+| `proba_margin` | Margin between the leading class probabilities |
+| `tree_vote_agreement` | Agreement among individual tree votes |
+| `tree_leaf_support` | Training support represented by tree leaves |
+| `knn_vote` | Nearest-neighbor vote agreement |
+| `knn_dist_weighted` | Distance-weighted nearest-neighbor confidence |
+| `knn_min_dist` | Confidence derived from nearest-neighbor distance |
+| `auto` | Select the best available signal by cross-fitted Brier score |
 
 Pass `--aer-ensemble` to compare several ways of combining eligible models.
 Specific strategies can be selected with `--aer-ensemble-strategies`:
@@ -1282,6 +1389,62 @@ coverage/accuracy summaries, risk-control metadata, and optional ensemble
 reports. Adaptive error analysis is classification-only and requires usable
 class probabilities. Dummy models are excluded. See `python df-analyze.py
 --help` for the complete list of AER options and defaults.
+
+For a multi-target run, each target has its own sanitized subdirectory below
+`results/adaptive_error`; with multiple external test sets, `testXX` is added
+before the target directory. The cross-model files at each AER base directory
+include:
+
+| Path | Purpose |
+|---|---|
+| `run_config.json` | Reproducible AER configuration, selected models, and run metadata |
+| `tables/models_ranked.csv` | Ranking and folder location of analyzed base models |
+| `tables/aer_metrics_by_model.csv` | Cross-model error-quality metrics |
+| `plots/confidence_vs_expected_error_compare.png` | Confidence-to-error comparison across models |
+| `predictions/test_per_sample_multi_model.csv` | Model-specific AER columns aligned to the same holdout rows |
+
+Each `models/<model-slug>/` directory can contain:
+
+| Path | Purpose |
+|---|---|
+| `metadata/proba_calibrator.json` | Selected probability-calibration method |
+| `metadata/confidence_metric_selection.json` | Selected confidence signal and candidate Brier scores |
+| `metadata/adaptive_error_metrics.json` | Global test error and AER calibration summary |
+| `tables/oof_confidence_error_bins.csv` | OOF bins used to learn the mapping |
+| `tables/test_confidence_error_bins.csv` | Holdout behavior of that mapping |
+| `tables/test_error_reliability_bins.csv` | Calibration-style reliability table |
+| `tables/coverage_accuracy_curve.csv` | Selective accuracy as progressively higher-risk rows are rejected |
+| `tables/coverage_summary.csv` | Selected operating points from the full coverage curve |
+| `tables/clinician_view.csv` | Row ID, labels, `aer_pct`, and target-error flag |
+| `predictions/oof_per_sample.csv` | Row-level diagnostics for learning the mapping |
+| `predictions/test_per_sample.csv` | Main row-level holdout output |
+| `reports/clinician_view.md` | Simplified report for non-technical readers |
+
+The main columns in `predictions/test_per_sample.csv` are:
+
+| Column | Meaning |
+|---|---|
+| `row_id` | Original row index |
+| `y_true`, `y_pred` | Encoded true and predicted class IDs |
+| `y_true_label`, `y_pred_label` | Decoded labels when a label map is available |
+| `correct` | `1` for a correct prediction, otherwise `0` |
+| `confidence` | Selected confidence signal after its transformation |
+| `aer`, `aer_pct` | Estimated error probability as a fraction and percentage |
+| `flag_gt_target_error` | `1` when `aer` meets or exceeds `--aer-target-error` |
+| `p_max`, `p_2nd`, `p_margin` | Diagnostics from calibrated class probabilities |
+| `p_pred`, `p_pred_margin` | Probability diagnostics for the predicted class |
+
+In `adaptive_error_metrics.json`, `global_error_test` is the ordinary holdout
+error rate, `brier_error_test` is the mean squared error of the predicted
+sample-level error probabilities, and `ece_error_test` is their
+calibration-style expected calibration error. Smaller Brier and ECE values are
+better.
+
+If the AER directory is absent, first confirm that the task is classification,
+that `--adaptive-error` was passed, and that at least one non-dummy model
+provided usable probabilities. Placeholder prediction files indicate that
+`--no-preds` was used. A noisy confidence/error plot may improve with
+`--aer-adaptive-binning` or a moderately larger `--aer-min-bin-count`.
 
 ### Error Consistency
 
@@ -1897,6 +2060,36 @@ timing outputs are described above.
   *not* exceed:
     - step-up: 20
     - step-down: 10
+
+## One Target Variable per Invocation / Run
+
+The following original explanation remains the basis of the single-target path.
+
+Features and targets must be treated fundamentally differently by all aspects
+of analysis. E.g.
+
+- normalization of targets in regression must be different than normalization
+  of continuous features
+- samples with NaNs in the target must be dropped (resulting in a different
+  base dataframe), but samples with NaN features can be imputed
+- data splitting must be stratified in classification to avoid errors, but
+  stratification must be based on the target (e.g. choosing a different
+  target will generally result in different splits)
+
+In addition, feature selection is expensive, and must be done for each target
+variable. Runtimes are often suprisingly sensitive to the distribution of the
+target variable.
+
+### Multi-Target Extension
+
+Multi-target support is additive to that single-target path. When multiple
+targets are explicitly selected, target-specific analyses and feature selection
+are performed for each target and then aggregated according to the selected
+multi-target strategy. Classification uses a support-aware split proxy and
+records when stratification must be relaxed. This removes the old one-target
+command-line limitation, but it does not remove the computational and
+statistical constraints described above.
+
 ## Dataset Size
 
 Let $p$ be the number of features, and $n$ be the number of samples in the
@@ -2040,8 +2233,19 @@ are simply beyond the scope of `df-analyze`.
       performance
     - imputing NaNs in a regression target (e.g. mean, median) biases estimates
       of regression performance
-  - for a single categorical target, levels with 20 or fewer samples are
-    removed because they cannot support the nested stratified splits
+  - categorical targets containing a class with 20 or fewer samples in a level
+    have the samples corresponding to that level dropped, and the user is
+    warned (these cause problems in nested stratified k-fold, and any estimated
+    of any metric or performance on such a small class is essentially
+    meaningless)
+  - continuous or ordinal single regression targets are robustly normalized
+    using 2.5th and 97.5th percentile values
+    - with this normalization, 95% of the target values are in [0, 1]
+    - thus an MAE of, say, 0.5, means that the error is about half of the
+      target (robust) range
+    - this also aids in the convergence and fitting of scale-sensitive models
+    - this also makes prediction metrics (e.g. MAE) more comparable across
+      different targets
   - for multi-target classification, low-support levels are retained so valid
     labels in the other targets are not silently discarded; the preparation
     report records them and the user is warned
@@ -2054,8 +2258,8 @@ are simply beyond the scope of `df-analyze`.
   - each actual multi-target tuning and final-CV fold is also verified after
     splitting; deterministic alternative partitions are attempted before an
     impossible grouped or ungrouped design is rejected
-  - regression targets remain in their original units, so MAE and related
-    metrics have the same units as the supplied outcomes
+  - multi-target regression targets remain in their original units, so MAE and
+    related metrics have the same units as the supplied outcomes
 
 
 

@@ -44,6 +44,7 @@ def get_model(
 ) -> Union[
     tuple[XLMRobertaModel, XLMRobertaTokenizerFast], tuple[SiglipModel, SiglipProcessor]
 ]:
+    # no idea WTF is going on here, why I can't compare enums properly...
     # Normalize the enum value before identity comparison because callers can
     # supply an equivalent EmbeddingModality instance from another import path.
     device = _embedding_device(runtime)

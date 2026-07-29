@@ -325,6 +325,21 @@ def test_grouped_split_does_not_fall_back_by_default() -> None:
         kf.split(y.to_frame(), y, g)
 
 
+def test_single_group_is_rejected_without_rowwise_fallback() -> None:
+    groups = Series(np.zeros(40, dtype=int))
+    target = Series(np.tile([0, 1], 20))
+    splitter = OmniKFold(
+        n_splits=5,
+        is_classification=True,
+        grouped=True,
+        warn_on_fallback=False,
+        allow_group_fallback=True,
+    )
+
+    with pytest.raises(RuntimeError, match="group-disjoint"):
+        splitter.split(target.to_frame(), target, groups)
+
+
 def test_grouped_holdout_split_does_not_fall_back_by_default() -> None:
     groups = Series(np.concatenate([np.zeros(50), np.ones(50)]))
     target = Series(np.concatenate([np.ones(45), np.zeros(5), np.zeros(45), np.ones(5)]))

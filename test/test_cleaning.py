@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 from _pytest.capture import CaptureFixture
 from pandas import DataFrame
+from sklearn.preprocessing import RobustScaler
 
 from df_analyze._constants import N_CAT_LEVEL_MIN
 from df_analyze.enumerables import NanHandling
@@ -72,13 +73,18 @@ def test_clean_regression_targets_preserves_units() -> None:
     assert y["target_b"].tolist() == [100.0, 200.0, 400.0]
 
 
-def test_clean_regression_target_preserves_units() -> None:
+def test_clean_regression_target_uses_original_robust_scaling() -> None:
     df = DataFrame({"feature": [1, 2, 3], "target": [10.0, "NA", 30.0]})
 
     cleaned, y, _, _ = clean_regression_target(df, df["target"], None, None)
 
     assert cleaned["feature"].tolist() == [1, 3]
-    assert y.tolist() == [10.0, 30.0]
+    expected = (
+        RobustScaler(quantile_range=(2.5, 97.5))
+        .fit_transform(np.array([[10.0], [30.0]]))
+        .ravel()
+    )
+    np.testing.assert_allclose(y.to_numpy(), expected)
 
 
 @pytest.mark.parametrize("value", [np.inf, -np.inf])

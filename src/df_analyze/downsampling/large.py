@@ -184,9 +184,9 @@ def large_table_prepared_splits(
             ]
         elif method is ValidationMethod.LODO:
             split_indices = []
-            for test_idx, test in enumerate(partitions):
-                train_parts = partitions[:test_idx] + partitions[test_idx + 1 :]
-                split_indices.append((np.concatenate(train_parts), test, None))
+            for train_idx, train in enumerate(partitions):
+                test_parts = partitions[:train_idx] + partitions[train_idx + 1 :]
+                split_indices.append((train, np.concatenate(test_parts), None))
         else:
             raise ValueError(f"Invalid external validation method: {method}")
 

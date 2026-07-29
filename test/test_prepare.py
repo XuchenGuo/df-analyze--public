@@ -15,8 +15,10 @@ from pandas import DataFrame
 from sklearn.utils.validation import check_X_y
 from tqdm import tqdm
 
+from df_analyze.enumerables import ValidationMethod
 from df_analyze.preprocessing.inspection.inspection import inspect_data
 from df_analyze.preprocessing.prepare import (
+    PreparedData,
     _ensure_target_levels_in_training,
     prepare_data,
     raw_train_test_indices,
@@ -76,6 +78,32 @@ def test_multitarget_training_coverage_moves_whole_groups() -> None:
     assert set(groups.iloc[train]).isdisjoint(groups.iloc[test])
     for target in y.columns:
         assert set(y.iloc[train][target]) == set(y[target])
+
+
+def test_lodo_preserves_public_train_partition_contract() -> None:
+    n_rows = 18
+    prepared = PreparedData(
+        X=DataFrame({"feature": np.arange(n_rows)}),
+        y=pd.Series(np.arange(n_rows, dtype=float), name="target"),
+        groups=None,
+        is_classification=False,
+        ix_train=np.arange(0, 4),
+        ix_tests=[np.arange(4, 10), np.arange(10, 18)],
+        tests_method=ValidationMethod.LODO,
+    )
+
+    splits = list(prepared.get_splits())
+
+    assert [(len(train.X), len(test.X)) for train, test in splits] == [
+        (4, 14),
+        (6, 12),
+        (8, 10),
+    ]
+    assert [train.X["feature"].tolist() for train, _ in splits] == [
+        list(range(0, 4)),
+        list(range(4, 10)),
+        list(range(10, 18)),
+    ]
 
 
 def test_multitarget_preparation_report_contains_audit() -> None:

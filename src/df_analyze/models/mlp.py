@@ -580,7 +580,9 @@ class MLPEstimator(DfAnalyzeModel):
                     preds = estimator.predict(X_test)
                     score = metric.tuning_score(y_test.numpy(), preds)
                     scores.append(score)
-                    # Reporting each intermediate fold score allows pruning.
+                    # allows pruning
+                    # Reporting each intermediate fold score makes that pruning
+                    # decision reflect progress across the completed folds.
                     trial.report(float(np.mean(scores)), step=step)
                     if trial.should_prune():
                         raise optuna.TrialPruned()

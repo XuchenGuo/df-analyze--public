@@ -13,7 +13,7 @@ from df_analyze.models.lgbm import (
 
 
 @pytest.mark.fast
-def test_lgbm_wrappers_use_stable_cpu_defaults() -> None:
+def test_lgbm_wrappers_preserve_public_defaults() -> None:
     models = [
         LightGBMClassifier(),
         LightGBMRegressor(),
@@ -22,9 +22,9 @@ def test_lgbm_wrappers_use_stable_cpu_defaults() -> None:
     ]
 
     for model in models:
-        assert model.fixed_args["n_jobs"] == 1
-        assert model.fixed_args["force_col_wise"] is True
         assert model.fixed_args["verbosity"] == -1
+        assert "n_jobs" not in model.fixed_args
+        assert "force_col_wise" not in model.fixed_args
 
     assert LightGBMRFClassifier().fixed_args["boosting_type"] == "rf"
     assert LightGBMRFRegressor().fixed_args["boosting_type"] == "rf"

@@ -527,12 +527,12 @@ def test_large_table_multitarget_split_and_target_audits():
     assert set(train.info.split_audit.dropped_targets) == {"target_a", "target_b"}
 
 
-def test_large_table_lodo_uses_every_partition_as_holdout():
+def test_large_table_lodo_uses_every_partition_as_training_set():
     rng = np.random.default_rng(31)
     frame = pd.DataFrame(
-        rng.normal(size=(120, 12)), columns=[f"x{idx}" for idx in range(12)]
+        rng.normal(size=(210, 12)), columns=[f"x{idx}" for idx in range(12)]
     )
-    frame["target"] = np.arange(120) % 2
+    frame["target"] = np.arange(210) % 2
     options = _options(FeatureDownsampleMethod.Variance, 5)
     options.is_classification = True
     options.target = "target"
@@ -545,7 +545,7 @@ def test_large_table_lodo_uses_every_partition_as_holdout():
     options.seed = 42
     options.assume_numeric_features = False
     options.tests_method = ValidationMethod.LODO
-    partitions = [np.arange(0, 40), np.arange(40, 80), np.arange(80, 120)]
+    partitions = [np.arange(0, 60), np.arange(60, 130), np.arange(130, 210)]
 
     outputs = large_table_prepared_splits(
         frame, options, partitions[0], partitions[1:]
@@ -553,9 +553,9 @@ def test_large_table_lodo_uses_every_partition_as_holdout():
 
     assert len(outputs) == 3
     assert [(len(train.X), len(test.X)) for train, test, _ in outputs] == [
-        (80, 40),
-        (80, 40),
-        (80, 40),
+        (60, 150),
+        (70, 140),
+        (80, 130),
     ]
 
 

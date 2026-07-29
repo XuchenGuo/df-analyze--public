@@ -435,7 +435,9 @@ class KNNEstimator(DfAnalyzeModel):
         self.grid = {
             "n_neighbors": [1, 5, 10, 25, 50],
             "weights": ["uniform", "distance"],
-            "metric": ["cosine", "l1", "l2", "correlation"],
+            # Keep the original public grid unchanged. The CUDA implementation
+            # can still accept L1 when it is explicitly supplied.
+            "metric": ["cosine", "l2", "correlation"],
         }
 
     def model_cls_args(self, full_args: dict[str, Any]) -> tuple[type, dict[str, Any]]:

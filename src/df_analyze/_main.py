@@ -349,11 +349,11 @@ def _run(options: ProgramOptions) -> None:
         df, renames = sanitize_names(df, target_spec)
         if merged_df is not None:
             # We already check column names are identical across test dfs, so
-            # we do not need to use renaming info twice.
+            # we do not need to use renaming info twice
             merged_df = sanitize_names(merged_df, target_spec)[0]
         prog_dirs.save_renames(renames)
-        # Likewise, the variables below are lists of column names, so there is
-        # nothing separate to rename for merged_df.
+        # Likewise, below variables are just list[str], and so we don't need to do
+        # anything for the merged_df
         categoricals = renames.rename_columns(categoricals)
         ordinals = renames.rename_columns(ordinals)
         drops = renames.rename_columns(drops)
@@ -389,10 +389,13 @@ def _run(options: ProgramOptions) -> None:
                     raise RuntimeError("Missing external train/test row indices.")
                 partitions = [ix_train, *ix_tests]
                 split_specs = []
-                for test_idx, idx_test in enumerate(partitions):
-                    train_parts = partitions[:test_idx] + partitions[test_idx + 1 :]
+                # Preserve the public-branch LODO contract: each supplied
+                # partition is the training set once, and all other partitions
+                # are combined into its external validation set.
+                for train_idx, idx_train in enumerate(partitions):
+                    test_parts = partitions[:train_idx] + partitions[train_idx + 1 :]
                     split_specs.append(
-                        (np.concatenate(train_parts), [idx_test], None)
+                        (idx_train, [np.concatenate(test_parts)], None)
                     )
             else:
                 raise ValueError(f"Invalid external validation method: {method}")
@@ -485,6 +488,7 @@ def _run(options: ProgramOptions) -> None:
             )
         if downsample_result is not None:
             prog_dirs.save_downsampling(downsample_result, fold_idx)
+            # describe prepared features
             # Describe prepared features after any requested downsampling.
             if fold_idx in (None, 0):
                 if isinstance(prep_train.y, DataFrame):
@@ -501,6 +505,7 @@ def _run(options: ProgramOptions) -> None:
                         desc_cont, desc_cat, desc_target
                     )
         elif not downsampling_requested and fold_idx in (None, 0):
+            # describe prepared features
             # Describe prepared features when no downsampling stage was requested.
             if isinstance(prep_train.y, DataFrame):
                 for target_name in prep_train.target_cols:
@@ -551,7 +556,7 @@ def _run(options: ProgramOptions) -> None:
                 prog_dirs.save_pred_report(predictions.to_markdown(), fold_idx)
 
             if FeatureSelection.Filter in options.feat_select:
-                # Select features via filter methods first.
+                # select features via filter methods first
                 assoc_filtered, pred_filtered = filter_select_features(
                     prep_selection, associations, predictions, options
                 )

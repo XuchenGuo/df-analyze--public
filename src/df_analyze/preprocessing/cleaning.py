@@ -11,7 +11,7 @@ from numpy import ndarray
 from pandas import DataFrame, Series
 from sklearn.experimental import enable_iterative_imputer  # noqa
 from sklearn.impute import IterativeImputer, SimpleImputer
-from sklearn.preprocessing import LabelEncoder, MinMaxScaler
+from sklearn.preprocessing import LabelEncoder, MinMaxScaler, RobustScaler
 from tqdm import tqdm
 
 from df_analyze._constants import (
@@ -311,6 +311,7 @@ def reindex(
         return ix_train, ix_tests
 
     keep = np.asarray(idx_keep, dtype=bool)
+    # we re-index later, so, we need to regen the indices to be increasing again
     # Regenerate compact, increasing indices after rows are removed so the
     # saved train/test partitions still address the re-indexed DataFrame.
     old_to_new = np.full(len(keep), -1, dtype=int)
@@ -596,11 +597,12 @@ def clean_regression_target(
     Optional[ndarray],
     Optional[list[ndarray]],
 ]:
-    """Remove regression targets that cannot be predicted.
+    """NaN targets cannot be predicted. Remove them, and then robustly
+    normalize target to facilitate convergence and interpretation
+    of metrics.
 
-    Missing targets are dropped, then the remaining values are converted to
-    finite floats while preserving their original units. Normalization, when
-    requested, is handled later from training-only data.
+    This preserves the original single-target behavior. Multi-target
+    regression uses ``clean_regression_targets`` and retains original units.
     """
     target = unify_nans(target)
     idx_keep = ~target.isna()
@@ -613,7 +615,12 @@ def clean_regression_target(
     numeric = values.to_numpy(dtype=float)
     if not np.isfinite(numeric).all():
         raise ValueError(f"Regression target '{target.name}' contains infinite values.")
-    target = Series(numeric, name=target.name)
+    y = (
+        RobustScaler(quantile_range=(2.5, 97.5))
+        .fit_transform(numeric.reshape(-1, 1))
+        .ravel()
+    )
+    target = Series(y, name=target.name)
 
     return df, target, ix_train, ix_tests
 

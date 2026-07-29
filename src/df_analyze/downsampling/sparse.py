@@ -198,24 +198,24 @@ def sparse_prepared_splits(options: Any) -> list[
                     )
                 )
         elif method is ValidationMethod.LODO:
-            for test_idx in range(len(loaded.matrices)):
-                train_matrices = [
+            for train_idx in range(len(loaded.matrices)):
+                test_matrices = [
                     matrix
                     for idx, matrix in enumerate(loaded.matrices)
-                    if idx != test_idx
+                    if idx != train_idx
                 ]
-                train_targets = [
+                test_targets = [
                     target
                     for idx, target in enumerate(loaded.targets)
-                    if idx != test_idx
+                    if idx != train_idx
                 ]
                 split_sources.append(
                     (
-                        vstack(train_matrices, format="csr"),
-                        np.concatenate(train_targets),
-                        loaded.matrices[test_idx],
-                        loaded.targets[test_idx],
-                        paths[test_idx],
+                        loaded.matrices[train_idx],
+                        loaded.targets[train_idx],
+                        vstack(test_matrices, format="csr"),
+                        np.concatenate(test_targets),
+                        paths[train_idx],
                     )
                 )
         else:

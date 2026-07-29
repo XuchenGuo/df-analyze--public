@@ -26,7 +26,7 @@ class LightGBMEstimator(DfAnalyzeModel):
     def __init__(self, model_args: Optional[Mapping] = None) -> None:
         super().__init__(model_args)
         self.is_classifier = False
-        self.fixed_args = dict(verbosity=-1, n_jobs=1, force_col_wise=True)
+        self.fixed_args = dict(verbosity=-1)
         self.model_cls: Type[Any] = type(None)
 
     def model_cls_args(self, full_args: dict[str, Any]) -> tuple[type, dict[str, Any]]:
@@ -56,7 +56,7 @@ class LightGBMRFEstimator(DfAnalyzeModel):
         super().__init__(model_args)
         self.is_classifier = False
         # https://github.com/microsoft/LightGBM/issues/1333
-        self.fixed_args = dict(verbosity=-1, n_jobs=1, force_col_wise=True)
+        self.fixed_args = dict(verbosity=-1)
         self.default_args = dict(bagging_freq=1, bagging_fraction=0.75)
         self.model_cls: Type[Any] = type(None)
 
@@ -87,7 +87,7 @@ class LightGBMClassifier(LightGBMEstimator):
     def __init__(self, model_args: Optional[Mapping] = None) -> None:
         super().__init__(model_args)
         self.is_classifier = True
-        self.fixed_args = dict(verbosity=-1, n_jobs=1, force_col_wise=True)
+        self.fixed_args = dict(verbosity=-1)
         self.model_cls = LGBMClassifier
 
 
@@ -99,7 +99,7 @@ class LightGBMRegressor(LightGBMEstimator):
     def __init__(self, model_args: Optional[Mapping] = None) -> None:
         super().__init__(model_args)
         self.is_classifier = False
-        self.fixed_args = dict(verbosity=-1, n_jobs=1, force_col_wise=True)
+        self.fixed_args = dict(verbosity=-1)
         self.model_cls = LGBMRegressor
 
 

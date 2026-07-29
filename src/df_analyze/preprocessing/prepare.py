@@ -720,9 +720,11 @@ class PreparedData:
         ix_all = [self.ix_train, *self.ix_tests]
         ix_pairs = []
         for i, ix in enumerate(ix_all):
-            ix_test = ix
-            ix_trains = ix_all[:i] + ix_all[i + 1 :]
-            ix_train = np.concatenate(ix_trains)
+            # Compatibility with the original public behavior: train on the
+            # selected partition and validate on all remaining partitions.
+            ix_train = ix
+            ix_tests = ix_all[:i] + ix_all[i + 1 :]
+            ix_test = np.concatenate(ix_tests)
             ix_pairs.append((ix_train, ix_test))
 
         for ix_train, ix_test in ix_pairs:
