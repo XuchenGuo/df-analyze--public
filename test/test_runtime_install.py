@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -166,10 +167,38 @@ def test_install_lock_detects_dead_owner(
 ) -> None:
     lock = tmp_path / "install.lock"
     lock.write_text("12345", encoding="utf-8")
-
-    def missing_process(pid: int, signal: int) -> None:
-        raise ProcessLookupError
-
-    monkeypatch.setattr(install.os, "kill", missing_process)
+    monkeypatch.setattr(install, "_process_exists", lambda pid: False)
 
     assert _stale_install_lock(lock)
+
+
+@pytest.mark.fast
+def test_install_lock_preserves_live_owner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lock = tmp_path / "install.lock"
+    lock.write_text("12345", encoding="utf-8")
+    monkeypatch.setattr(install, "_process_exists", lambda pid: True)
+
+    assert not _stale_install_lock(lock)
+
+
+@pytest.mark.fast
+def test_windows_liveness_check_never_signals_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(install, "_IS_WINDOWS", True)
+    monkeypatch.setattr(install, "_windows_process_exists", lambda pid: True)
+
+    def unexpected_signal(pid: int, signal: int) -> None:
+        pytest.fail("Windows process liveness checks must not call os.kill")
+
+    monkeypatch.setattr(install.os, "kill", unexpected_signal)
+
+    assert install._process_exists(12345)
+
+
+@pytest.mark.fast
+@pytest.mark.skipif(not install._IS_WINDOWS, reason="Windows-specific process check")
+def test_windows_process_check_detects_current_process() -> None:
+    assert install._windows_process_exists(os.getpid())

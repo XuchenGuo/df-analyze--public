@@ -162,6 +162,8 @@ class StepwiseSelector:
             leave=True,
             position=0,
         ):  # type: ignore
+            if not self.is_forward and len(self.to_consider) <= self.n_features:
+                break
             if len(self.to_consider) == 0:
                 self.redundant_early_stop = True
                 break
@@ -173,6 +175,16 @@ class StepwiseSelector:
                 results = self._get_best_new_features()
                 selected = results.best
                 score = results.best_score
+                if not self.is_forward:
+                    max_remove = len(self.to_consider) - self.n_features
+                    ranked = sorted(
+                        zip(results.features, results.scores),
+                        key=lambda item: (item[0] == results.best, item[1]),
+                        reverse=True,
+                    )
+                    removals = ranked[:max_remove]
+                    results.features = [feature for feature, _ in removals]
+                    results.scores = [value for _, value in removals]
                 self.redundant_results.append(results)
                 self.selected.update(results.features)
                 self.to_consider.difference_update(results.features)

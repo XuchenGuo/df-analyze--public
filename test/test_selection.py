@@ -41,6 +41,7 @@ from df_analyze.selection.filter import (
 )
 from df_analyze.selection.multitarget import aggregate_wrapper_selected
 from df_analyze.selection.stepwise import (
+    RedundantFeatures,
     StepwiseSelector,
     stepwise_select,
 )
@@ -84,6 +85,60 @@ def test_backward_selection_returns_retained_features(
     selected, scores, _, _ = result
     assert selected == ["b", "d"]
     assert scores == {"b": 0.7, "d": 0.6}
+
+
+@pytest.mark.fast
+def test_backward_redundancy_cannot_remove_below_requested_feature_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = SimpleNamespace(
+        X=DataFrame(np.zeros((4, 4)), columns=["a", "b", "c", "d"]),
+        is_classification=True,
+    )
+    options = SimpleNamespace(
+        wrapper_select=WrapperSelection.StepDown,
+        wrapper_model=WrapperSelectionModel.Linear,
+        redundant_selection=True,
+        n_feat_wrapper=2,
+    )
+
+    def all_candidates_redundant(selector: StepwiseSelector) -> RedundantFeatures:
+        selector.candidate_scores = {"a": 0.6, "b": 0.7, "c": 0.8, "d": 0.9}
+        return RedundantFeatures(
+            best="d",
+            best_score=0.9,
+            features=["a", "b", "c", "d"],
+            scores=[0.6, 0.7, 0.8, 0.9],
+            metric="accuracy",
+        )
+
+    monkeypatch.setattr(
+        StepwiseSelector, "_get_best_new_features", all_candidates_redundant
+    )
+
+    result = stepwise_select(
+        prep_train=prepared,  # type: ignore[arg-type]
+        options=options,  # type: ignore[arg-type]
+    )
+
+    assert result is not None
+    selected, scores, redundants, early_stop = result
+    assert selected == ["a", "b"]
+    assert scores == {"a": 0.6, "b": 0.7}
+    assert redundants[0].features == ["d", "c"]
+    assert redundants[0].scores == [0.9, 0.8]
+    assert not early_stop
+
+    report = WrapperSelected(
+        method=options.wrapper_select,
+        model=options.wrapper_model,
+        selected=selected,
+        scores=scores,
+        redundants=redundants,
+        early_stop=early_stop,
+        is_classification=True,
+    ).to_markdown()
+    assert "## Selected Features" in report
 
 
 def test_lgbm_wrapper_avoids_nested_cpu_parallelism() -> None:

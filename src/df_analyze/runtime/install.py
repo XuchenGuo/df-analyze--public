@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import errno
 import hashlib
 import json
@@ -10,11 +11,16 @@ import shutil
 import subprocess
 import sys
 import time
+from ctypes import wintypes
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
 import tomllib
+
+_IS_WINDOWS = os.name == "nt"
+_ERROR_ACCESS_DENIED = 5
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 
 class DeviceInstall(Enum):
@@ -56,6 +62,42 @@ print(json.dumps({"usable": usable, "torch": torch.__version__, "cuda": torch.ve
 """
 
 
+def _windows_process_exists(pid: int) -> bool:
+    """Check process liveness on Windows without sending it a signal."""
+    if pid <= 0:
+        return False
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    ]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if handle:
+        kernel32.CloseHandle(handle)
+        return True
+    return ctypes.get_last_error() == _ERROR_ACCESS_DENIED
+
+
+def _process_exists(pid: int) -> bool:
+    if _IS_WINDOWS:
+        return _windows_process_exists(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as error:
+        return error.errno != errno.ESRCH
+    return True
+
+
 def _stale_install_lock(path: Path) -> bool:
     try:
         raw_pid = path.read_text(encoding="utf-8").strip()
@@ -66,15 +108,7 @@ def _stale_install_lock(path: Path) -> bool:
         pid = int(raw_pid)
     except ValueError:
         return age > 60
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        return False
-    except OSError as error:
-        return error.errno == errno.ESRCH
-    return False
+    return not _process_exists(pid)
 
 VERIFY_RUNTIME = """
 import json
