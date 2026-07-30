@@ -763,21 +763,21 @@ def sparse_snplike_data(
     return X, y
 
 
-try:
-    __UNSORTED: list[tuple[str, TestDataset]] = [(p.name, TestDataset(p)) for p in ALL]
+AVAILABLE = [
+    path
+    for path in ALL
+    if (path / f"{path.name}.parquet").is_file()
+    and (path / "types.csv").is_file()
+]
+__UNSORTED: list[tuple[str, TestDataset]] = [
+    (path.name, TestDataset(path)) for path in AVAILABLE
+]
 
-    TEST_DATASETS: dict[str, TestDataset] = dict(
-        sorted(__UNSORTED, key=lambda p: p[1].load().shape[0])
-    )
-    if "credit-approval_reproduced" in TEST_DATASETS:
-        TEST_DATASETS.pop("credit-approval_reproduced")  # constant target
-except Exception:
-    # print(
-    #     "No test datasets found. If you are not a developer of df-analyze, "
-    #     "you may ignore this message."
-    # )
-    __UNSORTED = []
-    TEST_DATASETS = {}
+TEST_DATASETS: dict[str, TestDataset] = dict(
+    sorted(__UNSORTED, key=lambda pair: pair[1].shape[0])
+)
+if "credit-approval_reproduced" in TEST_DATASETS:
+    TEST_DATASETS.pop("credit-approval_reproduced")  # constant target
 
 INSPECTION_TIMES = {
     "KDD98": 68.49440933300002,
@@ -874,14 +874,26 @@ SLOW_INSPECTION = sorted(SLOW_INSPECTION, key=lambda d: str(d[0]).lower())
 ALL_DATASETS = sorted(ALL_DATASETS, key=lambda d: str(d[0]).lower())
 DATASET_LIST = FAST_INSPECTION + MEDIUM_INSPECTION + SLOW_INSPECTION
 
-# "cleveland", "heart-c", "cholesterol"
-FASTEST = []
-if len(DATASET_LIST) > 51:
-    FASTEST = [
-        DATASET_LIST[6],
-        DATASET_LIST[19],
-        DATASET_LIST[51],
+# Keep optional-data test groups executable when only a subset of the
+# repository's developer datasets is installed.
+if not SLOW_INSPECTION and DATASET_LIST:
+    SLOW_INSPECTION = [
+        max(
+            DATASET_LIST,
+            key=lambda pair: (
+                INSPECTION_TIMES.get(pair[0], 0.0),
+                pair[1].shape[0] * pair[1].shape[1],
+            ),
+        )
     ]
+
+FASTEST = sorted(
+    DATASET_LIST,
+    key=lambda pair: (
+        INSPECTION_TIMES.get(pair[0], float("inf")),
+        pair[1].shape[0] * pair[1].shape[1],
+    ),
+)[:3]
 
 
 # https://stackoverflow.com/a/5409569

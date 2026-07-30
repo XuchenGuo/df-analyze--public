@@ -59,6 +59,50 @@ RUNTIMES = ROOT / "runtimes"
 RUNTIMES.mkdir(exist_ok=True)
 
 
+def test_backward_selection_returns_retained_features(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = SimpleNamespace(
+        X=DataFrame(np.zeros((4, 4)), columns=["a", "b", "c", "d"])
+    )
+    options = SimpleNamespace(
+        wrapper_select=WrapperSelection.StepDown,
+        wrapper_model=WrapperSelectionModel.Linear,
+        redundant_selection=False,
+        n_feat_wrapper=2,
+    )
+
+    def fake_fit(selector: StepwiseSelector) -> None:
+        selector.selected = {"b", "d"}
+        selector.ordered_scores = [("a", 0.9), ("c", 0.8)]
+        selector.candidate_scores = {"b": 0.7, "c": 0.8, "d": 0.6}
+
+    monkeypatch.setattr(StepwiseSelector, "fit", fake_fit)
+    result = stepwise_select(prep_train=prepared, options=options)  # type: ignore[arg-type]
+
+    assert result is not None
+    selected, scores, _, _ = result
+    assert selected == ["b", "d"]
+    assert scores == {"b": 0.7, "d": 0.6}
+
+
+def test_lgbm_wrapper_avoids_nested_cpu_parallelism() -> None:
+    prepared = SimpleNamespace(
+        X=DataFrame(np.zeros((4, 2)), columns=["a", "b"])
+    )
+    options = SimpleNamespace(
+        wrapper_model=WrapperSelectionModel.LGBM,
+        redundant_selection=False,
+    )
+    selector = StepwiseSelector(
+        prep_train=prepared,  # type: ignore[arg-type]
+        options=options,  # type: ignore[arg-type]
+        n_features=1,
+    )
+
+    assert selector._candidate_n_jobs() == 1
+
+
 @pytest.mark.fast
 def test_total_filter_count_is_respected_for_continuous_features() -> None:
     columns = [f"feature_{idx}" for idx in range(6)]

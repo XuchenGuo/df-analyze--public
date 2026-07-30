@@ -27,6 +27,10 @@ pytestmark = [
     ),
 ]
 
+TORCH_CUDA_COMPONENTS = frozenset(
+    {RuntimeComponent.KNN, RuntimeComponent.MLP, RuntimeComponent.KAN}
+)
+
 
 def _classification_data() -> tuple[pd.DataFrame, pd.Series]:
     rng = np.random.default_rng(20260726)
@@ -38,7 +42,7 @@ def _classification_data() -> tuple[pd.DataFrame, pd.Series]:
 
 
 def _cuda_policy(component: RuntimeComponent):
-    if not torch.cuda.is_available():
+    if component in TORCH_CUDA_COMPONENTS and not torch.cuda.is_available():
         pytest.skip("PyTorch CUDA is not available on this test host")
     policy = get_runtime("cuda").with_workload(48, 6)
     decision = policy.decision_for(component)

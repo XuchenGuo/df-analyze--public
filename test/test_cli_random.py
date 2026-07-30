@@ -579,9 +579,10 @@ def inspect_sparse_data(capsys: CaptureFixture) -> None:
 
 
 def test_sparse_data(capsys: CaptureFixture) -> None:
-    if len(FASTEST) < 2:
-        pytest.skip("Bundled test datasets are not available")
-    ds = FASTEST[1][1]
+    classification_datasets = [ds for _, ds in FASTEST if ds.is_classification]
+    if not classification_datasets:
+        pytest.skip("Bundled classification test datasets are not available")
+    ds = classification_datasets[0]
     with capsys.disabled():
         with TemporaryDirectory() as tempdir:
             for _ in range(10):

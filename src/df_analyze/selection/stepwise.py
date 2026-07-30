@@ -133,6 +133,7 @@ class StepwiseSelector:
         self.scores: dict[str, float] = {}
         self.remaining: list[str] = prep_train.X.columns.to_list()
         self.ordered_scores: list[tuple[str, float]] = []
+        self.candidate_scores: dict[str, float] = {}
         self.redundant_results: list[RedundantFeatures] = []
         self.redundant_early_stop: bool = False
         self.selected: set[str] = set()
@@ -145,6 +146,11 @@ class StepwiseSelector:
     def _candidate_n_jobs(self) -> int:
         if self.options.wrapper_model is WrapperSelectionModel.KNN:
             return self.options.runtime.tuning_jobs(RuntimeComponent.KNN, -1)
+        if self.options.wrapper_model is WrapperSelectionModel.LGBM:
+            # LightGBM already parallelizes each fit across CPU cores. Running
+            # candidate fits in parallel as well causes severe nested
+            # oversubscription, especially on Windows.
+            return 1
         return -1
 
     def fit(self) -> None:
@@ -236,6 +242,7 @@ class StepwiseSelector:
         )
         scores = np.array(all_scores)
         feat_names = candidates
+        self.candidate_scores = dict(zip(feat_names, scores.tolist()))
         # Now remember redundant selection can stop early, so
 
         best_idx = np.argmax(scores)
@@ -296,6 +303,7 @@ class StepwiseSelector:
                 position=1,
             )
         )
+        self.candidate_scores = dict(zip(candidates, scores))
 
         idx = np.argmax(scores)
         selected = candidates[idx]
@@ -319,11 +327,18 @@ def stepwise_select(
     )
     selector.fit()
 
-    scores = {}
-    selected_feats = []
-    for fname, score in selector.ordered_scores:
-        selected_feats.append(fname)
-        scores[fname] = score
+    if selector.is_forward:
+        selected_feats = [fname for fname, _ in selector.ordered_scores]
+        scores = dict(selector.ordered_scores)
+    else:
+        selected_feats = [
+            fname for fname in prep_train.X.columns if fname in selector.selected
+        ]
+        scores = {
+            fname: selector.candidate_scores[fname]
+            for fname in selected_feats
+            if fname in selector.candidate_scores
+        }
 
     return (
         selected_feats,

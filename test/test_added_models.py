@@ -107,7 +107,7 @@ def test_real_kan_backend_smoke(task: str) -> None:
         "license and configuring TABPFN_TOKEN"
     ),
 )
-@pytest.mark.parametrize("version", ["v3", "v2.6", "v2.5"])
+@pytest.mark.parametrize("version", ["v3", "v2_6", "v2_5"])
 @pytest.mark.parametrize("task", ["classification", "regression"])
 def test_real_tabpfn_backend_smoke(version: str, task: str) -> None:
     X = numeric_data(24)

@@ -21,7 +21,13 @@ from df_analyze.analysis.univariate.associate import (
     ContClsStats,
     ContRegStats,
 )
-from df_analyze.cli.cli import ProgramOptions, Verbosity, get_options, random_cli_args
+from df_analyze.cli.cli import (
+    ProgramOptions,
+    Verbosity,
+    _split_cli_args,
+    get_options,
+    random_cli_args,
+)
 from df_analyze.enumerables import (
     ClsScore,
     DfAnalyzeClassifier,
@@ -73,6 +79,44 @@ def test_quoted_classifiers() -> None:
     ):
         opts = get_options()
     assert opts.categoricals == ["a one", "a two"]
+
+
+@pytest.mark.fast
+@pytest.mark.filterwarnings("ignore:.*not have write permissions.*")
+def test_programmatic_args_preserve_quotes_and_windows_paths() -> None:
+    args = (
+        r'--df "C:\Users\Jane Doe\data.csv" '
+        r'--target "Shell weight" '
+        r'--categoricals "CO2 CosIR Value" "MOX 2"'
+    )
+
+    assert _split_cli_args(args) == [
+        "--df",
+        r"C:\Users\Jane Doe\data.csv",
+        "--target",
+        "Shell weight",
+        "--categoricals",
+        "CO2 CosIR Value,MOX 2",
+    ]
+
+
+@pytest.mark.fast
+@pytest.mark.filterwarnings("ignore:.*not have write permissions.*")
+def test_spreadsheet_args_preserve_quoted_columns(tmp_path: Path) -> None:
+    spreadsheet = tmp_path / "data with spaces.csv"
+    spreadsheet.write_text(
+        '--target "Shell weight"\n'
+        '--categoricals "CO2 CosIR Value" "MOX 2"\n'
+        "\n"
+        '"Shell weight","CO2 CosIR Value","MOX 2"\n'
+        "0,1,2\n",
+        encoding="utf-8",
+    )
+
+    opts = get_options(f'--spreadsheet "{spreadsheet}" --verbosity 0')
+
+    assert opts.target == "Shell weight"
+    assert opts.categoricals == ["CO2 CosIR Value", "MOX 2"]
 
 
 @pytest.mark.fast

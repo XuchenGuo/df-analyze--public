@@ -548,6 +548,10 @@ class EvaluationResults:
         per_target_df = (
             pd.read_csv(per_target_path) if per_target_path.exists() else None
         )
+        for results_df in (df, per_target_df):
+            if results_df is not None and "failure_reason" in results_df.columns:
+                reasons = results_df["failure_reason"].astype(object)
+                results_df["failure_reason"] = reasons.where(reasons.notna(), None)
         X_train = pd.read_csv(root / "X_train.csv", engine="python")
         X_test = pd.read_csv(root / "X_test.csv", engine="python")
         df_y_tr = pd.read_csv(root / "y_train.csv", index_col=0)

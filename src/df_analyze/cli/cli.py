@@ -13,6 +13,7 @@ File for defining all options passed to `df-analyze.py`.
 """
 import os
 import secrets
+import shlex
 import sys
 import traceback
 from argparse import ArgumentParser, Namespace, RawTextHelpFormatter
@@ -402,7 +403,9 @@ class ProgramOptions(Debug):
         self.classifiers: Tuple[DfAnalyzeClassifier, ...] = tuple(
             sorted(set(classifiers))
         )
-        self.regressors: Tuple[DfAnalyzeRegressor, ...] = tuple(sorted(set(regressors)))
+        self.regressors: Tuple[DfAnalyzeRegressor, ...] = tuple(
+            sorted(set(regressors))
+        )
         self.tabpfn_version = TabPFNVersion.from_arg(tabpfn_version)
         self._validate_optional_model_dependencies()
         # self.htune: bool = htune
@@ -470,13 +473,13 @@ class ProgramOptions(Debug):
         self.aer_ens_tau_low: float = aer_ens_tau_low
         self.aer_ens_tau_high: float = aer_ens_tau_high
 
-        self.program_dirs: ProgramDirs = ProgramDirs.new(self.outdir, self.hash())
+        # Normalize model order so JSON round trips and hashes are stable.
+        self.classifiers = tuple(
+            sorted({*self.classifiers, DfAnalyzeClassifier.Dummy})
+        )
+        self.regressors = tuple(sorted({*self.regressors, DfAnalyzeRegressor.Dummy}))
 
-        # cleanup
-        if DfAnalyzeClassifier.Dummy not in self.classifiers:
-            self.classifiers = (DfAnalyzeClassifier.Dummy, *self.classifiers)
-        if DfAnalyzeRegressor.Dummy not in self.regressors:
-            self.regressors = (DfAnalyzeRegressor.Dummy, *self.regressors)
+        self.program_dirs: ProgramDirs = ProgramDirs.new(self.outdir, self.hash())
 
         is_cls = self.is_classification
         self.comparables = {
@@ -627,11 +630,15 @@ class ProgramOptions(Debug):
             for model in DfAnalyzeClassifier.random_n()
             if model is not DfAnalyzeClassifier.TabPFN
         )
+        if len(classifiers) == 0:
+            classifiers = (DfAnalyzeClassifier.Dummy,)
         regressors = tuple(
             model
             for model in DfAnalyzeRegressor.random_n()
             if model is not DfAnalyzeRegressor.TabPFN
         )
+        if len(regressors) == 0:
+            regressors = (DfAnalyzeRegressor.Dummy,)
         # htune: bool = choice([True, False])
         # htune_val: ValMethod = "kfold"
         # htune_val_size: Size = 5
@@ -810,6 +817,7 @@ class ProgramOptions(Debug):
         obj = cast(dict, obj)
         obj.pop("version", None)
         obj.pop("cli_args", None)
+        obj.pop("cli_argv", None)
         obj.pop("comparables", None)
         obj.pop("program_dirs", None)
 
@@ -830,6 +838,12 @@ class ProgramOptions(Debug):
         for key in tuples:
             if key in obj:
                 obj[key] = tuple(obj[key])
+
+        saved_outdir = obj.get("outdir")
+        datapath = obj.get("datapath")
+        if isinstance(saved_outdir, Path) and isinstance(datapath, Path):
+            if saved_outdir.name == datapath.stem:
+                obj["outdir"] = saved_outdir.parent
 
         opts = ProgramOptions(**obj)
         opts.program_dirs = program_dirs
@@ -983,6 +997,41 @@ class ProgramOptions(Debug):
         return df_all, ix_train, ix_tests
 
 
+_COLUMN_LIST_OPTIONS = frozenset(
+    {"--targets", "--categoricals", "--ordinals", "--drops"}
+)
+
+
+def _split_cli_args(args: str) -> list[str]:
+    """Split programmatic/spreadsheet CLI text without damaging Windows paths."""
+    lexer = shlex.shlex(args, posix=True)
+    lexer.commenters = ""
+    lexer.whitespace_split = True
+    lexer.escape = ""
+    tokens = list(lexer)
+
+    # Spreadsheet headers historically write selected columns as separately quoted
+    # values, while the public CLI documents comma-separated values. Normalize both
+    # forms to the single comma-separated token expected by ``column_parser``.
+    normalized: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        normalized.append(token)
+        index += 1
+        if token not in _COLUMN_LIST_OPTIONS:
+            continue
+
+        columns: list[str] = []
+        while index < len(tokens) and not tokens[index].startswith("--"):
+            columns.extend(col for col in tokens[index].split(",") if col)
+            index += 1
+        if columns:
+            normalized.append(",".join(columns))
+
+    return normalized
+
+
 def parse_and_merge_args(parser: ArgumentParser, args: Optional[str] = None) -> Namespace:
     # CLI args supersede when non default and also specified in sheet
     # see https://stackoverflow.com/a/76230387 for a similar problem
@@ -990,7 +1039,7 @@ def parse_and_merge_args(parser: ArgumentParser, args: Optional[str] = None) -> 
     sheet_parser = deepcopy(parser)
     sentinel_parser = deepcopy(parser)
 
-    parse_input = None if args is None else args.split()
+    parse_input = None if args is None else _split_cli_args(args)
     cli_args, unknown_cli_args = cli_parser.parse_known_args(parse_input)
     if unknown_cli_args:
         cli_parser.error(f"unrecognized arguments: {' '.join(unknown_cli_args)}")
@@ -1033,7 +1082,7 @@ def parse_and_merge_args(parser: ArgumentParser, args: Optional[str] = None) -> 
     else:
         options = ""
 
-    sheet_args = sheet_parser.parse_known_args(options.split())[0].__dict__
+    sheet_args = sheet_parser.parse_known_args(_split_cli_args(options))[0].__dict__
     # sentinel_sheet_args = sentinel_parser.parse_args(options.split())
     # explicit_sheet_args = Namespace(
     #     **{key: val for key, val in sentinel_sheet_args.__dict__.items() if val is not SENTINEL}

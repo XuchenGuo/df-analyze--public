@@ -130,10 +130,9 @@ class VisionTestingDataset:
         pq = self.root / "all.parquet"
         # PyArrow engine needed to properly decode bytes column
         df = pd.read_parquet(pq, engine="pyarrow")
-        im = df["image"].apply(lambda b: Image.open(BytesIO(b)))  # type: ignore
-        if self.name == "Handwritten-Mathematical-Expression-Convert-LaTeX":
-            # TODO: these images have only two dimensions since BW, so expand
-            ...
+        im = df["image"].apply(
+            lambda b: Image.open(BytesIO(b)).convert("RGB")
+        )  # type: ignore
         self._df = pd.concat([df["label"], im], axis=1) if "label" in df.columns else im
         return self._df
 
@@ -280,6 +279,14 @@ class NLPTestingDataset:
             self.load()  # this will generate the .parquet file
         return NLPDataset(datapath=pq, name=self.name)
 
+    def has_source_data(self) -> bool:
+        for path in self.datafiles.values():
+            if not isinstance(path, Path):
+                continue
+            if path.is_file() or parquet_file(path).is_file():
+                return True
+        return False
+
     @staticmethod
     def get_all_cls() -> list[NLPTestingDataset]:
         datas = []
@@ -289,7 +296,8 @@ class NLPTestingDataset:
             data = NLPTestingDataset(
                 name=dsname, root=info["root"], datafiles=info, is_cls=True
             )
-            datas.append(data)
+            if data.has_source_data():
+                datas.append(data)
         return datas
 
     @staticmethod
@@ -301,7 +309,8 @@ class NLPTestingDataset:
             data = NLPTestingDataset(
                 name=dsname, root=info["root"], datafiles=info, is_cls=False
             )
-            datas.append(data)
+            if data.has_source_data():
+                datas.append(data)
         return datas
 
     @staticmethod
@@ -797,8 +806,9 @@ def cluster_nlp_sanity_check(n_samples: Optional[int] = None) -> None:
             print(df)
 
         except Exception as e:
-            print(e)
-            continue
+            raise RuntimeError(
+                f"Could not run NLP clustering check for {ds.name}: {e}"
+            ) from e
 
 
 def vision_padding_check() -> None:
@@ -815,7 +825,9 @@ def vision_padding_check() -> None:
             )
         except Exception as e:
             traceback.print_exc()
-            print(f"Got error: {e} for dataset: {ds.name}")
+            raise RuntimeError(
+                f"Could not check image padding for {ds.name}: {e}"
+            ) from e
 
 
 def cluster_vision_sanity_check(n_samples: Optional[int] = None) -> None:
@@ -858,7 +870,9 @@ def cluster_vision_sanity_check(n_samples: Optional[int] = None) -> None:
                         df = stacked.reset_index()
                     except Exception as e:
                         traceback.print_exc()
-                        raise RuntimeError(f"Some bullshit ^^^: {e} for data: {ds.name}")
+                        raise RuntimeError(
+                            f"Could not assemble similarities for {ds.name}: {e}"
+                        ) from e
 
                     df.columns = ["x1", "x2", "sim"]
                     within = df["sim"].mean()
@@ -881,8 +895,9 @@ def cluster_vision_sanity_check(n_samples: Optional[int] = None) -> None:
 
         except Exception as e:
             traceback.print_exc()
-            print(e)
-            continue
+            raise RuntimeError(
+                f"Could not run vision clustering check for {ds.name}: {e}"
+            ) from e
 
 
 def detect_sus_images(ds: VisionTestingDataset) -> None:

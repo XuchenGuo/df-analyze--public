@@ -18,12 +18,14 @@ from typing import (
     Any,
     Tuple,
 )
+from unittest.mock import patch
 
 import numpy as np
 from numpy import ndarray
 from pandas import DataFrame, Series
 
 from df_analyze.cli.cli import ProgramOptions
+from df_analyze.enumerables import DfAnalyzeClassifier, DfAnalyzeRegressor
 from df_analyze.hypertune import EvaluationResults
 from df_analyze.preprocessing.inspection.inspection import InspectionResults
 from df_analyze.saving import ProgramDirs, windows_io_path
@@ -61,6 +63,29 @@ def test_random_options(dataset: Tuple[str, TestDataset]) -> None:
     dsname, ds = dataset
     for _ in range(100):
         ProgramOptions.random(ds)
+
+
+def test_random_options_falls_back_when_only_tabpfn_was_drawn() -> None:
+    cls_ds = TestDataset.from_name("credit_approval")
+    reg_ds = TestDataset.from_name("abalone")
+
+    with (
+        patch.object(
+            DfAnalyzeClassifier,
+            "random_n",
+            return_value=(DfAnalyzeClassifier.TabPFN,),
+        ),
+        patch.object(
+            DfAnalyzeRegressor,
+            "random_n",
+            return_value=(DfAnalyzeRegressor.TabPFN,),
+        ),
+    ):
+        cls_options = ProgramOptions.random(cls_ds)
+        reg_options = ProgramOptions.random(reg_ds)
+
+    assert cls_options.classifiers == (DfAnalyzeClassifier.Dummy,)
+    assert reg_options.regressors == (DfAnalyzeRegressor.Dummy,)
 
 
 @fast_ds
