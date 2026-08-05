@@ -118,9 +118,9 @@ class AutoCudaRule:
         return int(getattr(workload, self.work_metric))
 
 
-# These conservative crossover points prevent small traditional-learner jobs from
-# paying CUDA initialization and transfer costs. Neural and embedding components
-# remain accelerator-preferred because their backend is intrinsically compute-heavy.
+# Keep small traditional-model jobs on CPU when CUDA startup and data transfer
+# are likely to cost more than the calculation. Neural and embedding jobs still
+# prefer an accelerator.
 AUTO_CUDA_RULES = {
     RuntimeComponent.KNN: AutoCudaRule("pairwise_elements", 20_000_000),
     RuntimeComponent.CatBoost: AutoCudaRule("matrix_elements", 1_000_000),
@@ -519,7 +519,7 @@ def cleanup_torch_accelerator(
 
 
 def release_accelerator_memory() -> None:
-    """Best-effort cleanup before retrying a failed CUDA task on CPU."""
+    """Release cached accelerator memory before a CPU retry."""
     gc.collect()
     try:
         import torch
@@ -643,7 +643,7 @@ def format_device_plan(
     if cuda_names:
         lines.append(
             f"  Auto: {', '.join(cuda_names)} "
-            "(CUDA when available and beneficial)"
+            "(device chosen per task and input size)"
         )
     if cpu_names:
         lines.append(f"  CPU:  {', '.join(cpu_names)}")

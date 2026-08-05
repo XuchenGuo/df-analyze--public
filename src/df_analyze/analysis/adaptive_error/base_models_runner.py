@@ -29,6 +29,7 @@ from df_analyze.analysis.adaptive_error.plots import (
 from df_analyze.analysis.adaptive_error.report import (
     _coverage_summary,
     _df_to_markdown,
+    _write_csv,
     _write_markdown,
     _write_not_available_csv,
     _write_not_available_md,
@@ -166,7 +167,7 @@ def _write_model_extras(
         )
     else:
         clinician_df = test_df[clinician_cols].copy()
-        clinician_df.to_csv(m_tables / "clinician_view.csv", index=False)
+        _write_csv(clinician_df, m_tables / "clinician_view.csv", index=False)
 
         global_error = (
             float(np.mean(incorrect_test)) if incorrect_test.size else float("nan")
@@ -201,7 +202,11 @@ def _write_model_extras(
         _write_not_available_csv(m_tables / "top20_highest_adaptive_error.csv", reason)
     else:
         topk = test_df.sort_values(by="aer", ascending=False).head(20)
-        topk.to_csv(m_tables / "top20_highest_adaptive_error.csv", index=False)
+        _write_csv(
+            topk,
+            m_tables / "top20_highest_adaptive_error.csv",
+            index=False,
+        )
 
     # coverage-accuracy curve on test
     y_true_arr = test_df["y_true"].to_numpy()
@@ -223,10 +228,14 @@ def _write_model_extras(
             reason="No test samples.",
         )
     else:
-        curve_test.to_csv(m_tables / "coverage_accuracy_curve.csv", index=False)
+        _write_csv(
+            curve_test,
+            m_tables / "coverage_accuracy_curve.csv",
+            index=False,
+        )
         plot_coverage_vs_accuracy(curve_test, m_plots / "coverage_vs_accuracy.png")
         summary = _coverage_summary(curve_test, targets=[1.0, 0.9, 0.8, 0.7])
-        summary.to_csv(m_tables / "coverage_summary.csv", index=False)
+        _write_csv(summary, m_tables / "coverage_summary.csv", index=False)
         md = [
             "# Coverage-accuracy operating points",
             "",
@@ -276,8 +285,8 @@ def run_base_model_analyses(
             saved = np.asarray(saved_preds).ravel()
             if saved.size == y_test_arr.size:
                 return float(np.mean(saved == y_test_arr.ravel()))
-        # The guarded holdout stage below owns any required refit/prediction.
-        # Avoid an unguarded duplicate GPU execution merely for this summary.
+        # The guarded holdout stage below handles refitting and prediction.
+        # Do not run the same GPU work again just to build this summary.
         return float("nan")
 
     best_result = top_results[0]

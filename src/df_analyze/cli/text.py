@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from df_analyze.enumerables import (
     ClsScore,
     DfAnalyzeClassifier,
@@ -28,7 +26,7 @@ specify manually are:
 """
 
 USAGE_EXAMPLES = """
-USAGE EXAMPLE (assumes you have run `poetry shell`):
+USAGE EXAMPLE (run from the repository root with the environment activated):
 
     python df-analyze.py \\
         --df weather_data.json \\
@@ -45,7 +43,7 @@ USAGE EXAMPLE (assumes you have run `poetry shell`):
         --norm robust \\
         --nan median \\
         --n-feat-filter 10 \\
-        --n-feat-wrappper 10 \\
+        --n-feat-wrapper 10 \\
         --test-val-size=0.25 \\
         --outdir='./results'
 
@@ -68,11 +66,11 @@ For more details, see the README at https://github.com/stfxecutables/df-analyze.
 """
 
 DF_FILETYPES = """
-Currently only tables saved as either `.parquet`, `.xlsx`, `.json` or `.csv` are
-supported, but a file exported by Pandas `DataFrame.to_*` method is preferred.
-SVMlight text input is also supported with `--input-format svmlight`; auto mode
-recognizes common sparse suffixes and files with nonstandard names by a bounded
-SVMlight content check, including gzip, bzip2, and xz compression.
+Tables may be saved as `.parquet`, `.xlsx`, `.json`, or `.csv`. Files exported
+with a Pandas `DataFrame.to_*` method are preferred. SVMlight text input is also
+supported. Auto mode recognizes common sparse-file suffixes. For other
+filenames, it reads a short prefix to detect SVMlight, including gzip, bzip2,
+and xz-compressed files.
 
 If your data is saved as a Pandas `DataFrame`, it must have shape
 `(n_samples, n_features)` or `(n_samples, n_features + 1)`. The name of the
@@ -104,7 +102,7 @@ The manner in which to use the specified test sets for validation. Available
 options are:
 
   lodo        Leave-One-Dataset-Out. Assuming --df-train=file0, and that
-              --df-test=file1,file2,...,fileN, then df-analyze runs N+1 full
+              --df-tests=file1,file2,...,fileN, then df-analyze runs N+1 full
               runs of the feature selection, tuning, and validation pipeline,
               for the sets:
 
@@ -112,8 +110,6 @@ options are:
               X_train_1={{file1}}, X_test_1=concat({{file0, file2, ..., fileN}})
                                          ...
               X_train_N={{fileN}}, X_test_N=concat({{file0, file2, ..., fileN-1}})
-
-              The current CLI option name for the test files is --df-tests.
 
               Note: In the case of a single test file, this is just 2-fold. For
               more than 2 test files, expect this option to potentially be very
@@ -159,9 +155,9 @@ classification.
 TARGETS_HELP_STR = """
 Comma-separated target columns for a multi-target run, for example
 `--targets outcome_a,outcome_b`. All targets in one run must use the same
-`--mode`: categorical targets with `classify`, or numeric targets with
-`regress`. Rows missing any target are removed. This option takes precedence
-over `--target`; single-target usage is unchanged.
+`--mode`: use `classify` for categorical targets or `regress` for numeric
+targets. Rows missing any target are removed. This option takes precedence over
+`--target`.
 
 """
 
@@ -230,18 +226,19 @@ If "classify", do classification. If "regress", do regression.
 """
 
 DEVICE_HELP = """
-GPU policy: auto (recommended), cpu, or cuda. CPU keeps all work on CPU. Auto uses
-CUDA only for supported tasks when available and beneficial, and retries a failed
-CUDA model or analysis configuration once on CPU. CUDA strictly requires CUDA for
-every selected CUDA-capable component; components without one continue normally
-on CPU.
-GANDALF may use MPS in auto mode on supported Apple systems.
+Choose how supported work uses a GPU. `auto` (recommended) uses CUDA for neural
+models and TabPFN when it is available, and applies workload thresholds to KNN,
+CatBoost, XGBoost, and pairwise error consistency. An `auto` task that
+encounters a CUDA runtime error is tried once more on the CPU. `cpu` disables
+GPU use. `cuda` requires CUDA for selected work that supports it; CUDA errors
+stop the run, and CPU-only work remains on the CPU. GANDALF may use MPS in
+`auto` mode on a supported Mac.
 """
 
 DEVICE_INSTALL_HELP = """
-Managed CUDA PyTorch setup policy: auto, ask, or never. The default is never.
-Managed setup is available from a source checkout with pyproject.toml and
-uv.lock.
+Choose whether df-analyze may create a separate CUDA-enabled PyTorch
+environment: `auto`, `ask`, or `never` (the default). Setup requires a source
+checkout containing pyproject.toml and uv.lock.
 """
 
 CLASSIFIER_CHOICES = DfAnalyzeClassifier.choices()
@@ -258,47 +255,36 @@ The list of classifiers to use when comparing classification performance.
 Can be a list of elements from: [{" ".join(sorted(CLASSIFIER_CHOICES))}].
 Defaults are: [{" ".join(CLASSIFIER_DEFAULTS)}].
 
-  knn         scikit-learn KNeighborsClassifier.
-
-  lgbm        LightGBM boosted decision tree classifier.
-
-  rf          LightGBM random forest classifier.
-
-  sgd         scikit-learn SGDClassifier.
-
-  mlp         Modern multi-layer perceptron implemented in skorch/PyTorch.
-
-  svm         scikit-learn support vector classifer.
-
-  gandalf     Gated Adaptive Network for Deep Automated Learning of
-              Features for Tabular Data: https://arxiv.org/abs/2207.08548
-
-  dummy       scikit-learn DummyClassifier.
-
-  knn         scikit-learn KNeighborsClassifier.
-
-  lgbm        LightGBM boosted decision tree classifier.
-
-  rf          LightGBM random forest classifier.
-
-  sgd         scikit-learn SGDClassifier.
-
-  mlp         Modern multi-layer perceptron implemented in skorch/PyTorch.
-
-  svm         scikit-learn support vector classifer.
-
-  gandalf     Gated Adaptive Network for Deep Automated Learning of
-              Features for Tabular Data: https://arxiv.org/abs/2207.08548
-
-  dummy       scikit-learn DummyClassifier.
-
   catboost    CatBoost classifier.
+
   xgb         XGBoost classifier.
+
   tabpfn      Versioned TabPFN foundation-model classifier.
+
   dtree       scikit-learn DecisionTreeClassifier.
+
   et          scikit-learn ExtraTreesClassifier.
+
+  knn         KNN classifier (scikit-learn on CPU or PyTorch on CUDA).
+
+  lgbm        LightGBM boosted decision tree classifier.
+
+  rf          LightGBM random forest classifier.
+
   lr          scikit-learn LogisticRegression.
-  kan         Official pykan Kolmogorov-Arnold Network.
+
+  sgd         scikit-learn SGDClassifier.
+
+  mlp         Modern multi-layer perceptron implemented in skorch/PyTorch.
+
+  kan         Kolmogorov-Arnold Network implemented with PyKAN/skorch.
+
+  svm         Registered for compatibility; currently disabled.
+
+  gandalf     Gated Adaptive Network for Deep Automated Learning of
+              Features for Tabular Data: https://arxiv.org/abs/2207.08548
+
+  dummy       scikit-learn DummyClassifier.
 
 """
 
@@ -307,56 +293,46 @@ The list of regressors to use when comparing regression model performance.
 Can be a list of elements from: [{" ".join(sorted(REGRESSOR_CHOICES))}].
 Defaults are: [{" ".join(REGRESSOR_DEFAULTS)}].
 
-  knn         scikit-learn KNeighborsRegressor.
-
-  lgbm        LightGBM boosted decision tree regressor.
-
-  rf          LightGBM random forest regressor.
-
-  sgd         scikit-learn SGDRegressor.
-
-  mlp         Modern multi-layer perceptron implemented in skorch/PyTorch.
-
-  svm         scikit-learn support vector regressor.
-
-  gandalf     Gated Adaptive Network for Deep Automated Learning of
-              Features for Tabular Data: https://arxiv.org/abs/2207.08548
-
-  dummy       scikit-learn DummyRegressor.
-
-  knn         scikit-learn KNeighborsRegressor.
-
-  lgbm        LightGBM boosted decision tree regressor.
-
-  rf          LightGBM random forest regressor.
-
-  sgd         scikit-learn SGDRegressor.
-
-  mlp         Modern multi-layer perceptron implemented in skorch/PyTorch.
-
-  svm         scikit-learn support vector regressor.
-
-  gandalf     Gated Adaptive Network for Deep Automated Learning of
-              Features for Tabular Data: https://arxiv.org/abs/2207.08548
-
-  dummy       scikit-learn DummyRegressor.
-
   catboost    CatBoost regressor.
-  xgb         XGBoost regressor.
-  tabpfn      Versioned TabPFN foundation-model regressor.
-  dtree       scikit-learn DecisionTreeRegressor.
-  et          scikit-learn ExtraTreesRegressor.
-  elastic     scikit-learn ElasticNet.
-  kan         Official pykan Kolmogorov-Arnold Network.
 
+  xgb         XGBoost regressor.
+
+  tabpfn      Versioned TabPFN foundation-model regressor.
+
+  dtree       scikit-learn DecisionTreeRegressor.
+
+  et          scikit-learn ExtraTreesRegressor.
+
+  knn         KNN regressor (scikit-learn on CPU or PyTorch on CUDA).
+
+  lgbm        LightGBM boosted decision tree regressor.
+
+  rf          LightGBM random forest regressor.
+
+  elastic     scikit-learn ElasticNet.
+
+  sgd         scikit-learn SGDRegressor.
+
+  mlp         Modern multi-layer perceptron implemented in skorch/PyTorch.
+
+  kan         Kolmogorov-Arnold Network implemented with PyKAN/skorch.
+
+  svm         Registered for compatibility; currently disabled.
+
+  gandalf     Gated Adaptive Network for Deep Automated Learning of
+              Features for Tabular Data: https://arxiv.org/abs/2207.08548
+
+  dummy       scikit-learn DummyRegressor.
 """
 
 TABPFN_VERSION_HELP = """
-TabPFN checkpoint version. The default is v3; v2.6 and v2.5 select the older
-supported checkpoints. This option is used only when `tabpfn` is selected.
-The first run requires accepting the corresponding Prior Labs license and
-setting TABPFN_TOKEN in the same terminal. Review the current checkpoint terms
-before commercial or production use.
+TabPFN checkpoint to use. The default is v3; v2.6 and v2.5 select older
+checkpoints. This option applies only when `tabpfn` is selected. Before the
+first run, accept the matching Prior Labs license and authenticate with the
+Prior Labs browser flow or TABPFN_TOKEN. If the installed package reports a
+gated Hugging Face repository, use `hf auth login` or HF_TOKEN after accepting
+that repository's terms. Check the current license before commercial or
+production use.
 """
 
 FEAT_SELECT_HELP = """
@@ -366,7 +342,7 @@ The feature selection method(s) to use. Available options are:
               target variables.
 
   embed       Select features using a model with implicit feature selection,
-              e.g. an L1-regularized model or decision tree. For avaialable
+              e.g. an L1-regularized model or decision tree. For available
               models, see `--embed-select`.
 
   wrap        Select features by recursive model evaluation, currently either
@@ -387,8 +363,8 @@ is to prevent double-dipping / circular analysis that can result in
 """
 
 FEAT_DOWNSAMPLE_HELP = """
-Reduce a very wide feature matrix before the usual df-analyze feature selection.
-`auto` chooses a scalable supervised method; `none` keeps the existing behavior.
+Reduce a wide feature matrix before the usual df-analyze feature selection.
+`auto` chooses a suitable method; `none` disables this step.
 `variance` uses raw sample variance; `normalized-variance` is scale invariant.
 The projection methods (`svd` and `sparse-rp`) create new component features.
 """
@@ -398,13 +374,13 @@ Maximum number or fraction of features retained by feature downsampling.
 """
 
 DOWNSAMPLE_SCREENING_HELP = """
-Fraction of each training fold used only to fit supervised downsampling. The
-remaining training rows are reserved for model tuning, preventing leakage.
+Fraction of each training fold used to rank features. The remaining training
+rows are used for model tuning, so the same rows are not used for both steps.
 """
 
 LARGE_FEATURE_MODE_HELP = """
-Downsample numeric columns before the normal preparation pipeline. Use this for
-tables too wide to materialize all prepared features safely.
+Downsample numeric columns before normal preprocessing. Use this for a table
+that fits in memory but is too wide for the normal preparation path.
 """
 
 EMBED_SELECT_MODEL_HELP = """
@@ -628,7 +604,7 @@ target is classification / categorical.
               https://scikit-learn.org/stable/modules/generated/
               sklearn.feature_selection.mutual_info_classif.html
 
-  H           Kruskal-Wallace H. Extension of Mann-Whitney U test to multiple
+  H           Kruskal-Wallis H. Extension of Mann-Whitney U test to multiple
               groups, i.e. tests whether one group has a significantly more
               extreme median than the rest.
 
@@ -665,7 +641,7 @@ target is regression / continuous.
               https://scikit-learn.org/stable/modules/generated/
               sklearn.feature_selection.mutual_info_regression.html
 
-  H           Kruskal-Wallace H. Extension of Mann-Whitney U test to multiple
+  H           Kruskal-Wallis H. Extension of Mann-Whitney U test to multiple
               groups, i.e. tests whether one group has a significantly more
               extreme median than the rest.
 
@@ -709,7 +685,7 @@ REDUNDANT_CORR_THRESHOLD = """
 During each iteration of redundant wrapper selection, while some features may
 have nearly identical scores to the best score, some of these features may
 nevertheless contain very different information. Feature selection is done on
-the one-hot encoded cateogoricals and normalized continuous features. This
+the one-hot encoded categoricals and normalized continuous features. This
 means correlation (e.g. Pearson) gives us a rough measure of association
 between all selectable features. A more "cautious" redundant approach will
 only lump in features as equivalent if they are also strongly correlated with
@@ -871,7 +847,7 @@ Available options:
 """
 
 # TEST_VAL_HELP = """
-# Specify which validation method to use for testing. Same behavour as for
+# Specify which validation method to use for testing. Same behavior as for
 # `--htune-val` argument (see above).
 
 # """
@@ -887,13 +863,14 @@ An integer specifies the number of samples to set aside for testing.
 """
 
 MT_AGG_STRATEGY_HELP_STR = """
-How to combine feature selection results from each target into a single final ranking.
+How to combine feature selection across targets. `borda` combines the
+per-target ranks; `freq` favors features selected for more targets.
 
 """
 
 MT_TOP_K_HELP_STR = """
 After combining results across targets, keep only the top K features.
-Leave unset to keep all selected features.
+Leave this unset to keep every feature selected for at least one target.
 
 """
 
@@ -905,11 +882,11 @@ final-test holdout to select a model.
 """
 
 EC_PROFILE_HELP = """
-Use settings from an EC reference experiment. `classification-paper` uses an
+Use the settings from an EC reference experiment. `classification-paper` uses an
 80/20 holdout, 5 folds, 10 repetitions, and fixed model seeds.
 `regression-paper` uses an 80/20 holdout, 5 folds, 50 repetitions, fixed model
-seeds, and the seven reference methods. Explicit CLI or spreadsheet values
-override the matching profile setting. Profiles do not reproduce the original
+seeds, and the seven reference methods. A CLI or spreadsheet value overrides
+the corresponding profile value. Profiles do not reproduce the original
 datasets, preprocessing, models, or result tables.
 
 """
@@ -926,9 +903,9 @@ Number of shuffled K-fold repetitions. Each configuration is fitted
 """
 
 EC_MODEL_SEED_MODE_HELP = """
-Choose whether the fitted-model seed changes across folds. `vary` (the default)
-measures changes from both training rows and model randomness. `fixed` reuses
-the base seed for every fit.
+Choose whether the model seed changes across folds. `vary` (the default)
+includes changes from both training rows and model randomness. `fixed` uses the
+same seed for every fit.
 
 """
 
@@ -943,10 +920,10 @@ formulas.
 """
 
 EC_HOLDOUT_ROLE_HELP = """
-Describe how the shared holdout is used. `test` (the default) calculates EC but
-disables model ranking and EC/performance correlations. `validation` enables
-those outputs for a separate validation or audit holdout. This option does not
-change the split.
+Tell df-analyze how the shared holdout is being used. `test` (the default)
+calculates EC but disables model ranking and EC/performance correlations.
+`validation` enables those outputs for a separate validation or audit set.
+This option labels the existing split; it does not create a new one.
 
 """
 
@@ -957,8 +934,8 @@ holdout positions and true target values.
 """
 
 EC_OUTPUT_DETAIL_HELP = """
-Choose how much EC output to keep. `summary` writes the main tables and audit
-files; `pairwise` adds model-pair tables and plots; `full` adds sample-level
+Choose how much EC output to keep. `summary` writes the main tables and run
+details; `pairwise` adds model-pair tables and plots; `full` adds sample-level
 diagnostics. --ec-save-predictions adds prediction and residual/error matrices
 at any level. The default is `full`.
 
@@ -995,38 +972,39 @@ adaptive-error/EC report. The default is 0.5; it is not a universal cutoff.
 """
 
 ADAPTIVE_ERROR_HELP = """
-Enable adaptive error analysis outputs.
+Estimate the chance that each holdout prediction is wrong from out-of-fold
+training confidence.
 
 """
 
 AER_OOF_FOLDS_HELP = """
-Number of out-of-fold splits used to fit adaptive error lookup tables.
+Number of training folds used to learn the confidence-to-error mapping.
 
 """
 
 AER_BINS_HELP = """
-Number of bins used in adaptive error analysis.
+Number of confidence bins used to learn the error mapping.
 
 """
 
 AER_TARGET_ERROR_HELP = """
-Target error level used by adaptive error risk-control summaries.
+Target error rate used when reporting risk-controlled coverage.
 
 """
 
 AER_ALPHA_HELP = """
-Significance level used for one sided Clopper-Pearson upper bounds in
-risk controlled threshold selection (after adjustment across scanned thresholds).
+Significance level for the one-sided Clopper-Pearson error bounds, after
+adjusting for the thresholds that were checked.
 
 """
 
 AER_MIN_BIN_COUNT_HELP = """
-Minimum count per bin for adaptive error analysis.
+Minimum number of training predictions in an adaptive-error bin.
 
 """
 
 AER_PRIOR_STRENGTH_HELP = """
-Strength of beta-prior shrinkage toward global error.
+How strongly small bins are pulled toward the overall error rate.
 
 """
 
@@ -1036,7 +1014,7 @@ Disable smoothing of adaptive error bin estimates.
 """
 
 AER_MONOTONIC_HELP = """
-Enforce monotonic expected error vs confidence mapping.
+Require estimated error to move monotonically with confidence.
 
 """
 
@@ -1046,58 +1024,58 @@ Use quantile-based confidence bins instead of fixed-width bins.
 """
 
 AER_CONFIDENCE_METRIC_HELP = """
-Confidence proxy for adaptive error mapping (or "auto").
+Confidence measure used for the error mapping. Use `auto` to compare the
+measures available for each model.
 
 """
 
 AER_NMIN_HELP = """
-Minimum accepted sample count in threshold selection. Candidate thresholds must
-satisfy n_A(t) >= nmin.
+Minimum number of accepted holdout rows required for a reported risk threshold.
 
 """
 
 AER_TOP_K_HELP = """
-If > 0, run adaptive error only on top-k tuned base models.
+Analyze only the top K tuned models. The default, 0, analyzes all usable models.
 
 """
 
 AER_ENSEMBLE_HELP = """
-Enable adaptive-error ensemble analysis.
+Compare supported combinations of the analyzed models.
 
 """
 
 AER_ENSEMBLE_STRATEGIES_HELP = """
-Optional subset of adaptive-error ensemble strategy names to run.
+Ensemble strategies to run. Leave unset to use every supported strategy.
 
 """
 
 AER_ENS_TOP_N_HELP = """
-Top-N models used by adaptive-error ensemble strategies.
+Number of leading models available to top-N ensemble strategies.
 
 """
 
 AER_ENS_BETA_HELP = """
-Beta weight for adaptive-error ensemble confidence weighting.
+Beta value used to weight model confidence in adaptive-error ensembles.
 
 """
 
 AER_ENS_TAU0_HELP = """
-Base confidence threshold used by adaptive-error ensembles.
+Base confidence threshold for adaptive-error ensembles.
 
 """
 
 AER_ENS_LAMBDA_HELP = """
-Regularization mixing factor used by adaptive-error ensembles.
+Mixing weight used by regularized adaptive-error ensembles.
 
 """
 
 AER_ENS_ALPHA_HELP = """
-Support exponent used in adaptive-error ensemble scoring.
+Exponent applied to model support in adaptive-error ensemble scores.
 
 """
 
 AER_ENS_TRIM_Q_HELP = """
-Trim quantile used to suppress low-confidence ensemble members.
+Confidence quantile below which ensemble members are omitted.
 
 """
 
@@ -1111,11 +1089,9 @@ Upper confidence cutoff for adaptive-error ensembles.
 
 """
 
-OUTDIR_HELP = f"""
-Specifies location of all results, as well as cache files for slow
-computations (e.g. stepwise feature selection). If unspecified, will attempt
-to default to a number of common locations ({Path.home().resolve()}, the
-current working directory {Path.cwd().resolve()}, or a temporary directory).
+OUTDIR_HELP = """
+Location for results and cached computations. If omitted, df-analyze tries the
+user directory, current directory, and finally a temporary directory.
 
 """
 
@@ -1123,7 +1099,7 @@ NO_PRED_HELP = """
 Do not compute univariate predictions, and thus do not filter features based
 on univariate predictive utility. Useful for datasets with over 1 million
 samples and a large (e.g. 30+) number of features, where even scikit-learn
-SGDClassifer and SGDRegressor are often too slow / expensive.
+SGDClassifier and SGDRegressor are often too slow / expensive.
 """
 
 VERBOSITY_HELP = """

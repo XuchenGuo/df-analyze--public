@@ -23,16 +23,20 @@ from df_analyze.analysis.adaptive_error.plots import (
 from df_analyze.analysis.adaptive_error.report import (
     _coverage_summary,
     _df_to_markdown,
+    _write_csv,
     _write_markdown,
     _write_not_available_csv,
     _write_not_available_json,
     _write_not_available_md,
     _write_not_available_parquet,
     _write_not_available_png,
+    _write_parquet,
+    _write_text,
 )
 from df_analyze.analysis.adaptive_error.risk_control_writer import (
     _write_ensemble_risk_control,
 )
+from df_analyze.saving import windows_io_path
 
 
 def _write_ensemble_not_available(
@@ -44,7 +48,7 @@ def _write_ensemble_not_available(
     meta_dir = strategy_dir / "metadata"
     reports_dir = strategy_dir / "reports"
     for d in (tables_dir, plots_dir, preds_dir, meta_dir, reports_dir):
-        d.mkdir(parents=True, exist_ok=True)
+        windows_io_path(d).mkdir(parents=True, exist_ok=True)
 
     _write_not_available_parquet(preds_dir / "cv_ensemble.parquet", reason)
     _write_not_available_parquet(preds_dir / "test_per_sample.parquet", reason)
@@ -155,7 +159,7 @@ def _write_ensemble_error_metrics(
         )
         ece_error_test = None
     else:
-        rel_df.to_csv(rel_csv_path, index=False)
+        _write_csv(rel_df, rel_csv_path, index=False)
         ece = expected_calibration_error(rel_df)
         ece_error_test = float(ece) if np.isfinite(ece) else None
 
@@ -167,7 +171,7 @@ def _write_ensemble_error_metrics(
         "brier_error_test": brier_error_test,
         "ece_error_test": ece_error_test,
     }
-    metrics_path.write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
+    _write_text(metrics_path, json.dumps(metrics_payload, indent=2))
 
     return global_error_test, brier_error_test, ece_error_test
 
@@ -178,7 +182,11 @@ def _write_ensemble_summary(
     summary_rows: list[dict[str, Any]],
 ) -> None:
     summary_df = pd.DataFrame(summary_rows)
-    summary_df.to_csv(ens_tables_dir / "ensemble_summary.csv", index=False)
+    _write_csv(
+        summary_df,
+        ens_tables_dir / "ensemble_summary.csv",
+        index=False,
+    )
     md = [
         "# Ensemble summary",
         "",
@@ -215,14 +223,19 @@ def _fit_ensemble_confidence_mapping(
     aer_conf_oof = aer_conf.get_expected_error(conf_oof)
     aer_conf_test = aer_conf.get_expected_error(conf_test)
 
-    (s_meta / "confidence_to_expected_error_lookup.json").write_text(
-        json.dumps(aer_conf.to_json_dict(), indent=2), encoding="utf-8"
+    _write_text(
+        s_meta / "confidence_to_expected_error_lookup.json",
+        json.dumps(aer_conf.to_json_dict(), indent=2),
     )
-    aer_conf.to_csv_dataframe().to_csv(
-        s_tables / "confidence_to_expected_error_lookup.csv", index=False
+    _write_csv(
+        aer_conf.to_csv_dataframe(),
+        s_tables / "confidence_to_expected_error_lookup.csv",
+        index=False,
     )
-    aer_conf.bin_stats_df(z=1.96).to_csv(
-        s_tables / "oof_confidence_error_bins.csv", index=False
+    _write_csv(
+        aer_conf.bin_stats_df(z=1.96),
+        s_tables / "oof_confidence_error_bins.csv",
+        index=False,
     )
 
     return aer_conf, aer_conf_oof, aer_conf_test
@@ -273,8 +286,16 @@ def _write_ensemble_per_sample_outputs(
         _write_not_available_parquet(s_preds / "cv_ensemble.parquet", reason)
         _write_not_available_parquet(s_preds / "oof_per_sample.parquet", reason)
     else:
-        oof_out.to_parquet(s_preds / "cv_ensemble.parquet", index=False)
-        oof_out.to_parquet(s_preds / "oof_per_sample.parquet", index=False)
+        _write_parquet(
+            oof_out,
+            s_preds / "cv_ensemble.parquet",
+            index=False,
+        )
+        _write_parquet(
+            oof_out,
+            s_preds / "oof_per_sample.parquet",
+            index=False,
+        )
 
     aer_risk_pct = np.round(p_err_test * 100.0, 1)
     aer_confidence_pct = np.round(aer_conf_test * 100.0, 1)
@@ -304,8 +325,12 @@ def _write_ensemble_per_sample_outputs(
         _write_not_available_parquet(s_preds / "test_per_sample.parquet", reason)
         _write_not_available_csv(s_preds / "test_per_sample.csv", reason)
     else:
-        test_out.to_parquet(s_preds / "test_per_sample.parquet", index=False)
-        test_out.to_csv(s_preds / "test_per_sample.csv", index=False)
+        _write_parquet(
+            test_out,
+            s_preds / "test_per_sample.parquet",
+            index=False,
+        )
+        _write_csv(test_out, s_preds / "test_per_sample.csv", index=False)
 
     top20_path = s_tables / "top20_highest_adaptive_error.csv"
     if no_preds:
@@ -314,10 +339,10 @@ def _write_ensemble_per_sample_outputs(
             reason="Per-sample outputs disabled by --no-preds.",
         )
     else:
-        (
-            test_out.sort_values("aer", ascending=False)
-            .head(20)
-            .to_csv(top20_path, index=False)
+        _write_csv(
+            test_out.sort_values("aer", ascending=False).head(20),
+            top20_path,
+            index=False,
         )
 
 
@@ -362,7 +387,11 @@ def _write_ensemble_confidence_bins(
             min_count=int(getattr(options, "aer_min_bin_count", 10)),
             z_score=1.96,
         )
-        test_bins_df.to_csv(s_tables / "test_confidence_error_bins.csv", index=False)
+        _write_csv(
+            test_bins_df,
+            s_tables / "test_confidence_error_bins.csv",
+            index=False,
+        )
         plot_confidence_vs_error(
             test_bins_df,
             s_plots / "confidence_vs_expected_error.png",
@@ -399,13 +428,21 @@ def _write_ensemble_coverage_curve(
         )
         return None
 
-    curve_test.to_csv(s_tables / "coverage_accuracy_curve.csv", index=False)
+    _write_csv(
+        curve_test,
+        s_tables / "coverage_accuracy_curve.csv",
+        index=False,
+    )
     plot_coverage_vs_accuracy(curve_test, s_plots / "coverage_vs_accuracy.png")
     summary_curve = _coverage_summary(
         curve_test,
         targets=[1.0, 0.9, 0.8, 0.7],
     )
-    summary_curve.to_csv(s_tables / "coverage_summary.csv", index=False)
+    _write_csv(
+        summary_curve,
+        s_tables / "coverage_summary.csv",
+        index=False,
+    )
     md = [
         "# Coverage-accuracy operating points",
         "",

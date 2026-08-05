@@ -200,11 +200,11 @@ INPUT_SNIFF_BYTES = 64 * 1024
 
 
 def looks_like_svmlight_path(path: Path) -> bool:
-    """Recognize SVMlight by a known suffix or a bounded text prefix.
+    """Recognize SVMlight from its suffix or the start of the file.
 
-    Content sniffing is deliberately limited to unknown suffixes. This lets
-    extensionless benchmark files such as ``log1p.E2006.train`` work in auto
-    mode without scanning a multi-gigabyte input merely to choose its loader.
+    Only files with an unknown suffix need a content check. Reading a short
+    prefix lets extensionless files such as ``log1p.E2006.train`` work in auto
+    mode without scanning the complete input.
     """
     name = path.name.lower()
     if any(
@@ -606,7 +606,7 @@ class ProgramOptions(Debug):
         self.aer_ens_tau_low: float = aer_ens_tau_low
         self.aer_ens_tau_high: float = aer_ens_tau_high
 
-        # Normalize model order so JSON round trips and hashes are stable.
+        # Sort model names so JSON output and hashes do not depend on input order.
         self.classifiers = tuple(sorted({*self.classifiers, DfAnalyzeClassifier.Dummy}))
         self.regressors = tuple(sorted({*self.regressors, DfAnalyzeRegressor.Dummy}))
 
@@ -848,7 +848,7 @@ class ProgramOptions(Debug):
                 "    Akiba et al. (2019)\n"
                 "    Optuna: A Next-generation Hyperparameter Optimization Framework \n"
                 "    https://arxiv.org/pdf/1907.10902.pdf\n"
-                "For deep learners, e.g. if using `mlp` as either a classifer\n"
+                "For deep learners, e.g. if using `mlp` as either a classifier\n"
                 "or regressor, experience suggests more like 100-200 trials (with\n"
                 "pruning) are needed when exploring new architectures. For the\n"
                 "current MLP architecture, probably 100 trials is sufficient.\n"
@@ -907,9 +907,8 @@ class ProgramOptions(Debug):
 
     def hash(self) -> str:
         hashable = {**self.__dict__}
-        # Resume and checkpoint cadence change execution mechanics, not the
-        # scientific result. Keep them out of the output-directory hash so a
-        # second invocation with --ec-resume reaches the first run's checkpoint.
+        # These options do not change the result. Excluding them from the hash
+        # lets --ec-resume find the original run directory.
         hashable["ec_resume"] = False
         hashable["ec_checkpoint_every"] = 5
         argv = list(hashable.get("cli_argv", []))
@@ -1173,11 +1172,13 @@ def _split_cli_args(args: str) -> list[str]:
     lexer.commenters = ""
     lexer.whitespace_split = True
     lexer.escape = ""
+    # These argument strings use double quotes for names containing spaces.
+    # Keep apostrophes in ordinary column names instead of treating them as quotes.
+    lexer.quotes = '"'
     tokens = list(lexer)
 
-    # Spreadsheet headers historically write selected columns as separately quoted
-    # values, while the public CLI documents comma-separated values. Normalize both
-    # forms to the single comma-separated token expected by ``column_parser``.
+    # Spreadsheet headers may quote column names separately, while the CLI uses
+    # one comma-separated value. Convert both forms for ``column_parser``.
     normalized: list[str] = []
     index = 0
     while index < len(tokens):
@@ -1475,8 +1476,8 @@ def make_parser() -> ArgumentParser:
         choices=("auto", "table", "svmlight"),
         default="auto",
         help=(
-            "Input format; auto recognizes common SVMlight suffixes and bounded "
-            "content signatures for files with nonstandard names."
+            "Input format. Auto recognizes common SVMlight suffixes and checks "
+            "the start of files with other names."
         ),
     )
     parser.add_argument(
@@ -1500,8 +1501,8 @@ def make_parser() -> ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "CSV, TSV, JSON, or Parquet map with feature_index and feature_name "
-            "columns and an optional protected column."
+            "CSV, TSV, JSON, or Parquet file with feature_index and feature_name "
+            "columns, plus an optional protected column."
         ),
     )
     parser.add_argument(
@@ -1517,8 +1518,8 @@ def make_parser() -> ArgumentParser:
         nargs="+",
         default=[],
         help=(
-            "Source feature names that must survive large-table or SVMlight "
-            "downsampling and count toward --n-feat-downsample."
+            "Source feature names that are always kept during large-table or "
+            "SVMlight downsampling. They count toward --n-feat-downsample."
         ),
     )
     # parser.add_argument(

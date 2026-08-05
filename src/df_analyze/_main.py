@@ -61,6 +61,7 @@ from df_analyze.selection.multitarget import (
     aggregate_filter_selected,
     aggregate_model_selected,
 )
+from df_analyze.saving import windows_io_path
 from df_analyze.splitting import (
     resolve_final_cv_folds,
     validate_multitarget_cv_support,
@@ -424,8 +425,8 @@ def _write_run_timing(
         payload["error_type"] = type(error).__name__
         payload["error_message"] = str(error)
     try:
-        outdir.mkdir(exist_ok=True, parents=True)
-        (outdir / "run_timing.json").write_text(
+        windows_io_path(outdir).mkdir(exist_ok=True, parents=True)
+        windows_io_path(outdir / "run_timing.json").write_text(
             json.dumps(payload, indent=2) + "\n", encoding="utf-8"
         )
     except Exception as exc:
@@ -516,12 +517,10 @@ def _run(options: ProgramOptions) -> None:
 
         df, renames = sanitize_names(df, target_spec)
         if merged_df is not None:
-            # We already check column names are identical across test dfs, so
-            # we do not need to use renaming info twice
+            # Test frames have identical columns, so sanitizing them produces
+            # the same mapping recorded from the training frame.
             merged_df = sanitize_names(merged_df, target_spec)[0]
         prog_dirs.save_renames(renames)
-        # Likewise, below variables are just list[str], and so we don't need to do
-        # anything for the merged_df
         categoricals = renames.rename_columns(categoricals)
         ordinals = renames.rename_columns(ordinals)
         drops = renames.rename_columns(drops)
@@ -557,9 +556,8 @@ def _run(options: ProgramOptions) -> None:
                     raise RuntimeError("Missing external train/test row indices.")
                 partitions = [ix_train, *ix_tests]
                 split_specs = []
-                # Preserve the public-branch LODO contract: each supplied
-                # partition is the training set once, and all other partitions
-                # are combined into its external validation set.
+                # For LODO, train on each supplied partition in turn and
+                # validate on all the others combined.
                 for train_idx, idx_train in enumerate(partitions):
                     test_parts = partitions[:train_idx] + partitions[train_idx + 1 :]
                     split_specs.append(
@@ -669,7 +667,6 @@ def _run(options: ProgramOptions) -> None:
             )
         if downsample_result is not None:
             prog_dirs.save_downsampling(downsample_result, fold_idx)
-            # describe prepared features
             # Describe prepared features after any requested downsampling.
             if fold_idx in (None, 0):
                 if isinstance(prep_train.y, DataFrame):
@@ -686,7 +683,6 @@ def _run(options: ProgramOptions) -> None:
                         desc_cont, desc_cat, desc_target
                     )
         elif not downsampling_requested and fold_idx in (None, 0):
-            # describe prepared features
             # Describe prepared features when no downsampling stage was requested.
             if isinstance(prep_train.y, DataFrame):
                 for target_name in prep_train.target_cols:
@@ -737,7 +733,6 @@ def _run(options: ProgramOptions) -> None:
                 prog_dirs.save_pred_report(predictions.to_markdown(), fold_idx)
 
             if FeatureSelection.Filter in options.feat_select:
-                # select features via filter methods first
                 assoc_filtered, pred_filtered = filter_select_features(
                     prep_selection, associations, predictions, options
                 )
@@ -1092,19 +1087,32 @@ def _all_predictive_models_failed(options: ProgramOptions) -> bool:
 
 
 def _all_predictive_models_failed_message(options: ProgramOptions) -> str:
-    failed_models = sorted(
-        {
-            str(failure.get("model", ""))
-            for failure in getattr(options, "_model_failures", [])
-            if str(failure.get("model", "")) != "dummy"
-        }
-    )
+    failures = [
+        failure
+        for failure in getattr(options, "_model_failures", [])
+        if str(failure.get("model", "")) != "dummy"
+    ]
+    failed_models = sorted({str(failure.get("model", "")) for failure in failures})
     names = ", ".join(failed_models) or "unknown"
-    return (
+    message = (
         f"All requested predictive models failed: {names}. "
-        "No requested predictive-model result was produced; inspect the model "
-        "failure details above or in run_timing.json."
+        "No requested predictive-model result was produced."
     )
+    details = []
+    seen = set()
+    for failure in failures:
+        model = str(failure.get("model", "unknown"))
+        selection = str(failure.get("selection", "")).strip()
+        reason = str(failure.get("reason", "unknown failure")).strip()
+        label = f"{model} / {selection}" if selection else model
+        detail = f"{label}: {reason}"
+        if detail not in seen:
+            details.append(detail)
+            seen.add(detail)
+    if details:
+        message += "\nModel failure details:\n- " + "\n- ".join(details)
+    message += "\nThe same details are recorded in run_timing.json."
+    return message
 
 
 def main() -> None:

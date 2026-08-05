@@ -258,7 +258,7 @@ def validate_multitarget_holdout_coverage(
     *,
     external: bool,
 ) -> None:
-    """Ensure performance reporting discloses targets absent from a holdout."""
+    """Report target levels that are absent from a holdout."""
 
     missing: list[str] = []
     for target in y_train.columns:
@@ -314,9 +314,9 @@ def validate_multitarget_model_cv_support(
 ) -> None:
     """Validate each selected model's declared K-fold tuning design.
 
-    Models that tune with a non-K-fold design declare ``tuning_cv_folds=None``
-    and are intentionally excluded. Identical fold designs are validated once,
-    with every affected model named in the error context.
+    Models that do not use K-fold tuning declare ``tuning_cv_folds=None`` and
+    are skipped here. Identical fold designs are checked once, with every
+    affected model named in the error context.
     """
     designs: dict[int, list[str]] = {}
     for model_cls in model_classes:
@@ -591,7 +591,7 @@ class OmniKFold:
         max_splits = min(self.n_splits, n_groups)
         candidates: list[tuple[AnyKFold, int]] = []
 
-        # Preserve stratification where possible, reducing only the fold count.
+        # Try fewer stratified folds before dropping stratification.
         if self.is_cls and not unstratified:
             for n_splits in range(min(self.n_splits - 1, max_splits), 1, -1):
                 candidates.append((StratifiedGroupKFold, n_splits))

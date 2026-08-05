@@ -51,6 +51,7 @@ requires-python = ">= 3.13.11"
 
 [project.scripts]
 "df-analyze" = "df_analyze:main"
+"df-embed" = "df_analyze.embed_entrypoint:main"
 
 # This is to silence SyntaxWarnings we don't care about or want users to see
 # see:

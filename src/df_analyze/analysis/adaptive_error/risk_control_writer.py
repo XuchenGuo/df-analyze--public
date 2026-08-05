@@ -14,6 +14,7 @@ from df_analyze.analysis.adaptive_error.aer import AdaptiveErrorCalculator
 from df_analyze.analysis.adaptive_error.base_models_compute import _crossfit_oof_risk
 from df_analyze.analysis.adaptive_error.report import (
     _write_markdown,
+    _write_text,
 )
 from df_analyze.analysis.adaptive_error.risk_control import (
     _crossfit_hens_error_probability,
@@ -104,7 +105,7 @@ def _write_risk_control_threshold(
             "oof_risk_reason": oof_risk_reason,
             "oof_risk_condition": oof_risk_condition,
         }
-        risk_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        _write_text(risk_json, json.dumps(payload, indent=2))
 
         md = [
             "# Risk-controlled threshold (t*)",
@@ -156,7 +157,7 @@ def _write_risk_control_threshold(
             }
         )
 
-        risk_json.write_text(json.dumps(best, indent=2), encoding="utf-8")
+        _write_text(risk_json, json.dumps(best, indent=2))
 
         t_star = float(best["t_star"])
         oof_coverage = float(best["oof_coverage"])
@@ -289,7 +290,7 @@ def _write_ensemble_risk_control(
             "oof_risk_reason": oof_risk_reason,
             "oof_risk_condition": oof_risk_condition,
         }
-        risk_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        _write_text(risk_json, json.dumps(payload, indent=2))
 
         md = [
             "# Risk-controlled threshold (t*)",
@@ -342,7 +343,7 @@ def _write_ensemble_risk_control(
             }
         )
 
-        risk_json.write_text(json.dumps(best, indent=2), encoding="utf-8")
+        _write_text(risk_json, json.dumps(best, indent=2))
 
         t_star = float(best["t_star"])
         oof_coverage = float(best["oof_coverage"])

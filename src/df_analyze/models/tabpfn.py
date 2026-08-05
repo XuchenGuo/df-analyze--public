@@ -60,9 +60,8 @@ if _TABPFN_IMPORT_ERROR is not None:
 TABPFN_MAX_FEATURES_PER_ESTIMATOR = 200
 TABPFN_DEFAULT_N_ESTIMATORS = 8
 TABPFN_HIGH_DIM_N_ESTIMATORS = 16
-# The TabPFN-3 model card uses this as the feature-count boundary beyond which
-# predictive performance is not guaranteed. The current TabPFN 8.x package also
-# documents the wider row/feature regimes below.
+# The model card warns that performance is not guaranteed past this feature
+# count, although TabPFN also documents the wider input shapes below.
 TABPFN_V3_MODEL_CARD_MAX_FEATURES = 2_000
 TABPFN_V3_SUPPORTED_SHAPES = (
     (1_000_000, 200),
@@ -97,11 +96,15 @@ class TabPFNSetupError(RuntimeError):
 
 def _setup_message(model_name: str, error: BaseException) -> str:
     return (
-        f"Could not load {model_name}. On first use, sign in at "
-        "https://ux.priorlabs.ai/account, accept the selected model license, "
-        "and set TABPFN_TOKEN in the same terminal before running df-analyze. "
-        "Review the current checkpoint terms before commercial or production use: "
-        "https://huggingface.co/Prior-Labs/tabpfn_3. "
+        f"Could not load {model_name}. Accept the selected checkpoint license and "
+        "authenticate with the Prior Labs browser flow or TABPFN_TOKEN. If the "
+        "original error reports a gated Hugging Face repository, accept that "
+        "repository's terms and use `hf auth login` or a read-only HF_TOKEN. "
+        "For offline use, populate TABPFN_MODEL_CACHE_DIR with the required "
+        "weights. Setup guide: "
+        "https://docs.priorlabs.ai/how-to-access-gated-models. Never commit "
+        "authentication tokens. Review the selected checkpoint's current terms "
+        "before commercial or production use. "
         f"Original error: {type(error).__name__}: {error}"
     )
 
@@ -217,10 +220,8 @@ class TabPFNEstimator(DfAnalyzeModel):
                 "payload": b64encode(payload).decode("ascii"),
             }
 
-        # Test doubles and compatible third-party wrappers may not expose the
-        # official fitted-state API. Keep a conventional pickle fallback for
-        # those small objects; official TabPFN estimators always use the format
-        # above so their foundation weights are not duplicated in result JSON.
+        # Small test or third-party estimators may lack TabPFN's fitted-state
+        # API. Pickle those objects; official estimators use the format above.
         payload = pickle.dumps(model, protocol=pickle.HIGHEST_PROTOCOL)
         return {
             "format": "pickle",
@@ -282,8 +283,7 @@ class TabPFNEstimator(DfAnalyzeModel):
         model_state = state.pop("_serialized_model", None)
         tuned_model_state = state.pop("_serialized_tuned_model", None)
         self.__dict__.update(state)
-        # Loading results must not require the CUDA policy used for training.
-        # Restore on CPU and let callers select a new runtime for future work.
+        # Load saved models on CPU; callers can choose another device later.
         self.runtime = get_runtime("cpu")
         self._configure_runtime()
         self.model = self._restore_models(model_state)
@@ -393,8 +393,8 @@ class TabPFNEstimator(DfAnalyzeModel):
                 f"{self.longname} received {n_features:,} features. This is within "
                 "a wider TabPFN 8.x row/feature regime enforced by df-analyze, "
                 f"but exceeds the TabPFN-3 model card's {TABPFN_V3_MODEL_CARD_MAX_FEATURES:,}-"
-                "feature performance-guarantee boundary. Treat this wide-feature "
-                "regime as experimental and validate it against non-TabPFN baselines.",
+                "feature guidance. Treat this wider regime as experimental and "
+                "validate it against non-TabPFN baselines.",
                 stacklevel=2,
             )
         if self.is_classifier:
@@ -419,10 +419,8 @@ class TabPFNEstimator(DfAnalyzeModel):
         self, X: DataFrame, y: Union[Series, DataFrame], config: Any
     ) -> None:
         limits = {"samples": self._config_limit(config, "MAX_NUMBER_OF_SAMPLES")}
-        # TabPFN v3 supports high-dimensional input through feature subsampling
-        # across estimators. MAX_NUMBER_OF_FEATURES describes an individual
-        # checkpoint/estimator and must not replace the wrapper-level joint
-        # sample-feature envelope checked by ``_validate_limits``.
+        # In v3, MAX_NUMBER_OF_FEATURES applies to one estimator. The wrapper's
+        # full row/feature limits are checked in ``_validate_limits``.
         if self.version != "v3":
             limits["features"] = self._config_limit(
                 config, "MAX_NUMBER_OF_FEATURES"
@@ -473,7 +471,8 @@ class TabPFNEstimator(DfAnalyzeModel):
                 )
             if len(X) > 200:
                 warn(
-                    f"{self.longname} is running on CPU with {len(X)} rows and may be slow."
+                    f"{self.longname} is running on CPU with {len(X)} rows. "
+                    "This workload is a candidate for CUDA acceleration."
                 )
 
         config = self._preflight_config
@@ -484,6 +483,12 @@ class TabPFNEstimator(DfAnalyzeModel):
                 model = self._create_estimator(args, X)
                 get_config = getattr(model, "get_inference_config", None)
                 config = get_config() if callable(get_config) else None
+            except SystemExit as exc:
+                # Some authentication/checkpoint-loading paths in the upstream
+                # package terminate the interpreter instead of raising a normal
+                # exception. A library model must not be allowed to kill the
+                # df-analyze CLI before it can record an actionable failure.
+                raise TabPFNSetupError(_setup_message(self.longname, exc)) from exc
             except Exception as exc:
                 raise TabPFNSetupError(_setup_message(self.longname, exc)) from exc
             finally:
@@ -522,8 +527,11 @@ class TabPFNEstimator(DfAnalyzeModel):
         return sorted(set([low, high]))
 
     def _fit_one(self, X: DataFrame, y: Series, args: Mapping[str, Any]) -> Any:
-        model = self._create_estimator(args, X)
-        model.fit(X, y)
+        try:
+            model = self._create_estimator(args, X)
+            model.fit(X, y)
+        except SystemExit as exc:
+            raise TabPFNSetupError(_setup_message(self.longname, exc)) from exc
         return model
 
     def _fit_models(

@@ -174,9 +174,8 @@ def robust_auroc_score(
         )
         return 0.5
 
-    # AUROC values below chance are meaningful: they indicate that the model's
-    # ranking is systematically reversed. Reflecting them around 0.5 turns a
-    # completely wrong ranking (AUROC=0) into an apparently perfect one.
+    # Keep AUROC values below 0.5: they show a reversed ranking. Reflecting them
+    # around 0.5 would make AUROC=0 look perfect.
     return raw
 
 

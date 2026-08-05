@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from pathlib import Path
 from typing import Iterable
@@ -26,6 +25,7 @@ from df_analyze.analysis.error_consistency.diagnostics import (
     compute_model_ec_ranking,
     compute_target_ec_trend,
 )
+from df_analyze.saving import windows_io_path
 
 matplotlib.use("Agg")
 from matplotlib import pyplot as plt  # noqa: E402
@@ -37,14 +37,11 @@ def _safe_plot_name(value: object) -> str:
 
 def _io_path(path: Path) -> Path:
     """Return a Windows long-path-safe absolute path for file I/O."""
-    resolved = path.resolve()
-    if os.name == "nt":
-        return Path(f"\\\\?\\{resolved}")
-    return resolved
+    return windows_io_path(path.resolve())
 
 
 def _write_frame(frame: DataFrame, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _io_path(path.parent).mkdir(parents=True, exist_ok=True)
     frame.to_csv(_io_path(path), index=False, chunksize=50_000)
 
 
@@ -52,7 +49,7 @@ def _write_detail_plots(detail_dir: Path, pairwise: DataFrame) -> None:
     if pairwise.empty or "pair_mean" not in pairwise:
         return
     plots = detail_dir / "plots"
-    plots.mkdir(parents=True, exist_ok=True)
+    _io_path(plots).mkdir(parents=True, exist_ok=True)
     methods = pairwise.get("ec_method", pd.Series("ec", index=pairwise.index))
     for method in methods.dropna().unique():
         values = pairwise.loc[methods == method, "pair_mean"].dropna()
@@ -86,7 +83,7 @@ def write_model_outputs(
     metadata: dict | None = None,
 ) -> None:
     detail = str(output_detail).lower()
-    detail_dir.mkdir(parents=True, exist_ok=True)
+    _io_path(detail_dir).mkdir(parents=True, exist_ok=True)
     _write_frame(trial_design, detail_dir / "trial_design.csv")
     _write_frame(fold_assignments, detail_dir / "fold_assignments.csv")
     _write_frame(trial_scores, detail_dir / "trial_scores.csv")
@@ -182,7 +179,7 @@ def _write_root_plots(
     if summary.empty:
         return
     plots = root / "plots"
-    plots.mkdir(parents=True, exist_ok=True)
+    _io_path(plots).mkdir(parents=True, exist_ok=True)
 
     for method, group in summary.groupby("ec_method", dropna=False):
         values = group["ec_mean"].dropna()
@@ -245,7 +242,7 @@ def _write_root_plots(
 
 
 def write_root_outputs(root: Path, result: ErrorConsistencyResult) -> None:
-    root.mkdir(parents=True, exist_ok=True)
+    _io_path(root).mkdir(parents=True, exist_ok=True)
     holdout_role = str(result.metadata.get("holdout_role", "validation")).lower()
     selection_outputs_enabled = holdout_role == "validation"
     if selection_outputs_enabled:

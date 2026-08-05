@@ -39,8 +39,11 @@ from df_analyze.analysis.adaptive_error.proba import normalize_proba
 from df_analyze.analysis.adaptive_error.report import (
     _coverage_summary_by_accuracy,
     _coverage_summary_with_auc,
+    _write_csv,
+    _write_text,
 )
 from df_analyze.analysis.adaptive_error.risk_control import _fit_hens_calibrator
+from df_analyze.saving import windows_io_path
 
 
 def _align_to_reference(
@@ -72,19 +75,19 @@ def _init_ensemble_dirs(
     options,
 ) -> tuple[Path, Path, Path, Path, dict[str, str], dict[str, Path]]:
     ensemble_dir = base_dir / "ensemble"
-    ensemble_dir.mkdir(parents=True, exist_ok=True)
+    windows_io_path(ensemble_dir).mkdir(parents=True, exist_ok=True)
     ens_plots_dir = ensemble_dir / "plots"
     ens_tables_dir = ensemble_dir / "tables"
     ens_reports_dir = ensemble_dir / "reports"
     for _d in (ens_plots_dir, ens_tables_dir, ens_reports_dir):
-        _d.mkdir(parents=True, exist_ok=True)
+        windows_io_path(_d).mkdir(parents=True, exist_ok=True)
 
     # 10 adaptive-error ensemble strategies
     # when --aer-ensemble is enabled
     strategy_labels = _build_strategy_labels(options)
     strategy_dirs = {key: ensemble_dir / label for key, label in strategy_labels.items()}
     for sdir in strategy_dirs.values():
-        sdir.mkdir(parents=True, exist_ok=True)
+        windows_io_path(sdir).mkdir(parents=True, exist_ok=True)
 
     return (
         ensemble_dir,
@@ -182,7 +185,7 @@ def _prepare_strategy_dirs(sdir: Path) -> _StrategyDirs:
     s_meta = sdir / "metadata"
     s_reports = sdir / "reports"
     for d in (s_plots, s_tables, s_preds, s_meta, s_reports):
-        d.mkdir(parents=True, exist_ok=True)
+        windows_io_path(d).mkdir(parents=True, exist_ok=True)
     return _StrategyDirs(
         plots=s_plots,
         tables=s_tables,
@@ -324,11 +327,13 @@ def _run_strategy_analysis(
         r_star_oof, incorrect_oof, r_star_test
     )
 
-    (s_dirs.meta / "hens_calibrator.json").write_text(
-        json.dumps(hens_payload, indent=2), encoding="utf-8"
+    _write_text(
+        s_dirs.meta / "hens_calibrator.json",
+        json.dumps(hens_payload, indent=2),
     )
 
-    (s_dirs.meta / "strategy.json").write_text(
+    _write_text(
+        s_dirs.meta / "strategy.json",
         json.dumps(
             {
                 "strategy_key": strategy_key,
@@ -337,7 +342,6 @@ def _run_strategy_analysis(
             },
             indent=2,
         ),
-        encoding="utf-8",
     )
 
     aer_conf, aer_conf_oof, aer_conf_test = _fit_ensemble_confidence_mapping(
@@ -573,15 +577,18 @@ def run_ensemble_analysis(
 
     if overlay_summary_rows:
         overlay_summary = pd.concat(overlay_summary_rows, ignore_index=True)
-        overlay_summary.to_csv(
-            tables_dir / "coverage_accuracy_overlay_summary.csv", index=False
+        _write_csv(
+            overlay_summary,
+            tables_dir / "coverage_accuracy_overlay_summary.csv",
+            index=False,
         )
 
     if overlay_summary_rows_by_acc:
         overlay_acc_summary = pd.concat(
             overlay_summary_rows_by_acc, ignore_index=True
         )
-        overlay_acc_summary.to_csv(
+        _write_csv(
+            overlay_acc_summary,
             tables_dir / "coverage_accuracy_overlay_by_accuracy_summary.csv",
             index=False,
         )

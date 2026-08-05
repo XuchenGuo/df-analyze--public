@@ -59,10 +59,9 @@
       - [`📂 wrapper`](#-wrapper)
     - [`📂 tuning`](#-tuning)
     - [`📂 results`](#-results)
-  - [Complete Listing](#complete-listing)
+- [Complete Listing](#complete-listing)
 - [Limitations](#limitations)
-  - [One Target Variable per Invocation / Run](#one-target-variable-per-invocation--run)
-    - [Multi-Target Extension](#multi-target-extension)
+  - [Target Variables](#target-variables)
   - [Dataset Size](#dataset-size)
   - [Inappropriate Data](#inappropriate-data)
   - [Inappropriate Tasks](#inappropriate-tasks)
@@ -78,10 +77,9 @@
 
 `df-analyze` is a command-line tool for performing
 [AutoML](https://en.wikipedia.org/w/index.php?title=Automated_machine_learning&oldid=1193286380)
-on small to medium-sized tabular datasets. The ordinary dense pipeline is
-generally intended for datasets with fewer than about 200 000 samples and 200
-features; separate downsampling paths are available for much wider numeric
-data. `df-analyze` attempts to automate:
+on small to medium-sized tabular datasets. Separate downsampling paths are
+available for much wider numeric data, including sparse SVMlight input.
+`df-analyze` attempts to automate:
 
 - feature type inference
 - feature description (e.g. univariate associations and stats)
@@ -283,7 +281,7 @@ HPC systems / clusters like Compute Canada / DRAC).
 Native Windows support is still experimental. The automated tests cover the
 Windows installation helpers and long output paths, but not every optional
 model and GPU configuration. The Windows Subsystem for Linux (WSL) generally
-works well, and the [local install scripts](#local-install-by-shell-script)
+works well, and the [local install scripts](#legacy-local-install-by-shell-script)
 should work there.
 
 If for some reason you can't use the WSL, then there are experimental manual
@@ -316,39 +314,39 @@ be out of date.
 For documentation of the embedding functionality, run:
 
 ```shell
+df-embed --help
+```
+
+The equivalent command from a source checkout is:
+
+```shell
 python df-embed.py --help
 ```
 
 
 ## CPU and CUDA Devices
 
-Both `df-analyze` and `df-embed` accept `--device auto`, `--device cpu`, or
-`--device cuda`. Treat this option as a GPU-use policy for the mixed pipeline,
-not as a requirement that every step use one device:
+Both `df-analyze` and `df-embed` accept `--device auto`, `--device cpu`, and
+`--device cuda`. This option controls the parts of the run that support a GPU;
+preprocessing and CPU-only models still run on the CPU.
 
-- `auto` (recommended) uses CUDA for supported tasks when it is available and
-  worthwhile. If one CUDA model or analysis configuration fails, only that
-  complete configuration is retried once on CPU.
-- `cpu` disables all GPU probing and GPU execution.
-- `cuda` strictly requires CUDA for every selected model that has a supported
-  CUDA backend. Models with no CUDA implementation still run normally on CPU.
-  If a required backend is unavailable, the run stops with a clear error.
+- `auto` is the recommended default. KNN, CatBoost, and XGBoost use workload
+  thresholds; neural models, TabPFN, and embeddings use CUDA when it is
+  available. If an `auto` task encounters a CUDA runtime error, the complete
+  affected task is tried once more on the CPU.
+- `cpu` runs everything on the CPU and does not check for a GPU.
+- `cuda` requires CUDA for selected models that support it. A missing backend
+  or CUDA runtime failure stops the run instead of falling back. CPU-only
+  models and preprocessing still run on the CPU. The command also stops if
+  none of the selected work has a supported CUDA backend.
 
-The current `auto` route uses each model's actual post-selection input size and
-keeps small KNN, CatBoost, and XGBoost jobs on CPU,
-where GPU startup and data transfer can cost more than they save. Larger jobs
-and compute-heavy PyTorch models use an available accelerator. GANDALF may also
-use MPS in `auto` mode on a supported Apple system.
-
-CUDA execution is available for CatBoost, XGBoost, KNN, MLP, KAN, GANDALF,
-TabPFN, image or text embedding, and sufficiently large error-consistency
-pairwise calculations. Other estimators, preprocessing, and other feature
-analyses continue to use CPU implementations. GPU-backed tuning is serialized
-so that concurrent trials do not compete for the same device. Completed
-accelerator models are snapshotted for normal result reloading and then removed
-from live accelerator memory before the next configuration is retained.
-GPU availability does not guarantee a faster run, so `auto` is the recommended
-default.
+CatBoost, XGBoost, KNN, MLP, KAN, GANDALF, TabPFN, image and text embedding,
+and error-consistency calculations can use CUDA. Neural models and embedding,
+together with larger CatBoost, XGBoost, KNN, or error-consistency workloads,
+are the most likely to show a noticeable improvement. Small jobs may see little
+improvement because device setup and data transfer still take time, and
+CPU-only stages can remain a substantial part of the run. On a supported Mac,
+GANDALF may use MPS in `auto` mode.
 
 For example:
 
@@ -369,8 +367,8 @@ uv run python df-embed.py \
     --out embeddings.parquet
 ```
 
-If the current PyTorch installation cannot use an NVIDIA GPU, a source checkout
-can create a separate managed CUDA environment on demand:
+If the installed copy of PyTorch cannot use an NVIDIA GPU, `df-analyze` and
+`df-embed` can create a separate CUDA environment for the run:
 
 ```shell
 uv run python df-analyze.py \
@@ -384,25 +382,18 @@ uv run python df-analyze.py \
     --outdir ./managed_cuda_results
 ```
 
-The environment is stored under `.df-analyze-runtime` and is rebuilt when
-`pyproject.toml` or `uv.lock` changes. Use `--device-install ask` for an
-interactive prompt, or leave the default `never` to keep the current
-environment unchanged. CatBoost and XGBoost do not require this managed
-PyTorch environment. In `auto`, size-dependent KNN and error-consistency work
-does not trigger managed-environment setup before the real workload is known.
-When an NVIDIA GPU is visible but the selected accelerator-preferred models
-would use a CPU-only PyTorch installation, `auto` prints a concise CPU fallback
-notice with the `--device-install auto` remedy.
-If an isolated managed CUDA environment already exists, it is reused
-automatically without reinstalling, including for `auto` KNN and
-error-consistency work. Strict `--device cuda` still validates or prepares
-those PyTorch paths before running.
+The default, `--device-install never`, leaves the current Python environment
+unchanged. Use `ask` to confirm setup interactively or `auto` to allow it
+without a prompt. This requires a source checkout containing `pyproject.toml`
+and `uv.lock`. The managed environment is stored in `.df-analyze-runtime` and
+is reused until either of those files changes. It supplies CUDA-enabled
+PyTorch; CatBoost and XGBoost use their own CUDA backends, so selecting only
+those models does not trigger this setup.
 
 ### Verifying CUDA and GPU Visibility
 
-The device router can only use hardware that the relevant backend can see.
-These read-only checks help distinguish an unavailable NVIDIA driver from a
-PyTorch- or CatBoost-specific installation problem:
+Run these checks in the same terminal and environment that will run
+`df-analyze`:
 
 | Check | Command | Expected result |
 |---|---|---|
@@ -410,14 +401,12 @@ PyTorch- or CatBoost-specific installation problem:
 | PyTorch CUDA visibility | `python -c "import torch; print(torch.cuda.is_available()); print(torch.version.cuda)"` | `True` when the installed PyTorch build can use CUDA; the second value is that build's CUDA runtime |
 | CatBoost GPU visibility | `python -c "from catboost.utils import get_gpu_device_count; print(get_gpu_device_count())"` | A positive number when CatBoost sees one or more GPUs |
 
-For compatibility and installation details, use the
+If `nvidia-smi` works but the PyTorch check prints `False`, the installed
+PyTorch build may not support the available driver or CUDA runtime. For
+installation and compatibility details, use the
 [NVIDIA CUDA compatibility documentation](https://docs.nvidia.com/deploy/cuda-compatibility/),
 the [PyTorch CUDA availability reference](https://docs.pytorch.org/docs/stable/generated/torch.cuda.is_available.html),
 and the [official PyTorch installation selector](https://pytorch.org/get-started/locally/).
-If the NVIDIA driver is too old for the CUDA family used by the installed
-PyTorch build, CUDA may not initialize even though an NVIDIA GPU is present.
-Run the checks in the same environment and terminal that will launch
-`df-analyze`.
 
 
 ## Quick Start and Examples
@@ -458,16 +447,21 @@ can be evaluated when their dependencies and, where needed, model weights are
 available.
 
 TabPFN defaults to the v3 checkpoint. Use `--tabpfn-version v2.6` or
-`--tabpfn-version v2.5` to select an older supported checkpoint. The first run
-requires accepting the corresponding Prior Labs license and setting
-`TABPFN_TOKEN` in the same terminal. `df-analyze` also checks that the model
-cache is writable before TabPFN attempts a download.
+`--tabpfn-version v2.5` to select an older supported checkpoint. Before the
+first download, accept the license for the selected checkpoint. The recommended
+setup is the Prior Labs browser flow or a `TABPFN_TOKEN` from the Prior Labs
+account page. Some `tabpfn` versions may instead report that a checkpoint is in
+a gated Hugging Face repository. In that case, accept the terms for the named
+repository and authenticate with `hf auth login` or a read-only `HF_TOKEN`.
+Do not commit either token. For an offline machine, download the weights
+separately and point `TABPFN_MODEL_CACHE_DIR` at that directory. See
+[Prior Labs' model-access instructions](https://docs.priorlabs.ai/how-to-access-gated-models).
+`df-analyze` checks that the selected cache is writable before a download.
 
-The TabPFN-3 model-weight license currently permits research and limited
-internal evaluation while restricting commercial and production use without
-the appropriate commercial license. Review the current
+Checkpoint licenses can differ and may change. Review the current license for
+the selected version before commercial or production use; the
 [TabPFN-3 model card and license](https://huggingface.co/Prior-Labs/tabpfn_3)
-before using the checkpoint or its outputs outside evaluation.
+is the relevant page for the default v3 checkpoint.
 
 TabPFN receives a separate raw-valued table with its categorical columns
 identified, instead of the one-hot encoded matrix used by most other models.
@@ -483,24 +477,25 @@ warning.
 Passing these shape checks is not a memory or accuracy guarantee; compare
 wide-input results against non-TabPFN baselines. See the current
 [Prior Labs model limits](https://docs.priorlabs.ai/models) before interpreting
-or publishing results. CPU runs are intended for small datasets; use CUDA for
-larger TabPFN analyses.
+or publishing results. By default, `df-analyze` refuses to run TabPFN on the CPU
+with more than 1 000 rows. Use CUDA or set
+`TABPFN_ALLOW_CPU_LARGE_DATASET=1` to allow a larger CPU run explicitly.
 
 ### Additional Model Backends
 
-The registered model lists above include the following additional classifier
-and regressor backends:
+The following tokens add model backends beyond the original defaults:
 
-- `catboost`: CatBoost gradient-boosted trees, with CPU/CUDA routing
-- `xgb`: XGBoost gradient-boosted trees, with CPU/CUDA routing
-- `tabpfn`: the versioned TabPFN foundation model described above
-- `dtree`: a scikit-learn decision tree
-- `et`: a scikit-learn extremely randomized trees ensemble
-- `kan`: the official PyKAN Kolmogorov-Arnold Network implementation
+| Token | Model |
+|---|---|
+| `catboost` | CatBoost gradient-boosted trees |
+| `xgb` | XGBoost gradient-boosted trees |
+| `tabpfn` | The selected TabPFN checkpoint |
+| `dtree` | A scikit-learn decision tree |
+| `et` | Scikit-learn extremely randomized trees |
+| `kan` | A Kolmogorov-Arnold Network using PyKAN |
 
-Pass the tokens after `--classifiers` or `--regressors`; they participate in
-the same feature-set comparison, hyperparameter tuning, and final validation
-as the existing models. For example:
+Pass these names to `--classifiers` or `--regressors` just like the original
+model names:
 
 ```shell
 python df-analyze.py \
@@ -513,20 +508,15 @@ python df-analyze.py \
     --outdir ./additional_model_results
 ```
 
-These backends are alternatives to compare, not a claim that one will be best
-for every dataset. CatBoost, XGBoost, and KAN use CUDA only when the selected
-device route and installed backend permit it; CPU execution remains supported.
-TabPFN has the license, token, checkpoint download, and writable-cache
-requirements noted above. Multi-target estimators use a native multi-output
-path where one is supported and otherwise use a per-target independent
-adapter; selecting one of these tokens does not by itself imply joint
-multi-target learning.
+They use the same feature-set comparison, tuning, and final validation as the
+other models. CatBoost, XGBoost, KAN, and TabPFN can use CUDA but do not require
+it. TabPFN has the license, token, and model-download requirements described
+above. No model is expected to be best for every dataset.
 
 ## Multi-Target Analysis
 
-For one target, keep using the original `--target outcome` interface. For
-several targets, the only required change is to use comma-separated names with
-`--targets`:
+Use `--target outcome` for the usual single-target analysis. For several
+targets, pass a comma-separated list to `--targets`:
 
 ```shell
 # Several categorical outcomes
@@ -536,30 +526,21 @@ python df-analyze.py --df data.csv --targets outcome_a,outcome_b --mode classify
 python df-analyze.py --df data.csv --targets score_a,score_b --mode regress
 ```
 
-No model or output options are required for a first run; the normal
-single-target defaults are reused. Put only one task type in each run: do not
-mix categorical and continuous targets. If target names contain spaces, quote
-the entire comma-separated value. `--targets` takes precedence if `--target`
-is also present.
+The usual model and output defaults still apply. Keep these rules in mind:
 
-Conceptually, multi-target analysis maps one feature matrix **X** to a target
-vector **y** = (y1, y2, ...). Continuous targets form a multi-output regression
-task; categorical targets form a multi-output classification task. This is
-useful for related outcomes such as several clinical endpoints or laboratory
-measurements recorded for the same subject. Some estimators learn the targets
-jointly, while the per-target adapter fits independent models; the selected
-backend determines which behavior is used.
+- All targets in one run must have the same task type. Do not mix categorical
+  and continuous targets.
+- Quote the whole comma-separated value if a target name contains spaces.
+- `--targets` takes precedence when both `--target` and `--targets` are given.
+- Rows missing any target are removed.
 
-Classification and regression are both supported. Rows missing any target are
-removed, and target cleaning is recorded in the preparation report. For
-classification, `df-analyze` checks that every target level has enough samples
-for the requested models and validation folds. If a safe split cannot be made,
-the run stops and reports the target and level that caused the problem. For
-regression, every target must vary in the outer training/holdout partitions and
-in every tuning and final-evaluation fold.
+`df-analyze` checks that every classification level has enough samples for the
+requested validation folds. Every regression target must vary in the training,
+holdout, and cross-validation partitions. If a valid split cannot be made, the
+error names the target that caused the problem.
 
-Feature selection runs once per target. The results are then combined using
-Borda ranking or selection frequency:
+Feature selection is run for each target, then the results are combined with
+Borda ranks or selection frequency:
 
 ```shell
 --mt-agg-strategy borda
@@ -567,42 +548,20 @@ Borda ranking or selection frequency:
 --mt-top-k 25
 ```
 
-When `--mt-top-k` is omitted, the union of the features actually selected for
-at least one target is retained. Borda scores are computed only over those
-selected features; features that merely received a candidate score are not
-silently reintroduced. Models that support multi-output targets use their
-native implementation; other estimators fit one model per target. Native
-multi-output regressors standardize every target using training-only
-statistics and convert predictions back to the supplied units, so changing one
-target's measurement unit does not change its implicit training weight.
-Final outputs include aggregate and per-target performance tables:
+Without `--mt-top-k`, every feature selected for at least one target is kept.
+Models with native multi-output support fit the targets together; other models
+fit one estimator per target. The default tuning search chooses one
+configuration from the average per-target score. For regression, those tuning
+scores are normalized so that a target with larger numeric values does not
+dominate. Reported errors remain in the target's original units.
 
-- `results/final_performances_per_target.csv`
-- `results/performance_long_table_per_target.csv`
-- `results/main_metric_by_target_acc.csv` for classification
-- `results/main_metric_by_target_mae.csv` for regression
-- one `results_report_target_<target>.md` report per target
+Final cross-validation uses up to five folds. A grouped run may use fewer folds
+when fewer than five holdout groups are available, but a group is never split
+between folds. The output column `final_cv_folds` records the number used.
+Adaptive error analysis, when enabled, runs separately for each classification
+target.
 
-Adaptive error analysis also runs separately for each classification target.
-Multi-target support does not mean that every estimator learns relationships
-between the targets. The default hyperparameter search is shared: it selects
-one configuration by averaging the per-target tuning scores, while fitted
-per-target model weights remain independent.
-
-Each target's internal tuning score is used when selecting candidates for
-adaptive error analysis. The final holdout labels are used only for reporting
-and risk evaluation.
-
-For regression, error-based tuning scores are normalized against a constant
-baseline for each target. This prevents the target with the largest numeric
-scale from dominating the search. Reported MAE, MSE, and RMSE values remain in
-the original target units.
-
-Final cross-validation uses up to five folds. For grouped data it may use fewer
-folds when the holdout contains fewer than five groups, but it never splits a
-group across folds. The actual number is recorded as `final_cv_folds`.
-
-Important multi-target outputs include:
+The main multi-target outputs are:
 
 | Path | Description |
 |---|---|
@@ -718,11 +677,18 @@ request a different preprocessing method in the current version.
 ## Embedding Functionality
 
 `df-analyze` now supports the pre-processing of **image** and **text**
-classification or regression datasets through the `df-embed.py` python script.
+classification or regression datasets through the installed `df-embed`
+command or the source-checkout `df-embed.py` Python script.
 
 ### Quickstart
 
 The CLI help can be accessed locally by running
+
+```bash
+df-embed --help
+```
+
+From a source checkout, the equivalent command is:
 
 ```bash
 python df-embed.py --help
@@ -748,23 +714,16 @@ python df-embed.py \
     --out my_data_embedded.parquet
 ```
 
-**NOTE**: These are large models, so the **memory requirements may be too high
-for you to efficiently embed a dataset on your local machine**. CUDA execution
-is supported when the installed PyTorch and GPU are usable, but does not reduce
-the requirement that the input dataset fit in memory and does not guarantee a
-runtime improvement for small jobs. CPU execution will work and is tested on
-modern e.g. M-series MacBooks (Air or Pro), but may make use of swap memory,
-which could be unacceptably slow for your dataset(s), depending on your
-machine.
+**NOTE**: These models require enough memory for the input and model state.
+CUDA is used when the installed PyTorch build and GPU support it; larger
+embedding batches are more likely to benefit, while small batches may show
+limited improvement. CPU execution is also supported. In either mode, the
+input data and model state must fit in available memory.
 
-However, on a Linux-based cluster (e.g. CentOS or RedHat, on Compute Canada),
-then inference on CPU on a node with 128GB RAM is quite efficient (datasets
-of 200k to 300k samples should still embed in a few hours, and smaller
-datasets in just a few minutes). But in order to do this, you will need to
-[build the container](#building-the-singularity-container) and then make use
-of the `run_python_with_home.sh` script included in this repo, and paying
-attention to the advice to use `readlink` or `realpath` for all references to
-files.
+On a Linux cluster, a CPU node with enough memory can also be used. Follow the
+instructions to [build the container](#building-the-singularity-container), use
+the included `run_python_with_home.sh` script, and pass absolute paths obtained
+with `readlink` or `realpath`.
 
 
 ### About the Embedding Models
@@ -1239,9 +1198,8 @@ variable, each test fold would be expected to be 20% of the samples, so about
 reliable performance estimates for this class, and so only introduces noise
 to final performance metrics.
 
-For the current single-target implementation, classes with 20 or fewer samples
-are removed. This deliberately conservative minimum avoids folds with too few
-examples while preserving the original single-target cleaning behavior.
+For a single target, classes with 20 or fewer samples are removed. This matches
+the original cleaning behavior and avoids folds with too few examples.
 
 Multi-target classification is handled differently. Removing a row because one
 target has a rare class would also remove valid labels from the other targets,
@@ -1355,10 +1313,9 @@ features in $\symbfit{R}$ are also greedily eliminated.
 
 ### Adaptive Error Analysis
 
-Pass `--adaptive-error` to estimate a classification model's sample-level
-error risk from its out-of-fold confidence. This is useful when an aggregate
-accuracy is not enough and individual predictions need a calibrated
-reliability estimate:
+Pass `--adaptive-error` to estimate the chance that each classification
+prediction is wrong. Unlike accuracy, which summarizes the whole holdout set,
+adaptive error gives each row its own estimated error rate:
 
 ```shell
 python df-analyze.py \
@@ -1374,40 +1331,26 @@ python df-analyze.py \
     --outdir ./adaptive_error_results
 ```
 
-The confidence-to-error lookup is fitted from out-of-fold predictions on the
-training data. The final holdout labels are used only for reporting and risk
-evaluation. In a multi-target classification run, the analysis is performed
-separately for each target.
+The confidence-to-error mapping is learned from out-of-fold predictions on the
+training data. Holdout labels are used only to report how well that mapping
+worked. In a multi-target classification run, each target is analyzed
+separately.
 
-The AER pipeline:
+#### How Adaptive Error Works
 
-1. Refits tuned model settings and creates out-of-fold (OOF) predictions from
-   the training partition.
-2. Builds or normalizes class probabilities and compares applicable external
-   calibrators: none, temperature scaling, Platt scaling, binary isotonic, or
-   one-vs-rest isotonic.
-3. Constructs the confidence signals supported by the estimator, including
-   probability margin, tree-vote agreement, tree-leaf support, KNN vote,
-   distance-weighted KNN confidence, and KNN minimum-distance confidence.
-4. With `--aer-confidence-metric auto`, selects the signal with the lowest
-   cross-fitted Brier score for predicting whether the model is wrong.
-5. Fits confidence to expected error using OOF bins, shrinks noisy bins toward
-   the global error rate, smooths the curve by default, and can optionally
-   enforce monotonicity.
-6. Applies only the learned mapping to the holdout set, producing an expected
-   error estimate for each sample.
-7. Computes risk-controlled operating points using exact one-sided
-   Clopper-Pearson bounds with a Bonferroni adjustment over scanned thresholds.
+1. Refit the tuned model in several training folds and collect out-of-fold
+   predictions.
+2. Calibrate the class probabilities when a supported calibrator improves them.
+3. Compare the confidence measures available for that model. In `auto` mode,
+   choose the one with the best cross-fitted Brier score.
+4. Learn the relationship between confidence and observed error on the
+   out-of-fold predictions.
+5. Apply that learned relationship to the holdout predictions.
+6. Report coverage and error thresholds with one-sided Clopper-Pearson bounds.
 
-The most useful controls are:
+#### Options
 
-- `--aer-oof-folds`: number of out-of-fold splits
-- `--aer-bins`: number of confidence bins
-- `--aer-min-bin-count`: minimum observations in a retained bin
-- `--aer-confidence-metric`: confidence measure used by the lookup
-- `--aer-top-k`: maximum number of tuned models to analyze
-
-The complete set of base AER controls retained from the original guide is:
+The main options are:
 
 | Flag | Default | Description |
 |---|---:|---|
@@ -1415,14 +1358,14 @@ The complete set of base AER controls retained from the original guide is:
 | `--aer-oof-folds` | `5` | OOF splits used for AER fitting and cross-fitting |
 | `--aer-bins` | `20` | Nominal number of confidence bins |
 | `--aer-min-bin-count` | `10` | Minimum observations before bins are merged or reduced |
-| `--aer-prior-strength` | `2.0` | Beta-prior shrinkage toward the global error rate |
+| `--aer-prior-strength` | `2.0` | Strength of shrinkage toward the global error rate |
 | `--no-aer-smooth` | off | Disable the default local smoothing |
 | `--aer-monotonic` | `False` | Enforce a monotonic confidence-to-error mapping |
 | `--aer-adaptive-binning` | `False` | Use quantile-like adaptive instead of fixed-width bins |
 | `--aer-confidence-metric` | `auto` | Select a confidence signal; `auto` uses cross-fitted Brier score |
 | `--aer-nmin` | `1` | Minimum accepted observations at a risk-controlled threshold |
 | `--aer-target-error` | `0.05` | Target error rate for risk-control summaries |
-| `--aer-alpha` | `0.05` | Significance level for the exact upper bound |
+| `--aer-alpha` | `0.05` | Significance level for the one-sided error bound |
 | `--aer-top-k` | `0` | Analyze at most the top *k* usable base models; `0` means all |
 | `--no-preds` | off | Replace large per-sample prediction outputs with placeholders |
 
@@ -1438,20 +1381,23 @@ Available base-model confidence signals are:
 | `knn_min_dist` | Confidence derived from nearest-neighbor distance |
 | `auto` | Select the best available signal by cross-fitted Brier score |
 
-Pass `--aer-ensemble` to compare several ways of combining eligible models.
-Specific strategies can be selected with `--aer-ensemble-strategies`:
+Use `--aer-ensemble` to compare combinations of the eligible models. Select
+specific combinations with `--aer-ensemble-strategies`:
 
 ```shell
 --aer-ensemble \
 --aer-ensemble-strategies min_aer topn calibration_aware
 ```
 
-Outputs are written below `results/adaptive_error`, including model rankings,
-confidence/error lookup tables, per-sample estimates, reliability bins,
-coverage/accuracy summaries, risk-control metadata, and optional ensemble
-reports. Adaptive error analysis is classification-only and requires usable
-class probabilities. Dummy models are excluded. See `python df-analyze.py
---help` for the complete list of AER options and defaults.
+Adaptive error is available only for classification models that provide usable
+class probabilities. Dummy models are skipped.
+
+#### Outputs
+
+Results are written below `results/adaptive_error`. The main files contain the
+model ranking, the learned confidence/error relationship, one estimated error
+rate per holdout row, reliability bins, and coverage/accuracy summaries. See
+`python df-analyze.py --help` for every option.
 
 For a multi-target run, each target has its own sanitized subdirectory below
 `results/adaptive_error`; with multiple external test sets, `testXX` is added
@@ -1460,7 +1406,7 @@ include:
 
 | Path | Purpose |
 |---|---|
-| `run_config.json` | Reproducible AER configuration, selected models, and run metadata |
+| `run_config.json` | AER settings, selected models, and run metadata |
 | `tables/models_ranked.csv` | Ranking and folder location of analyzed base models |
 | `tables/aer_metrics_by_model.csv` | Cross-model error-quality metrics |
 | `plots/confidence_vs_expected_error_compare.png` | Confidence-to-error comparison across models |
@@ -1481,7 +1427,7 @@ Each `models/<model-slug>/` directory can contain:
 | `tables/clinician_view.csv` | Row ID, labels, `aer_pct`, and target-error flag |
 | `predictions/oof_per_sample.csv` | Row-level diagnostics for learning the mapping |
 | `predictions/test_per_sample.csv` | Main row-level holdout output |
-| `reports/clinician_view.md` | Simplified report for non-technical readers |
+| `reports/clinician_view.md` | Short report for non-technical readers |
 
 The main columns in `predictions/test_per_sample.csv` are:
 
@@ -1498,16 +1444,14 @@ The main columns in `predictions/test_per_sample.csv` are:
 | `p_pred`, `p_pred_margin` | Probability diagnostics for the predicted class |
 
 In `adaptive_error_metrics.json`, `global_error_test` is the ordinary holdout
-error rate, `brier_error_test` is the mean squared error of the predicted
-sample-level error probabilities, and `ece_error_test` is their
-calibration-style expected calibration error. Smaller Brier and ECE values are
-better.
+error rate. `brier_error_test` and `ece_error_test` measure the quality of the
+per-row error estimates; smaller values are better.
 
 If the AER directory is absent, first confirm that the task is classification,
 that `--adaptive-error` was passed, and that at least one non-dummy model
 provided usable probabilities. Placeholder prediction files indicate that
-`--no-preds` was used. A noisy confidence/error plot may improve with
-`--aer-adaptive-binning` or a moderately larger `--aer-min-bin-count`.
+`--no-preds` was used. Use `--aer-adaptive-binning` to switch to quantile-based
+bins or increase `--aer-min-bin-count` to merge sparse bins more aggressively.
 
 ### Error Consistency
 
@@ -2130,12 +2074,10 @@ timing outputs are described above.
     - step-up: 20
     - step-down: 10
 
-## One Target Variable per Invocation / Run
+## Target Variables
 
-The following original explanation remains the basis of the single-target path.
-
-Features and targets must be treated fundamentally differently by all aspects
-of analysis. E.g.
+Use `--target` for one target or `--targets` for several. Features and targets
+need different handling throughout the analysis. For example:
 
 - normalization of targets in regression must be different than normalization
   of continuous features
@@ -2145,19 +2087,9 @@ of analysis. E.g.
   stratification must be based on the target (e.g. choosing a different
   target will generally result in different splits)
 
-In addition, feature selection is expensive, and must be done for each target
-variable. Runtimes are often suprisingly sensitive to the distribution of the
-target variable.
-
-### Multi-Target Extension
-
-Multi-target support is additive to that single-target path. When multiple
-targets are explicitly selected, target-specific analyses and feature selection
-are performed for each target and then aggregated according to the selected
-multi-target strategy. Classification uses a support-aware split proxy and
-records when stratification must be relaxed. This removes the old one-target
-command-line limitation, but it does not remove the computational and
-statistical constraints described above.
+Feature selection is run for each target, then combined using the selected
+multi-target aggregation strategy. Multi-target classification uses a
+support-aware split proxy and records when stratification must be relaxed.
 
 ## Dataset Size
 
@@ -2183,8 +2115,14 @@ These are historical estimates for the full, dense pipeline and should not be
 extrapolated to the large-scale downsampling paths. Downsampling can reduce the
 feature count seen by later analyses, but the ordinary and large-feature table
 paths must still load their source table in memory; use SVMlight for a source
-matrix that must remain sparse. Likewise, supported CUDA execution may reduce
-some model runtimes but does not guarantee an end-to-end speedup.
+matrix that must remain sparse.
+
+The estimate also predates multi-target analysis, KAN, TabPFN, adaptive error,
+and error consistency, and should not be used for those combinations. Error
+consistency adds `folds x repetitions` refits for every target, model, and
+selected feature set: 25 with the default 5 x 5 settings, 50 with the
+classification profile, and 250 with the regression profile. Use a 2 x 2 run
+with one model to measure the dataset and machine before scaling up.
 
 The expected runtime on your machine will be quite different. If $n <
 10 000$ and $p < 60$, and you have a recent machine (e.g. M1/M2/M3 series

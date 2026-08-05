@@ -235,7 +235,7 @@ class MLPEstimator(DfAnalyzeModel):
         self.fixed_args["device"] = self.runtime.device_for(self.runtime_component)
 
     def _runtime_model_args(self, args: Mapping[str, Any]) -> dict[str, Any]:
-        """Make the runtime policy authoritative over user/model arguments."""
+        """Apply the resolved runtime device to the model arguments."""
         resolved = dict(args)
         resolved["device"] = self.runtime.device_for(self.runtime_component)
         return resolved
@@ -596,7 +596,6 @@ class MLPEstimator(DfAnalyzeModel):
                     preds = estimator.predict(X_test)
                     score = metric.tuning_score(y_test.numpy(), preds)
                     scores.append(score)
-                    # allows pruning
                     # Reporting each intermediate fold score makes that pruning
                     # decision reflect progress across the completed folds.
                     trial.report(float(np.mean(scores)), step=step)

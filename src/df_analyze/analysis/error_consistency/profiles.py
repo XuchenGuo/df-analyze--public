@@ -83,11 +83,11 @@ GENERAL_EC_DEFAULTS: dict[str, Any] = {
 
 
 def apply_ec_profile(cli_args: Namespace, mode: str) -> Namespace:
-    """Resolve a paper profile while preserving explicitly supplied values.
+    """Apply a paper profile without replacing user-supplied values.
 
     Profile-controlled parser arguments use ``None`` as their unresolved default.
-    Consequently, a CLI or spreadsheet value always wins, including when the
-    explicit value happens to equal the ordinary df-analyze default.
+    A CLI or spreadsheet value therefore always wins, even when it equals the
+    normal df-analyze default.
     """
 
     name = str(getattr(cli_args, "ec_profile", "none") or "none").lower()

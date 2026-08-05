@@ -249,6 +249,14 @@ def test_lodo_refits_preprocessing_for_each_partition(tmp_path) -> None:
         if "per_target" not in path.stem
     ]
     assert len(tables) == 3
+    training_tables = sorted(output_path.rglob("X_train_*.csv"))
+    assert len(training_tables) == 3
+    for table in training_tables:
+        training = pd.read_csv(table)
+        assert training.columns.tolist() == ["x"]
+        assert training["x"].min() == 0.0
+        assert training["x"].max() == 1.0
+
     inspection_root = options.program_dirs.inspection
     assert inspection_root is not None
     inspection_dirs = list(inspection_root.glob("test*"))

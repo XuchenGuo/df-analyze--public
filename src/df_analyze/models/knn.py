@@ -100,7 +100,7 @@ class _TorchKNN:
 
     @staticmethod
     def _correlation_normalize(x):
-        """Preserve scipy/sklearn's NaN correlation for constant rows."""
+        """Match scipy/sklearn by returning NaN correlation for constant rows."""
         torch = _TorchKNN._torch()
         norm = torch.linalg.vector_norm(x, dim=1, keepdim=True)
         return x / norm
@@ -443,8 +443,8 @@ class KNNEstimator(DfAnalyzeModel):
         self.grid = {
             "n_neighbors": [1, 5, 10, 25, 50],
             "weights": ["uniform", "distance"],
-            # Keep the original public grid unchanged. The CUDA implementation
-            # can still accept L1 when it is explicitly supplied.
+            # Keep the original tuning grid. CUDA KNN still accepts an
+            # explicitly supplied L1 metric.
             "metric": ["cosine", "l2", "correlation"],
         }
 
@@ -459,10 +459,8 @@ class KNNEstimator(DfAnalyzeModel):
         return self.model_cls, full_args
 
     def _cleanup_after_fold(self) -> None:
-        # Fold-local tensors are released when the estimator goes out of scope.
-        # Emptying PyTorch's allocator and forcing a full Python GC after every
-        # KNN fold defeats allocator reuse and is substantially slower than the
-        # distance calculation on small and medium datasets.
+        # Fold tensors are released with the estimator. Keep PyTorch's allocator
+        # state so later folds can reuse it; task-level cleanup releases it.
         return
 
     def optuna_args(self, trial: Trial) -> dict[str, str | float | int]:

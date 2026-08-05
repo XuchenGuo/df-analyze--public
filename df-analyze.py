@@ -28,9 +28,8 @@ andr2w commented on Jan 25, 2023:
 import torch  # noqa  # type: ignore
 # fmt: on
 
-# The bootstrap call must remain before the torch import so a missing dependency
-# can be diagnosed or installed. Torch still remains before df_analyze._main,
-# which can import transformers-backed model modules.
+# Bootstrap before torch so missing packages can be reported or installed.
+# Torch must still load before df_analyze._main and its transformer models.
 
 from src.df_analyze._main import main
 

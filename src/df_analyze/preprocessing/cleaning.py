@@ -312,8 +312,7 @@ def reindex(
 
     keep = np.asarray(idx_keep, dtype=bool)
     # we re-index later, so, we need to regen the indices to be increasing again
-    # Regenerate compact, increasing indices after rows are removed so the
-    # saved train/test partitions still address the re-indexed DataFrame.
+    # Renumber the remaining rows so saved split indices match the DataFrame.
     old_to_new = np.full(len(keep), -1, dtype=int)
     old_to_new[np.flatnonzero(keep)] = np.arange(keep.sum())
 
@@ -551,9 +550,8 @@ def encode_targets(
     y_encoded = DataFrame(index=y_df_raw.index)
     for col in target_cols:
         series = unify_nans(y_df_raw[col])
-        # Preserve numeric ordering. Converting numeric labels to strings makes
-        # LabelEncoder order them lexicographically (for example 10 before 2),
-        # which can silently reverse the binary positive class.
+        # Keep numeric labels numeric. Converting them to strings would sort 10
+        # before 2 and could reverse the encoded positive class.
         if not pd.api.types.is_numeric_dtype(series.dtype):
             series = series.astype(str)
         series_train = series if ix_train is None else series.iloc[ix_train]

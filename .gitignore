@@ -46,12 +46,10 @@ poetry.lock
 **/*.xlsx
 **/*.zip
 
-# Reproducible GPU experiment protocols and their intentionally retained outputs.
+
 !docs/
 !docs/**/*.md
-!benchmarks/results/
-!benchmarks/results/**
-benchmarks/results/**/raw/
+
 
 # research scripts
 calibration.py

@@ -48,9 +48,8 @@ def _supports_supervised_scoring(
     frame = y.to_frame() if isinstance(y, Series) else y
     subset = frame.iloc[rows]
     if not is_classification:
-        # Preserve the original single-target regression path.  Requiring every
-        # screening/tuning subset to vary is a multi-target safeguard: one
-        # constant output would otherwise invalidate the aggregate scorer.
+        # Only multi-target scoring requires every target to vary in both
+        # subsets. Keep the existing single-target check unchanged.
         if frame.shape[1] == 1:
             return True
         for col in frame:

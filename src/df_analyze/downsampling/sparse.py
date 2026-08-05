@@ -348,8 +348,7 @@ def _sparse_file_stats(
                 try:
                     numeric_index = int(index)
                 except ValueError:
-                    # Let scikit-learn produce the authoritative syntax error
-                    # during parsing.
+                    # Let scikit-learn report the full syntax error while parsing.
                     continue
                 has_zero |= numeric_index == 0
                 max_index = max(max_index, numeric_index)
@@ -435,9 +434,8 @@ def _load_sparse_matrix(
 def load_sparse_input(paths: Sequence[Path], index_base: str = "auto") -> SparseInput:
     resolved, n_features, targets = _sparse_layout(paths, index_base)
     matrices: list[csr_matrix] = []
-    # Parse one file at a time with the shared dimension.  This avoids the
-    # additional all-files parser peak of load_svmlight_files while preserving
-    # a consistent feature coordinate system.
+    # Parse files one at a time to lower peak memory, using one shared feature
+    # dimension so their column indices still match.
     for path in paths:
         matrices.append(_load_sparse_matrix(path, n_features, resolved))
     return SparseInput(matrices=matrices, targets=targets, index_base=resolved)
@@ -544,8 +542,7 @@ def _prepare_hybrid_split(
 def sparse_prepared_splits(
     options: Any,
 ) -> list[tuple[PreparedData, PreparedData, FeatureDownsampleResult]]:
-    # Preserve compatibility with programmatic callers that provide the older,
-    # minimal options namespace.
+    # Supply defaults for older programmatic callers with fewer option fields.
     for name, default in (
         ("grouper", None),
         ("categoricals", []),

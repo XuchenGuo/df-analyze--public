@@ -1,4 +1,4 @@
-# ref: Wilson / Clopper–Pearson confidence intervals: https://www.statsmodels.org/v0.14.0/generated/statsmodels.stats.proportion.proportion_confint.html
+# ref: Wilson / Clopperâ€“Pearson confidence intervals: https://www.statsmodels.org/v0.14.0/generated/statsmodels.stats.proportion.proportion_confint.html
 
 from __future__ import annotations
 

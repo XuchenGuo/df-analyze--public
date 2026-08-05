@@ -854,8 +854,8 @@ class PreparedData:
         ix_all = [self.ix_train, *self.ix_tests]
         ix_pairs = []
         for i, ix in enumerate(ix_all):
-            # Compatibility with the original public behavior: train on the
-            # selected partition and validate on all remaining partitions.
+            # Train on this partition and validate on all remaining partitions,
+            # as in the original LODO path.
             ix_train = ix
             ix_tests = ix_all[:i] + ix_all[i + 1 :]
             ix_test = np.concatenate(ix_tests)

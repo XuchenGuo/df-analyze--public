@@ -143,9 +143,8 @@ def resolve_feature_downsample_method(
     if any(target.nunique(dropna=True) < 2 for target in targets):
         return FeatureDownsampleMethod.NormalizedVariance
     if n_features >= LARGE_FEATURE_THRESHOLD or n_features / max(n_samples, 1) >= 1_000:
-        # At extreme p/n, a single-sample ranking is especially unstable.
-        # Repeated supervised subsampling is a more defensible automatic choice
-        # than giving an arbitrary equal vote to an untargeted variance rank.
+        # With many more features than rows, repeat the supervised ranking
+        # instead of mixing it equally with an unrelated variance ranking.
         return FeatureDownsampleMethod.StableRank
     return FeatureDownsampleMethod.FTest
 
@@ -510,9 +509,8 @@ def select_indexed_columns(
             else [f"feature_{idx}" for idx in range(n_features)]
         )
     else:
-        # Keep lazy feature-name sequences lazy.  Materializing one million
-        # generated SVMlight names costs substantially more memory than the
-        # numeric score vector itself.
+        # Do not build millions of generated SVMlight names just to select a
+        # small set of columns.
         names = feature_names
     if len(names) != n_features:
         raise ValueError("Feature names must match the input feature count.")

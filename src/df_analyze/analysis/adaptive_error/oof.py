@@ -1,6 +1,13 @@
-# ref: Out-of-fold predictions via cross-validation: https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.cross_val_predict.html
+"""Build leakage-safe predictions for fitting adaptive error estimates.
+
+Every training row is predicted by a fold model that did not fit that row.
+The resulting confidence/error pairs fit the adaptive-error mapping; the
+unchanged holdout is evaluated later in ``test_stage``.
+"""
 
 from __future__ import annotations
+
+# ref: Out-of-fold predictions via cross-validation: https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.cross_val_predict.html
 
 import inspect
 from typing import Any, Optional
@@ -57,6 +64,11 @@ def build_oof_for_result(
     seed: int = SEED,
     options=None,
 ) -> tuple[pd.DataFrame, np.ndarray]:
+    """Refit one tuned configuration across folds and collect OOF outputs.
+
+    Hyperparameters remain fixed so the mapping measures prediction confidence
+    rather than another round of tuning. Groups remain disjoint when supplied.
+    """
     splitter = OmniKFold(
         n_splits=n_folds,
         is_classification=True,

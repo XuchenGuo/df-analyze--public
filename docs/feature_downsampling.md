@@ -4,13 +4,30 @@ Feature downsampling reduces a wide matrix before df-analyze runs its usual
 univariate analyses, feature selection, and model tuning. It is disabled by
 default.
 
-```powershell
-python df-analyze.py --df data.csv --target outcome --mode classify `
-  --feat-downsample auto --n-feat-downsample 1000
+```shell
+python df-analyze.py \
+    --df data.csv \
+    --target outcome \
+    --mode classify \
+    --feat-downsample auto \
+    --n-feat-downsample 1000
 ```
 
 `--n-feat-downsample` accepts either a count or a fraction. For example, `500`
 keeps at most 500 features and `0.1` keeps 10 percent.
+
+For a first run, use `auto`. Use another method only when you have a reason to
+control how features are ranked or projected.
+
+## Choosing an input path
+
+- Use the normal table path for data that fits comfortably in memory.
+- Add `--large-feature-mode` for an all-numeric table that fits in memory but
+  is too wide for normal preprocessing.
+- Use SVMlight for a sparse matrix that should not be loaded as a dense table.
+
+All three paths use only training data to choose features. The holdout and any
+external test sets are not used for feature ranking.
 
 ## Methods
 
@@ -29,24 +46,30 @@ keeps at most 500 features and `0.1` keeps 10 percent.
 | `selector-ensemble` | Yes | source columns | Yes |
 | `stable-rank` | Yes | source columns | Yes |
 
-`auto` uses no downsampling when the requested dimension is already available,
-range-normalized variance when a usable target or statistically valid
-screening/tuning split is not available, and an F-test for ordinary supervised
-data. Explicit `variance` uses raw sample variance and is therefore sensitive to
-the source measurement units; prefer `normalized-variance` when raw columns have
-different scales. When the feature count reaches the large-feature threshold or
-the feature-to-sample ratio is at least 1,000, supervised `auto` uses
-`stable-rank`: repeated subsamples of the leakage-isolated screening data are
-ranked by F-test score, then combined by selection frequency and mean rank. This
-avoids assigning an unvalidated equal weight to an untargeted variance score.
-`rank-ensemble` remains available as an explicit exploratory method. In the
-normal prepared-table path, its materialized inputs with at most 50,000 features
-and a fitting matrix within the dense working-memory budget also attempt
-mutual-information, linear, and LGBM members; result metadata lists only members
-that actually produced valid scores. Multi-target scores are combined through
-per-target ranks so targets with different score scales contribute comparably.
-Equal scores receive equal average ranks; exact top-k boundary ties are resolved
-reproducibly from the feature identity and configured seed.
+`auto` works as follows:
+
+1. If the data already has no more than the requested number of features, keep
+   it unchanged.
+2. For ordinary supervised data, rank features with an F-test.
+3. For extremely wide data (or at least 1,000 features per sample), use
+   `stable-rank`. This repeats the F-test on several screening subsamples and
+   combines the selection frequency and average rank.
+4. If a supervised screening split cannot be made, use
+   `normalized-variance`.
+
+Explicit `variance` uses raw sample variance, so a change in measurement units
+can change the ranking. Use `normalized-variance` when columns have different
+scales.
+
+`rank-ensemble` is an exploratory alternative. On a prepared table with at
+most 50,000 features, and when the fitting matrix stays within the memory
+limit, it may combine F-test, normalized-variance, mutual-information, linear,
+and LGBM scores. The report lists the members that actually ran.
+
+For multiple targets, scores are converted to per-target ranks before they are
+combined. This prevents a target with numerically larger scores from dominating
+the result. Equal scores receive equal ranks; ties at the final top-k boundary
+are broken reproducibly from the feature name and seed.
 
 `stable-rank` is a compatibility name for repeated-subsample F-test rank
 aggregation; it does not refer to the matrix stable-rank quantity.
@@ -55,30 +78,26 @@ Variance, F-test, and ensemble scores are computed in column chunks. The
 requested `--downsample-chunk-size` is reduced automatically when a chunk would
 exceed the internal working-memory limit.
 
-These methods reduce computation; they do not guarantee a globally optimal
-predictive feature set. In particular, variance and univariate F-test screening
-can miss features whose signal exists only through interactions. Compare final
-holdout performance with a no-downsampling baseline whenever the full baseline is
-computationally feasible, and use repeated or ensemble screening when selection
-stability matters.
+Downsampling reduces computation, but it can discard useful features. Variance
+and F-test screening can miss a feature that is useful only through an
+interaction with another feature. When the full analysis is practical, compare
+its holdout result with the downsampled run.
 
 ## Leakage control
 
-Supervised downsampling fits on a screening subset of each training fold. Model
-hyperparameters are tuned on the disjoint remainder, then the tuned estimator
-is refit on the full training fold. Holdout and external test rows are never
-used to score features. For multi-target data, both subsets must retain usable
-support for every classification target and non-constant values for every
-regression target. Change the screening allocation with
-`--downsample-screening-fraction`. If the data cannot form disjoint subsets that
-both have usable statistical support, `auto` falls back to normalized-variance
-downsampling and records the reason. Each classification level must occur at
-least twice in both subsets, and each regression subset must have at least three
-rows. An explicitly requested supervised method stops with an explanatory error
-instead. Grouped data require at least two distinct training groups and keep
-every group wholly within screening or tuning; an impossible group-disjoint
-split follows the same fallback/error rules and never silently reuses groups
-across the two phases.
+Supervised methods divide each training fold into two parts. One part ranks the
+features; the other tunes the model. The tuned model is then refit on the full
+training fold. Change the first part with `--downsample-screening-fraction`.
+
+Both parts must contain enough data for the selected task. Every classification
+level must appear at least twice in both parts. Each regression part must have
+at least three rows; in a multi-target run, every regression target must also
+be finite and non-constant in both parts.
+
+For grouped data, a group stays wholly in one part and at least two training
+groups are required. If these splits cannot be made, `auto` records the reason
+and switches to `normalized-variance`. A supervised method selected by name
+stops with an error instead.
 
 ## Extremely wide numeric tables
 
@@ -91,29 +110,25 @@ python df-analyze.py --df wide.parquet --target outcome --mode classify `
   --n-feat-downsample 1000
 ```
 
-This mode splits rows and scores columns before materializing the selected
-training and test matrices. Categorical and ordinal predictors are not accepted
-because their encoding can change the feature dimension. Only indexed-safe
-methods from the table above are available. The source table is still loaded as
-a pandas DataFrame, so it must fit in memory. Only rows in the current train/test
-split and the selected columns are copied into normal preprocessing, with a
-peak-working-memory guard. Use SVMlight input when the source matrix itself is
-too large to materialize densely.
+This mode splits rows and scores columns before it builds the selected training
+and test matrices. Predictors must be numeric and finite; categorical and
+ordinal predictors need the normal preparation path. Only methods marked
+suitable for indexed input in the table above can be used.
 
-The ensemble methods in large-feature mode use only the scale-invariant,
-column-chunked range-normalized-variance and F-test members. They do not use
-raw, pre-preprocessing linear coefficients.
+The complete source table is still loaded as a pandas DataFrame and must fit in
+memory. Use SVMlight when the source matrix needs to remain sparse.
+
+In this mode, ensemble methods use only chunked `normalized-variance` and
+F-test scores.
 
 ## SVMlight input
 
 Files ending in `.svm`, `.svmlight`, `.libsvm`, or `.binary` are recognized,
 including gzip, bzip2, and xz compression. The matrix stays sparse during
 scoring and only selected columns are converted to the final dense matrices.
-The selected numeric columns are then scaled with a training-fitted,
-zero-preserving maximum-absolute-value transform. This avoids erasing rare
-non-zero events in sparse binary or count features. Dense materialization uses a
-peak-working-memory guard; reduce `--n-feat-downsample` when the selected
-train/test matrices would exceed it.
+The selected numeric columns are scaled from the training data without turning
+sparse zeroes into non-zero values. If the selected dense train/test matrices
+would exceed the memory limit, reduce `--n-feat-downsample`.
 
 ```powershell
 python df-analyze.py --df wide.svmlight --target outcome --mode classify `
@@ -145,8 +160,10 @@ python df-analyze.py `
   --outdir .\e2006_results
 ```
 
-To combine CRUSH-scale imaging values with the ordinary clinical spreadsheet,
-pass one row-aligned sidecar per SVMlight input:
+### Adding Clinical Data and Feature Names
+
+To combine CRUSH-scale imaging values with an ordinary clinical table, pass one
+row-aligned sidecar per SVMlight input:
 
 ```powershell
 python df-analyze.py --df crush.svmlight --target diagnosis --mode classify `
@@ -158,14 +175,13 @@ python df-analyze.py --df crush.svmlight --target diagnosis --mode classify `
 ```
 
 Sidecars may be CSV, TSV, JSON, or Parquet. Their row count and order must match
-the corresponding sparse file exactly. If the target column is present,
-df-analyze verifies one-to-one class correspondence (or numeric equality for
-regression) against the SVMlight target; otherwise it adds the SVMlight target.
-All sidecars must have the same schema. Clinical columns are appended only after
-imaging downsampling and then use the normal df-analyze inference, encoding, and
-cleaning pipeline. A sidecar also enables `--grouper`, `--categoricals`,
-`--ordinals`, and `--drops`; groups remain disjoint during both initial
-holdout splitting and supervised screening.
+the corresponding sparse file exactly, and all sidecars must have the same
+columns. If a sidecar contains the target, df-analyze checks it against the
+SVMlight target. Otherwise, the SVMlight target is added to the clinical data.
+
+Clinical columns are added after imaging downsampling, then pass through normal
+type inference, encoding, and cleaning. A sidecar also enables `--grouper`,
+`--categoricals`, `--ordinals`, and `--drops`.
 
 For strong row-identity validation, add comments to the corresponding SVMlight
 rows, for example `1 4:0.2 91:1 # participant_id=sub-0001`, and pass
@@ -183,19 +199,17 @@ mapped or generated names can be protected with
 `--downsample-protected-features`. Protected features can still be removed later
 if normal preprocessing proves that they are constant or otherwise unusable.
 
-Single-file train/test splitting retains one source CSR instead of copying both
-partitions. External LODO materializes selected dense test blocks sequentially
-and does not stack million-column sparse matrices. The main analysis first
-scans dimensions and labels without loading predictor matrices, then retains at
-most the current training CSR and one current test CSR. Generated feature names
-remain lazy.
+### Memory and Timing Reports
 
-The downsampling JSON and Markdown report time input layout/target scanning,
-training CSR loading, feature scoring, external test CSR loading, and selected
-feature materialization/scaling separately. The reported score-chunk memory
-budget is not a whole-process RSS limit: it excludes source CSR matrices,
-temporary sparse conversions, full-length score/rank vectors, and selected dense
-outputs.
+For a single input file, the train/test split shares one sparse source matrix.
+For external leave-one-dataset-out (LODO) validation, test matrices are loaded
+one at a time. The main analysis first reads dimensions and labels, then keeps
+only the current training matrix and one current test matrix in memory.
+
+The JSON and Markdown reports time input scanning, sparse-matrix loading,
+feature scoring, external test loading, and selected-feature conversion
+separately. The score-chunk memory budget covers only the current scoring chunk,
+not the whole process.
 
 ## Outputs
 

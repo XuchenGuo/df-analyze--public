@@ -226,8 +226,7 @@ class KANEstimator(MLPEstimator):
         model_state = state.pop("_serialized_model", None)
         tuned_model_state = state.pop("_serialized_tuned_model", None)
         self.__dict__.update(state)
-        # Restore portable fitted artifacts without requiring the training
-        # machine's CUDA backend. New work can opt into another runtime later.
+        # Load saved models on CPU; callers can choose another device later.
         self.runtime = get_runtime("cpu")
         self._configure_runtime()
         self.model = self._restore_models(model_state)
@@ -514,11 +513,8 @@ class KANEstimator(MLPEstimator):
         n_jobs: int = -1,
         verbosity: int = optuna.logging.ERROR,
     ) -> Study:
-        # Each trial creates multiple PyTorch/pykan modules while PyTorch also
-        # manages its own CPU thread pool. Parallel trials therefore multiply
-        # memory use and oversubscribe CPUs; pykan also uses process-global RNG
-        # state during module construction. Keep trials serial for stable,
-        # reproducible tuning while retaining parallelism inside torch itself.
+        # Parallel trials multiply PyTorch memory and CPU threads, while pykan
+        # also uses global random state. Run trials one at a time.
         n_jobs = self.runtime.tuning_jobs(RuntimeComponent.KAN, 1)
         return DfAnalyzeModel.htune_optuna(
             self,

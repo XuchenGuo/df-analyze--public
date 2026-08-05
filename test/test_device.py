@@ -1185,7 +1185,10 @@ def test_main_fails_when_all_predictive_models_fail(monkeypatch) -> None:
         ),
     )
 
-    with pytest.raises(RuntimeError, match="All requested predictive models failed"):
+    with pytest.raises(
+        RuntimeError,
+        match=r"(?s)All requested predictive models failed.*license token missing",
+    ):
         _main.main()
 
     assert len(timings) == 1

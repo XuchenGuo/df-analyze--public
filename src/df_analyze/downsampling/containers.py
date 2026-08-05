@@ -47,9 +47,8 @@ class FeatureDownsampleResult:
     stability_repeats: Optional[int] = None
     stability_subsample: Optional[float] = None
     large_feature_mode: bool = False
-    # Full score vectors deliberately remain NumPy-backed.  Converting a
-    # million values/indices/names to Python lists can consume hundreds of MiB.
-    # These fields are excluded from JSON and streamed to CSV in bounded chunks.
+    # Keep full score vectors as NumPy arrays. Python lists for millions of
+    # scores, indices, and names use much more memory. Stream them to CSV.
     full_score_values: Optional[NDArray[np.float64]] = field(default=None, repr=False)
     full_score_feature_names: Optional[Sequence[str]] = field(default=None, repr=False)
 
@@ -118,7 +117,7 @@ class FeatureDownsampleResult:
         return json.dumps(self.to_dict(), indent=2, allow_nan=False)
 
     def clone_for_reuse(self) -> FeatureDownsampleResult:
-        """Clone mutable metadata while sharing immutable full-score arrays."""
+        """Clone mutable metadata while sharing score arrays treated as read-only."""
         return replace(
             self,
             selected_features=self.selected_features.copy(),

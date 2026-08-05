@@ -249,8 +249,8 @@ def compute_classification_ec(
         "leave_one_model_out_sd": leave_one_model_out_sd,
         "n_leave_one_model_out": len(leave_one_model_out),
         "output_detail": detail,
-        # Backward-compatible aliases. "Leave one model out" is the precise
-        # name; this is not leave-one-sample-out cross-validation.
+        # Keep the old keys, although this is leave-one-model-out rather than
+        # leave-one-sample-out cross-validation.
         "leave_one_out_mean": leave_one_model_out_mean,
         "leave_one_out_sd": leave_one_model_out_sd,
     }

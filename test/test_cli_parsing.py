@@ -42,12 +42,13 @@ from df_analyze.enumerables import (
 )
 from df_analyze.testing.datasets import ALL_DATASETS, TEST_DATASETS, TestDataset, all_ds
 
-pytestmark = pytest.mark.skipif(
+requires_test_data = pytest.mark.skipif(
     not TEST_DATASETS, reason="Optional parquet test datasets are not available."
 )
 PATH = next(iter(TEST_DATASETS.values())).datapath if TEST_DATASETS else Path()
 
 
+@requires_test_data
 @pytest.mark.fast
 @pytest.mark.filterwarnings("ignore:.*not have write permissions.*")
 def test_classifiers() -> None:
@@ -63,6 +64,7 @@ def test_classifiers() -> None:
         assert opts.categoricals == sorted(["one", "two", "three"])
 
 
+@requires_test_data
 @pytest.mark.fast
 @pytest.mark.filterwarnings("ignore:.*not have write permissions.*")
 def test_quoted_classifiers() -> None:
@@ -101,6 +103,21 @@ def test_programmatic_args_preserve_quotes_and_windows_paths() -> None:
 
 
 @pytest.mark.fast
+def test_programmatic_args_preserve_apostrophes_in_column_names() -> None:
+    assert _split_cli_args(
+        "--target mother's_qualification --verbosity 0"
+    ) == ["--target", "mother's_qualification", "--verbosity", "0"]
+    assert _split_cli_args(
+        "--target mother's_qualification --categoricals father's_occupation"
+    ) == [
+        "--target",
+        "mother's_qualification",
+        "--categoricals",
+        "father's_occupation",
+    ]
+
+
+@pytest.mark.fast
 @pytest.mark.filterwarnings("ignore:.*not have write permissions.*")
 def test_spreadsheet_args_preserve_quoted_columns(tmp_path: Path) -> None:
     spreadsheet = tmp_path / "data with spaces.csv"
@@ -119,6 +136,7 @@ def test_spreadsheet_args_preserve_quoted_columns(tmp_path: Path) -> None:
     assert opts.categoricals == ["CO2 CosIR Value", "MOX 2"]
 
 
+@requires_test_data
 @pytest.mark.fast
 @pytest.mark.filterwarnings("ignore:.*not have write permissions.*")
 def test_int_seed() -> None:
@@ -134,6 +152,7 @@ def test_int_seed() -> None:
         assert opts.seed == 12345
 
 
+@requires_test_data
 @pytest.mark.fast
 @pytest.mark.filterwarnings("ignore:.*not have write permissions.*")
 def test_unseeded() -> None:
@@ -147,6 +166,7 @@ def test_unseeded() -> None:
         assert opts.seed == SEED
 
 
+@requires_test_data
 @pytest.mark.fast
 @pytest.mark.filterwarnings("ignore:.*not have write permissions.*")
 def test_default_seeded() -> None:
@@ -162,6 +182,7 @@ def test_default_seeded() -> None:
         assert opts.seed == SEED
 
 
+@requires_test_data
 @pytest.mark.fast
 @pytest.mark.filterwarnings("ignore:.*not have write permissions.*")
 def test_random_seeded() -> None:

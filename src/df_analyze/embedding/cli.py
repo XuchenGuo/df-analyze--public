@@ -216,13 +216,14 @@ generally be a small integer value like 2, 4, or 8.
 """
 
 DEVICE_HELP = """
-GPU policy: auto (recommended), cpu, or cuda. Auto uses CUDA when the installed
-PyTorch can use it and may retry a CUDA failure once on CPU. CPU disables GPU
-use. CUDA strictly requires a CUDA-capable PyTorch installation.
+Choose where embedding runs. `auto` (recommended) uses CUDA when available and
+tries the complete embedding once more on CPU after a CUDA runtime error. `cpu`
+disables GPU use. `cuda` requires CUDA and stops on CUDA runtime errors.
 """
 
 DEVICE_INSTALL_HELP = """
-Managed CUDA PyTorch setup policy: auto, ask, or never. Defaults to never.
+Choose whether df-embed may create a separate CUDA-enabled PyTorch environment:
+`auto`, `ask`, or `never` (the default).
 """
 
 

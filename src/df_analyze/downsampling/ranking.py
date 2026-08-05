@@ -11,9 +11,8 @@ from scipy.stats import rankdata
 def usable_score_mask(scores: NDArray[np.float64]) -> NDArray[np.bool_]:
     """Return scores that can participate in feature ranking.
 
-    Positive infinity is intentionally retained because it is the valid limiting
-    F statistic for perfectly separated features. NaN and negative infinity are
-    treated as unavailable scores.
+    Positive infinity is a valid limiting F statistic for perfectly separated
+    features, so it remains rankable. NaN and negative infinity are unavailable.
     """
     values = np.asarray(scores, dtype=np.float64)
     return ~np.isnan(values) & ~np.isneginf(values)
@@ -100,7 +99,7 @@ def fractional_top_k_votes(
     scores: NDArray[np.float64],
     n_select: int,
 ) -> NDArray[np.float64]:
-    """Return order-invariant top-k votes with fractional boundary ties."""
+    """Give tied features fractional votes at the top-k boundary."""
     values = np.asarray(scores, dtype=np.float64)
     votes = np.zeros(values.shape, dtype=np.float64)
     usable = usable_score_mask(values)

@@ -1,4 +1,4 @@
-# ref: Selective prediction / risk–coverage framing https://arxiv.org/abs/1705.08500
+# ref: Selective prediction / riskâ€“coverage framing https://arxiv.org/abs/1705.08500
 
 from __future__ import annotations
 

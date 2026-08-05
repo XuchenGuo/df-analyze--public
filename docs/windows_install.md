@@ -1,7 +1,7 @@
 # Windows Installation
 
 For those who can't use the [shell
-script](https://github.com/stfxecutables/df-analyze?tab=readme-ov-file#local-install-by-shell-script)
+script](https://github.com/stfxecutables/df-analyze?tab=readme-ov-file#legacy-local-install-by-shell-script)
 to install the necessary `df-analyze` dependencies for a local install, this
 should be the attempted installation procedure.
 
@@ -83,16 +83,16 @@ to use the [Legacy install procedure below](#legacy--fallback-installation-via-p
    1. In PowerShell, run: `Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/pyenv-win/pyenv-win/master/pyenv-win/install-pyenv-win.ps1" -OutFile "./install-pyenv-win.ps1"; &"./install-pyenv-win.ps1"`
    2. Reopen PowerShell
    3. Run `pyenv --version` to check if the installation was successful.
-   4. Run `pyenv install 3.12.5`
+   4. Run `pyenv install 3.13.11`
    5. `cd` to the directory where you cloned `df-analyze`
-   6. Run `pyenv local 3.12.5`
+   6. Run `pyenv local 3.13.11`
       - this creates a permanent file `.python-version` in the `df-analyze`
-        directory, and whenever you subseqeuntly open a new PowerShell and `cd`
+        directory, and whenever you subsequently open a new PowerShell and `cd`
         to this location, ensures that the correct python version is automatically
         used
    7. Restart PowerShell
    8. `cd` to the directory where you cloned `df-analyze`
-   9. Run `python --version` and confirm that the output is `Python 3.12.5`
+   9. Run `python --version` and confirm that the output is `Python 3.13.11`
 
 For all future uses of PowerShell, it should now be that case that if you are in the
 `df-analyze` directory, then the correct python version is used. You should always
@@ -102,16 +102,16 @@ check this before doing anything else by running:
 python --version
 ```
 
-first before doing anything. If for some reason the above does not return `Python 3.12.5`,
+first before doing anything. If for some reason the above does not return `Python 3.13.11`,
 you can manually activate the correct python version at any location by running
 
 ```powershell
-pyenv shell 3.12.5
+pyenv shell 3.13.11
 ```
 
 ## Virtual Environment Creation
 
-Make sure to `cd` to the `df-analye` directory, and that `python --version` returns `Python 3.12.5`.
+Make sure to `cd` to the `df-analyze` directory, and that `python --version` returns `Python 3.13.11`.
 Then, run the following command:
 
 ```powershell
@@ -122,7 +122,8 @@ This creates a virtual environment directory `.venv` in the `df-analyze`
 directory. Now, we need to activate this virtual environment (i.e. tell
 PowerShell to use the Python binary and libraries contained in the local
 `.venv` folder rather than the global python 3.12.5 installation files).
-In order to this, it is best to first set some permissions by running:
+Before activating it, allow locally created scripts for the current Windows
+user:
 
 ```powershell
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
@@ -177,7 +178,7 @@ python -m pip install --upgrade pip setuptools wheel --no-cache-dir
 Then run the following command:
 
 ```powershell
-python -m pip install cli-test-helpers joblib jsonpickle lightgbm xgboost pykan tabpfn llvmlite matplotlib numba numpy openpyxl optuna pandas pyarrow pytest "pytest-xdist[psutil]" python-dateutil scikit-image scikit-learn scipy seaborn statsmodels tabulate torch torchaudio torchvision tqdm typing_extensions skorch "transformers[torch]" accelerate "datasets[vision]" protobuf sentencepiece "pytorch_tabular"
+python -m pip install catboost cli-test-helpers joblib jsonpickle lightgbm xgboost pykan tabpfn llvmlite matplotlib numba numpy openpyxl optuna pandas pyarrow pytest "pytest-xdist[psutil]" python-dateutil scikit-image scikit-learn scipy seaborn statsmodels tabulate torch torchaudio torchvision tqdm typing_extensions skorch "transformers[torch]" accelerate "datasets[vision]" protobuf sentencepiece "pytorch_tabular"
 ```
 
 All necessary dependencies should now be installed. You can verify that the installation
@@ -195,25 +196,39 @@ Anytime you open PowerShell and navigate to the `df-analyze` directory, you will
 to [activate the virtual environment](#activating-the-virtual-environment) prior to
 running `df-analyze`. But you won't have to do any of the other install procedures again.
 
-### TabPFN model cache
+### TabPFN Authentication and Model Cache
 
-TabPFN downloads licensed checkpoints on first use. If the normal Windows
-application-data directory is restricted, set a persistent writable cache in
-the same PowerShell session:
+TabPFN downloads licensed model files the first time each selected checkpoint
+is used. First accept the corresponding license. Prior Labs recommends its
+browser login or an API key from its account page:
+
+```powershell
+$env:TABPFN_TOKEN = "<Prior Labs API key>"
+```
+
+If TabPFN instead reports a gated Hugging Face repository, accept that
+repository's terms and either run `hf auth login` or set a read-only Hugging
+Face token in the same terminal:
+
+```powershell
+$env:HF_TOKEN = "<Hugging Face read token>"
+```
+
+Do not store either token in the repository or commit it to a configuration
+file. See the current
+[Prior Labs model-access guide](https://docs.priorlabs.ai/how-to-access-gated-models)
+for browser, notebook, and offline setup.
+
+If your Windows application-data directory is read-only, or you downloaded the
+weights for offline use, choose a cache directory in the PowerShell terminal
+where you will run `df-analyze`:
 
 ```powershell
 $env:TABPFN_MODEL_CACHE_DIR = "$PWD\.df-analyze-runtime\tabpfn-model-cache"
 ```
 
-df-analyze probes this directory before TabPFN acquires its download lock. An
-explicit path that is not writable produces an immediate setup error instead
-of waiting indefinitely. If no path was explicitly configured and TabPFN's
-default cache is not writable, df-analyze automatically uses a writable
-temporary fallback and prints its location.
-
-
-
-
-
-
-
+Set this variable again in a new terminal, or add it to your Windows environment
+variables if you want to keep using the same directory. If the selected path is
+not writable, `df-analyze` reports an error before starting the download. When
+no path is set and TabPFN's default cache is not writable, `df-analyze` uses a
+temporary directory and prints its location.

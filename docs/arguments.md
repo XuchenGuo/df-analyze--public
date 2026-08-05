@@ -36,9 +36,11 @@ options:
   --df DF
                         The dataframe to analyze.
 
-                        Currently only tables saved as `.parquet`, `.xlsx`, `.json` or `.csv`, or
-                        NumPy `ndarray`s saved as "<filename>.npy" are supported, but a file exported
-                        by a Pandas `DataFrame.to_*` method is preferred.
+                        Tables may be saved as `.parquet`, `.xlsx`, `.json`, or `.csv`. Files exported
+                        with a Pandas `DataFrame.to_*` method are preferred. SVMlight text input is
+                        also supported. Auto mode recognizes common sparse-file suffixes. For other
+                        filenames, it reads a short prefix to detect SVMlight, including gzip, bzip2,
+                        and xz-compressed files.
 
                         If your data is saved as a Pandas `DataFrame`, it must have shape
                         `(n_samples, n_features)` or `(n_samples, n_features + 1)`. The name of the
@@ -58,9 +60,9 @@ options:
   --targets TARGETS
 
                         Comma-separated target columns for a multi-target classification or
-                        regression run. All targets in one run must use the same `--mode`.
-                        Rows missing any target are removed. This takes precedence over
-                        `--target`; single-target usage is unchanged.
+                        regression run. All targets in one run must use the same `--mode`: use
+                        `classify` for categorical targets or `regress` for numeric targets. Rows
+                        missing any target are removed. This takes precedence over `--target`.
 
   --grouper GROUPER [GROUPER ...]
 
@@ -117,28 +119,34 @@ options:
                         If "classify", do classification. If "regress", do regression.
 
   --device {auto,cpu,cuda}
-                        GPU policy. Auto is recommended: supported models use CUDA when
-                        available and beneficial, and a failed CUDA model task retries
-                        once on CPU. CPU disables GPU use. CUDA is strict for selected
-                        models with CUDA support; models without a CUDA backend still
-                        run normally on CPU. GANDALF may use MPS in auto mode.
+                        Choose how supported work uses a GPU. Auto is recommended: it uses CUDA for
+                        neural models and TabPFN when available, and applies workload thresholds to
+                        KNN, CatBoost, XGBoost, and pairwise error consistency. An auto task that
+                        encounters a CUDA runtime error is tried once more on the CPU. CPU disables
+                        GPU use. CUDA requires CUDA for selected work that supports it; CUDA errors
+                        stop the run, and CPU-only work remains on the CPU. GANDALF may use MPS in
+                        auto mode on a supported Mac.
 
   --device-install {auto,ask,never}
-                        Managed CUDA PyTorch setup policy. The default is never.
-                        Managed setup is available from a source checkout containing
-                        pyproject.toml and uv.lock.
+                        Choose whether df-analyze may create a separate CUDA-enabled PyTorch
+                        environment: auto, ask, or never (the default). Setup requires a source
+                        checkout containing pyproject.toml and uv.lock.
 
   --tabpfn-version {v3,v2.6,v2.5}
-                        TabPFN checkpoint version. The default is v3; v2.6 and v2.5
-                        select older supported checkpoints. The first run requires
-                        accepting the corresponding Prior Labs license and setting
-                        TABPFN_TOKEN in the same terminal.
+                        TabPFN checkpoint to use. The default is v3; v2.6 and v2.5 select older
+                        checkpoints. This option applies only when `tabpfn` is selected. Before the
+                        first run, accept the matching Prior Labs license and authenticate with the
+                        Prior Labs browser flow or TABPFN_TOKEN. If the installed package reports a
+                        gated Hugging Face repository, use `hf auth login` or HF_TOKEN after accepting
+                        that repository's terms. Check the current license before commercial or
+                        production use.
 
   --classifiers  [ ...]
 
                         The list of classifiers to use when comparing classification performance.
                         Registered tokens: [catboost dummy dtree et gandalf kan knn lgbm lr mlp rf
                         sgd svm tabpfn xgb]. The svm token is currently disabled by the CLI.
+                        Defaults: [dummy knn lgbm sgd lr].
 
                           catboost    CatBoost classifier.
 
@@ -150,7 +158,7 @@ options:
 
                           et          scikit-learn ExtraTreesClassifier.
 
-                          knn         scikit-learn KNeighborsClassifier.
+                          knn         KNN classifier (scikit-learn on CPU or PyTorch on CUDA).
 
                           lgbm        LightGBM boosted decision tree classifier.
 
@@ -176,6 +184,7 @@ options:
                         The list of regressors to use when comparing regression model performance.
                         Registered tokens: [catboost dummy dtree elastic et gandalf kan knn lgbm mlp
                         rf sgd svm tabpfn xgb]. The svm token is currently disabled by the CLI.
+                        Defaults: [dummy knn lgbm sgd elastic].
 
                           catboost    CatBoost regressor.
 
@@ -187,7 +196,7 @@ options:
 
                           et          scikit-learn ExtraTreesRegressor.
 
-                          knn         scikit-learn KNeighborsRegressor.
+                          knn         KNN regressor (scikit-learn on CPU or PyTorch on CUDA).
 
                           lgbm        LightGBM boosted decision tree regressor.
 
@@ -216,7 +225,7 @@ options:
                                       target variables.
 
                           embed       Select features using a model with implicit feature selection,
-                                      e.g. an L1-regularized model or decision tree. For avaialable
+                                      e.g. an L1-regularized model or decision tree. For available
                                       models, see `--embed-select`.
 
                           wrap        Select features by recursive model evaluation, currently either
@@ -236,9 +245,9 @@ options:
 
   --feat-downsample {none,auto,random,variance,normalized-variance,f-test,mutual-info,linear,lgbm,svd,sparse-rp,rank-ensemble,selector-ensemble,stable-rank}
 
-                        Reduce a wide matrix before the usual feature-selection and tuning
-                        stages. Supervised methods use a screening subset disjoint from the
-                        rows used for model tuning. The default is none.
+                        Reduce a wide matrix before the usual feature-selection and tuning stages.
+                        Supervised methods use separate rows for feature ranking and model tuning.
+                        The default is none.
 
   --n-feat-downsample N_FEAT_DOWNSAMPLE
 
@@ -258,11 +267,13 @@ options:
 
   --downsample-screening-fraction DOWNSAMPLE_SCREENING_FRACTION
 
-                        Fraction of training rows used only for supervised downsampling.
+                        Fraction of each training fold used to rank features. The remaining training
+                        rows are used for model tuning, so the same rows are not used for both steps.
 
   --large-feature-mode
 
-                        Split and downsample a numeric table before normal preparation.
+                        Downsample a numeric table that fits in memory but is too wide for normal
+                        preparation.
 
   --assume-numeric-features
 
@@ -275,8 +286,8 @@ options:
 
   --input-format {auto,table,svmlight}
 
-                        Input format; auto recognizes common SVMlight suffixes and bounded
-                        content signatures for files with nonstandard names.
+                        Input format. Auto recognizes common SVMlight suffixes and checks the
+                        start of files with other names.
 
   --svmlight-index-base {auto,zero,one}
 
@@ -289,8 +300,8 @@ options:
 
   --svmlight-feature-map SVMLIGHT_FEATURE_MAP
 
-                        CSV, TSV, JSON, or Parquet map with feature_index and feature_name
-                        columns and an optional protected column.
+                        CSV, TSV, JSON, or Parquet file with feature_index and feature_name
+                        columns, plus an optional protected column.
 
   --svmlight-sample-id-column SVMLIGHT_SAMPLE_ID_COLUMN
 
@@ -299,18 +310,18 @@ options:
 
   --downsample-protected-features DOWNSAMPLE_PROTECTED_FEATURES [DOWNSAMPLE_PROTECTED_FEATURES ...]
 
-                        Source feature names that must survive large-table or SVMlight
-                        downsampling and count toward --n-feat-downsample.
+                        Source feature names that are always kept during large-table or
+                        SVMlight downsampling. They count toward --n-feat-downsample.
 
   --mt-agg-strategy {borda,freq}
 
-                        How to combine per-target feature-selection results. Borda combines
-                        ranks; freq emphasizes features selected for several targets.
+                        How to combine feature selection across targets. Borda combines the
+                        per-target ranks; freq favors features selected for more targets.
 
   --mt-top-k MT_TOP_K
 
                         Keep only the top K features after multi-target aggregation. When
-                        omitted, all features that pass the aggregation criteria are retained.
+                        omitted, every feature selected for at least one target is retained.
 
   --embed-select  [ ...]
 
@@ -513,7 +524,7 @@ options:
                                       https://scikit-learn.org/stable/modules/generated/
                                       sklearn.feature_selection.mutual_info_classif.html
 
-                          H           Kruskal-Wallace H. Extension of Mann-Whitney U test to multiple
+                          H           Kruskal-Wallis H. Extension of Mann-Whitney U test to multiple
                                       groups, i.e. tests whether one group has a significantly more
                                       extreme median than the rest.
 
@@ -548,7 +559,7 @@ options:
                                       https://scikit-learn.org/stable/modules/generated/
                                       sklearn.feature_selection.mutual_info_regression.html
 
-                          H           Kruskal-Wallace H. Extension of Mann-Whitney U test to multiple
+                          H           Kruskal-Wallis H. Extension of Mann-Whitney U test to multiple
                                       groups, i.e. tests whether one group has a significantly more
                                       extreme median than the rest.
 
@@ -601,7 +612,7 @@ options:
                         During each iteration of redundant wrapper selection, while some features may
                         have nearly identical scores to the best score, some of these features may
                         nevertheless contain very different information. Feature selection is done on
-                        the one-hot encoded cateogoricals and normalized continuous features. This
+                        the one-hot encoded categoricals and normalized continuous features. This
                         means correlation (e.g. Pearson) gives us a rough measure of association
                         between all selectable features. A more "cautious" redundant approach will
                         only lump in features as equivalent if they are also strongly correlated with
@@ -704,12 +715,12 @@ options:
                         training folds change, but every fitted model predicts the same
                         external holdout. Do not use a final-test holdout to select a model.
   --ec-profile {none,classification-paper,regression-paper}
-                        Use settings from an EC reference experiment.
+                        Use the settings from an EC reference experiment.
                         classification-paper uses an 80/20 holdout, 5 folds, 10
                         repetitions, and fixed model seeds. regression-paper uses an 80/20
                         holdout, 5 folds, 50 repetitions, fixed model seeds, and the seven
-                        reference methods. Explicit CLI or spreadsheet values override
-                        the matching profile setting. Profiles do not reproduce the
+                        reference methods. A CLI or spreadsheet value overrides the
+                        corresponding profile value. Profiles do not reproduce the
                         original datasets, preprocessing, models, or result tables.
   --ec-folds EC_FOLDS
                         Number of folds in each error-consistency repetition.
@@ -717,9 +728,9 @@ options:
                         Number of shuffled K-fold repetitions. Each configuration is
                         fitted --ec-folds * --ec-repetitions times. The default is 5.
   --ec-model-seed-mode {vary,fixed}
-                        Choose whether the fitted-model seed changes across folds. vary
-                        (the default) measures changes from both training rows and model
-                        randomness. fixed reuses the base seed for every fit.
+                        Choose whether the model seed changes across folds. vary (the
+                        default) includes changes from both training rows and model
+                        randomness. fixed uses the same seed for every fit.
   --ec-methods EC_METHODS [EC_METHODS ...]
                         Regression EC methods to calculate. The default is all seven
                         methods: ratio, ratio_diff, ratio_sign,
@@ -728,13 +739,14 @@ options:
                         ratio_diff_sign_reference is an optional signed compatibility
                         method and is not ranked.
   --ec-holdout-role {test,validation}
-                        Describe how the shared holdout is used. test (the default)
-                        calculates EC but disables model ranking and EC/performance
-                        correlations. validation enables those outputs for a separate
-                        validation or audit holdout. This option does not change the split.
+                        Tell df-analyze how the shared holdout is being used. test (the
+                        default) calculates EC but disables model ranking and
+                        EC/performance correlations. validation enables those outputs for
+                        a separate validation or audit set. This option labels the existing
+                        split; it does not create a new one.
   --ec-output-detail {summary,pairwise,full}
                         Choose how much EC output to keep. summary writes the main tables
-                        and audit files; pairwise adds model-pair tables and plots; full
+                        and run details; pairwise adds model-pair tables and plots; full
                         adds sample-level diagnostics. --ec-save-predictions adds
                         prediction and residual/error matrices at any level. The default
                         is full.
@@ -761,17 +773,72 @@ options:
                         adaptive-error/EC report. The default is 0.5; it is not a
                         universal cutoff.
 
+  --adaptive-error
+                        Estimate the chance that each holdout prediction is wrong from
+                        out-of-fold training confidence.
+  --aer-oof-folds AER_OOF_FOLDS
+                        Number of training folds used to learn the confidence-to-error
+                        mapping.
+  --aer-bins AER_BINS
+                        Number of confidence bins used to learn the error mapping.
+  --aer-target-error AER_TARGET_ERROR
+                        Target error rate used when reporting risk-controlled coverage.
+  --aer-alpha AER_ALPHA
+                        Significance level for the one-sided Clopper-Pearson error bounds,
+                        after adjusting for the thresholds that were checked.
+  --aer-min-bin-count AER_MIN_BIN_COUNT
+                        Minimum number of training predictions in an adaptive-error bin.
+  --aer-prior-strength AER_PRIOR_STRENGTH
+                        How strongly small bins are pulled toward the overall error rate.
+  --no-aer-smooth
+                        Disable smoothing of adaptive-error bin estimates.
+  --aer-monotonic
+                        Require estimated error to move monotonically with confidence.
+  --aer-adaptive-binning
+                        Use quantile-based confidence bins instead of fixed-width bins.
+  --aer-confidence-metric AER_CONFIDENCE_METRIC
+                        Confidence measure used for the error mapping. Use auto to compare
+                        the measures available for each model.
+  --aer-nmin AER_NMIN
+                        Minimum number of accepted holdout rows required for a reported
+                        risk threshold.
+  --aer-top-k AER_TOP_K
+                        Analyze only the top K tuned models. The default, 0, analyzes all
+                        usable models.
+  --aer-ensemble
+                        Compare supported combinations of the analyzed models.
+  --aer-ensemble-strategies AER_ENSEMBLE_STRATEGIES [AER_ENSEMBLE_STRATEGIES ...]
+                        Ensemble strategies to run. Leave unset to use every supported
+                        strategy.
+  --aer-ens-top-n AER_ENS_TOP_N
+                        Number of leading models available to top-N ensemble strategies.
+  --aer-ens-beta AER_ENS_BETA
+                        Beta value used to weight model confidence in adaptive-error
+                        ensembles.
+  --aer-ens-tau0 AER_ENS_TAU0
+                        Base confidence threshold for adaptive-error ensembles.
+  --aer-ens-lambda AER_ENS_LAMBDA
+                        Mixing weight used by regularized adaptive-error ensembles.
+  --aer-ens-alpha AER_ENS_ALPHA
+                        Exponent applied to model support in adaptive-error ensemble
+                        scores.
+  --aer-ens-trim-q AER_ENS_TRIM_Q
+                        Confidence quantile below which ensemble members are omitted.
+  --aer-ens-tau-low AER_ENS_TAU_LOW
+                        Lower confidence cutoff for adaptive-error ensembles.
+  --aer-ens-tau-high AER_ENS_TAU_HIGH
+                        Upper confidence cutoff for adaptive-error ensembles.
+
   --outdir OUTDIR
-                        Specifies location of all results, as well as cache files for slow
-                        computations (e.g. stepwise feature selection). If unspecified, will attempt
-                        to default to a number of common locations (/Users/derekberger, the
-                        current working directory /Users/derekberger/Documents/Antigonish/df-analyze, or a temporary directory).
+                        Location for results and cached computations. If omitted, df-analyze
+                        tries the user directory, current directory, and finally a temporary
+                        directory.
 
   --no-preds
                         Do not compute univariate predictions, and thus do not filter features based
                         on univariate predictive utility. Useful for datasets with over 1 million
                         samples and a large (e.g. 30+) number of features, where even scikit-learn
-                        SGDClassifer and SGDRegressor are often too slow / expensive.
+                        SGDClassifier and SGDRegressor are often too slow / expensive.
   --verbosity VERBOSITY
 
                         Controls amount of output to stdout and stderr. Options:
@@ -788,7 +855,7 @@ options:
                         If this flag is present, just print the df-analyze version and exit.
 
 
-USAGE EXAMPLE (assumes you have run `poetry shell`):
+USAGE EXAMPLE (run from the repository root with the environment activated):
 
     python df-analyze.py \
         --df weather_data.json \
@@ -805,7 +872,7 @@ USAGE EXAMPLE (assumes you have run `poetry shell`):
         --norm robust \
         --nan median \
         --n-feat-filter 10 \
-        --n-feat-wrappper 10 \
+        --n-feat-wrapper 10 \
         --test-val-size=0.25 \
         --outdir='./results'
 ```

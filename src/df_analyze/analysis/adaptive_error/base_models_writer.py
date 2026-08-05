@@ -14,8 +14,10 @@ from df_analyze.analysis.adaptive_error.plots import (
     expected_calibration_error,
 )
 from df_analyze.analysis.adaptive_error.report import (
+    _write_csv,
     _write_not_available_csv,
     _write_not_available_json,
+    _write_text,
 )
 
 
@@ -74,7 +76,7 @@ def _write_test_error_metrics(
         )
         ece_error_test = None
     else:
-        rel_df.to_csv(rel_csv_path, index=False)
+        _write_csv(rel_df, rel_csv_path, index=False)
         ece = expected_calibration_error(rel_df)
         ece_error_test = float(ece) if np.isfinite(ece) else None
 
@@ -90,9 +92,6 @@ def _write_test_error_metrics(
         "brier_error_test": brier_error_test,
         "ece_error_test": ece_error_test,
     }
-    metrics_path.write_text(
-        json.dumps(metrics_payload, indent=2),
-        encoding="utf-8",
-    )
+    _write_text(metrics_path, json.dumps(metrics_payload, indent=2))
 
     return global_error_test, brier_error_test, ece_error_test

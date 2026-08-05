@@ -29,7 +29,7 @@ CLEAN_JSON = DATAFILE.parent / "mcic_clean.json"
 UNCORRELATED = DATADIR / "mcic_uncorrelated_cols.json"
 
 # Legacy model-name lists retained for callers that import these constants.
-# The enum choices in df_analyze.enumerables are authoritative for the current CLI.
+# The current CLI choices come from the enums in df_analyze.enumerables.
 CLASSIFIERS = ["rf", "svm", "dtree", "mlp", "bag", "dummy", "lgb"]
 REGRESSORS = ["linear", "rf", "svm", "adaboost", "gboost", "mlp", "knn", "lgb"]
 

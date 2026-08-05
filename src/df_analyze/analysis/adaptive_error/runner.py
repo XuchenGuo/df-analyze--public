@@ -25,6 +25,7 @@ from df_analyze.analysis.adaptive_error.report import (
     write_cross_model_summaries,
     write_run_config,
 )
+from df_analyze.saving import windows_io_path
 
 if TYPE_CHECKING:
     from df_analyze.cli.cli import ProgramOptions
@@ -79,12 +80,12 @@ def run_adaptive_error_analysis(
             warn("No output root directory available; skipping adaptive error analysis.")
             return
         base_dir = Path(root_dir) / "results" / "adaptive_error"
-    base_dir.mkdir(parents=True, exist_ok=True)
+    windows_io_path(base_dir).mkdir(parents=True, exist_ok=True)
     plots_dir = base_dir / "plots"
     tables_dir = base_dir / "tables"
     preds_dir = base_dir / "predictions"
     for d in (plots_dir, tables_dir, preds_dir):
-        d.mkdir(parents=True, exist_ok=True)
+        windows_io_path(d).mkdir(parents=True, exist_ok=True)
 
     # the global `--no-preds` flag
     no_preds = bool(no_preds) or bool(getattr(options, "no_preds", False))

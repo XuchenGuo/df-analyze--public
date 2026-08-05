@@ -586,6 +586,8 @@ def _run_one_result_attempt(
 
     output_detail = str(getattr(options, "ec_output_detail", "full")).lower()
     detail_dir = detail_output_dir(base_dir, identity)
+    # EC measures refit instability for one selected configuration. Retuning
+    # inside every fold would mix search variation into that quantity.
     tuned_args = getattr(result.model, "tuned_args", None) or result.params
     fingerprint, fingerprint_payload = configuration_fingerprint(
         identity=identity,
@@ -1200,6 +1202,11 @@ def run_error_consistency_analysis(
     base_dir: Optional[Path] = None,
     write_root: bool = True,
 ) -> ErrorConsistencyResult:
+    """Compare K x R fixed-configuration refits on one shared holdout.
+
+    The shared holdout makes model errors directly comparable. Random state is
+    restored afterward so enabling EC does not change later pipeline results.
+    """
     results = getattr(eval_results, "results", [])
     torch_components = [
         getattr(result.model_cls, "runtime_component", RuntimeComponent.Sklearn)

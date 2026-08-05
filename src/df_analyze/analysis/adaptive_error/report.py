@@ -15,9 +15,26 @@ from df_analyze.analysis.adaptive_error.plots import (
     plot_compare_confidence_vs_error,
     plot_placeholder,
 )
+from df_analyze.saving import windows_io_path
+
+
+def _write_text(path: Path, text: str) -> None:
+    windows_io_path(path.parent).mkdir(parents=True, exist_ok=True)
+    windows_io_path(path).write_text(text, encoding="utf-8")
+
+
+def _write_csv(df: pd.DataFrame, path: Path, **kwargs: Any) -> None:
+    windows_io_path(path.parent).mkdir(parents=True, exist_ok=True)
+    df.to_csv(windows_io_path(path), **kwargs)
+
+
+def _write_parquet(df: pd.DataFrame, path: Path, **kwargs: Any) -> None:
+    windows_io_path(path.parent).mkdir(parents=True, exist_ok=True)
+    df.to_parquet(windows_io_path(path), **kwargs)
+
 
 def _write_markdown(path: Path, lines: list[str]) -> None:
-    path.write_text("\n".join(lines), encoding="utf-8")
+    _write_text(path, "\n".join(lines))
 
 
 def _df_to_markdown(df: pd.DataFrame, **kwargs: Any) -> str:
@@ -26,7 +43,7 @@ def _df_to_markdown(df: pd.DataFrame, **kwargs: Any) -> str:
 
 
 def _write_sanity_checks(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _write_text(path, json.dumps(payload, indent=2))
 
 
 def _write_not_available_json(
@@ -36,12 +53,10 @@ def _write_not_available_json(
     payload["available"] = False
     payload["status"] = "NOT_AVAILABLE"
     payload["reason"] = str(reason)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _write_text(path, json.dumps(payload, indent=2))
 
 
 def _write_not_available_csv(path: Path, reason: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(
         [
             {
@@ -51,11 +66,10 @@ def _write_not_available_csv(path: Path, reason: str) -> None:
             }
         ]
     )
-    df.to_csv(path, index=False)
+    _write_csv(df, path, index=False)
 
 
 def _write_not_available_parquet(path: Path, reason: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(
         [
             {
@@ -65,11 +79,10 @@ def _write_not_available_parquet(path: Path, reason: str) -> None:
             }
         ]
     )
-    df.to_parquet(path, index=False)
+    _write_parquet(df, path, index=False)
 
 
 def _write_not_available_md(path: Path, title: str, reason: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
         f"# {title}",
         "",
@@ -77,13 +90,13 @@ def _write_not_available_md(path: Path, title: str, reason: str) -> None:
         "",
         f"Reason: {reason}",
     ]
-    path.write_text("\n".join(lines), encoding="utf-8")
+    _write_text(path, "\n".join(lines))
 
 
 def _write_not_available_png(path: Path, title: str, reason: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    windows_io_path(path.parent).mkdir(parents=True, exist_ok=True)
     message = str(reason).strip() or "Not available"
-    plot_placeholder(path, title=title, message=message)
+    plot_placeholder(windows_io_path(path), title=title, message=message)
 
 
 def _display_label(slug: str) -> str:
@@ -346,7 +359,11 @@ def write_cross_model_summaries(
     model_rows: list[dict[str, Any]],
     no_preds: bool,
 ) -> None:
-    pd.DataFrame(model_rows).to_csv(tables_dir / "models_ranked.csv", index=False)
+    _write_csv(
+        pd.DataFrame(model_rows),
+        tables_dir / "models_ranked.csv",
+        index=False,
+    )
 
     test_multi = base_test.copy()
     for slug in slugs:
@@ -375,10 +392,16 @@ def write_cross_model_summaries(
         )
         _write_not_available_csv(preds_dir / "test_per_sample_multi_model.csv", reason)
     else:
-        test_multi.to_parquet(
-            preds_dir / "test_per_sample_multi_model.parquet", index=False
+        _write_parquet(
+            test_multi,
+            preds_dir / "test_per_sample_multi_model.parquet",
+            index=False,
         )
-        test_multi.to_csv(preds_dir / "test_per_sample_multi_model.csv", index=False)
+        _write_csv(
+            test_multi,
+            preds_dir / "test_per_sample_multi_model.csv",
+            index=False,
+        )
 
     compare_bins_for_plot: dict[str, pd.DataFrame] = {}
     for slug in slugs:
@@ -394,8 +417,10 @@ def write_cross_model_summaries(
         title="Confidence vs adaptive expected error rate",
     )
 
-    pd.DataFrame(compare_metrics).to_csv(
-        tables_dir / "aer_metrics_by_model.csv", index=False
+    _write_csv(
+        pd.DataFrame(compare_metrics),
+        tables_dir / "aer_metrics_by_model.csv",
+        index=False,
     )
 
 
@@ -447,6 +472,4 @@ def write_run_config(
         "ensemble_strategy_params": strategy_params,
         "models": model_run_info,
     }
-    (base_dir / "run_config.json").write_text(
-        json.dumps(run_config, indent=2), encoding="utf-8"
-    )
+    _write_text(base_dir / "run_config.json", json.dumps(run_config, indent=2))

@@ -25,6 +25,7 @@ from df_analyze.analysis.error_consistency.provenance import (
     EC_METHOD_IMPLEMENTATION_VERSION,
     canonical_fingerprint,
 )
+from df_analyze.saving import windows_io_path
 
 CHECKPOINT_SCHEMA_VERSION = "1.0"
 
@@ -80,31 +81,35 @@ def checkpoint_directory(detail_dir: Path) -> Path:
 
 
 def _atomic_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    windows_io_path(path.parent).mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(text, encoding="utf-8")
-    temporary.replace(path)
+    temporary_io = windows_io_path(temporary)
+    temporary_io.write_text(text, encoding="utf-8")
+    temporary_io.replace(windows_io_path(path))
 
 
 def _atomic_frame(path: Path, frame: DataFrame) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    windows_io_path(path.parent).mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
-    frame.to_csv(temporary, index=False, chunksize=50_000)
-    temporary.replace(path)
+    temporary_io = windows_io_path(temporary)
+    frame.to_csv(temporary_io, index=False, chunksize=50_000)
+    temporary_io.replace(windows_io_path(path))
 
 
 def _atomic_array(path: Path, values: ndarray) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    windows_io_path(path.parent).mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
-    DataFrame(values).to_parquet(temporary, index=False)
-    temporary.replace(path)
+    temporary_io = windows_io_path(temporary)
+    DataFrame(values).to_parquet(temporary_io, index=False)
+    temporary_io.replace(windows_io_path(path))
 
 
 def _read_frame(path: Path) -> DataFrame:
-    if not path.is_file():
+    path_io = windows_io_path(path)
+    if not path_io.is_file():
         return DataFrame()
     try:
-        return pd.read_csv(path)
+        return pd.read_csv(path_io)
     except EmptyDataError:
         return DataFrame()
 
@@ -159,7 +164,7 @@ def configuration_fingerprint(
 
 
 def read_checkpoint_state(detail_dir: Path) -> dict[str, Any] | None:
-    state_path = checkpoint_directory(detail_dir) / "state.json"
+    state_path = windows_io_path(checkpoint_directory(detail_dir) / "state.json")
     if not state_path.is_file():
         return None
     try:
@@ -209,9 +214,10 @@ def load_partial_checkpoint(
     if state.get("status") not in {"partial", "complete"}:
         return None
     prediction_path = directory / "predictions.parquet"
-    if not prediction_path.is_file():
+    prediction_io = windows_io_path(prediction_path)
+    if not prediction_io.is_file():
         return None
-    predictions = pd.read_parquet(prediction_path).to_numpy()
+    predictions = pd.read_parquet(prediction_io).to_numpy()
     return ECPartialCheckpoint(
         completed_repetitions=int(state.get("completed_repetitions", 0)),
         predictions=predictions,
@@ -241,9 +247,8 @@ def mark_checkpoint_complete(
         checkpoint_directory(detail_dir) / "state.json",
         json.dumps(state, indent=2) + "\n",
     )
-    # Final configuration files now contain everything needed to reuse a
-    # complete result. Remove duplicated partial payloads, especially the raw
-    # prediction matrix, while retaining the small completion state.
+    # The final configuration file contains the complete reusable result.
+    # Remove duplicate partial data but keep the small completion record.
     directory = checkpoint_directory(detail_dir)
     for name in (
         "predictions.parquet",
@@ -252,7 +257,7 @@ def mark_checkpoint_complete(
         "trial_scores.csv",
         "trial_failures.csv",
     ):
-        (directory / name).unlink(missing_ok=True)
+        windows_io_path(directory / name).unlink(missing_ok=True)
 
 
 def load_completed_result(
@@ -276,10 +281,12 @@ def load_completed_result(
         "trial_failures.csv",
         "metadata.json",
     ]
-    if any(not (detail_dir / name).is_file() for name in required):
+    if any(not windows_io_path(detail_dir / name).is_file() for name in required):
         return None
     try:
-        metadata = json.loads((detail_dir / "metadata.json").read_text(encoding="utf-8"))
+        metadata = json.loads(
+            windows_io_path(detail_dir / "metadata.json").read_text(encoding="utf-8")
+        )
     except (OSError, ValueError, TypeError):
         return None
     metadata["resumed_from_complete_checkpoint"] = True

@@ -109,9 +109,8 @@ def embed_select_features(
                 y_train=y,
                 g_train=g,
                 metric=metric,
-                # Preserve the public-branch embedded-selection budget. The
-                # general --htune-trials option controls final model tuning,
-                # not this separate feature-selection search.
+                # Embedded selection has its own fixed search budget;
+                # --htune-trials controls only final model tuning.
                 n_trials=100,
                 n_jobs=-1,
             )

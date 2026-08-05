@@ -420,8 +420,8 @@ class ProgramDirs(Debug):
                     .reset_index(drop=True)
                 )
             else:
-                # MAE columns retain each target's original units. Their row-wise
-                # arithmetic mean is not a meaningful cross-target ranking.
+                # MAE remains in each target's units, so do not average it
+                # across targets for ranking.
                 wide = wide.sort_values(idx_cols).reset_index(drop=True)
         return wide
 

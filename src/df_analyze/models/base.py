@@ -236,7 +236,7 @@ class ScaledMultiTargetRegressor:
         )
 
     def __getattr__(self, name: str) -> Any:
-        # Preserve access to estimator attributes such as feature_importances_.
+        # Forward attributes such as feature_importances_ to the estimator.
         estimator = self.__dict__.get("estimator")
         if estimator is None:
             raise AttributeError(name)
@@ -773,7 +773,6 @@ class DfAnalyzeModel(ABC):
                     else:
                         score = float(metric.tuning_score(y_test, preds))
                     scores.append(score)
-                    # allows pruning
                     # Reporting each intermediate fold score makes that pruning
                     # decision reflect progress across the completed folds.
                     trial.report(float(np.mean(scores)), step=step)

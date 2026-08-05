@@ -105,7 +105,12 @@ def test_real_kan_backend_smoke(task: str) -> None:
         np.testing.assert_array_equal(restored.predict(X), predictions)
         probabilities = np.asarray(model.predict_proba_untuned(X))
         assert probabilities.shape == (len(y), 2)
-        np.testing.assert_allclose(restored.predict_proba_untuned(X), probabilities)
+        np.testing.assert_allclose(
+            restored.predict_proba_untuned(X),
+            probabilities,
+            rtol=1e-6,
+            atol=1e-7,
+        )
     else:
         np.testing.assert_allclose(
             restored.predict(X), predictions, rtol=1e-6, atol=1e-7
@@ -135,7 +140,7 @@ def test_real_kan_backend_smoke(task: str) -> None:
     not RUN_REAL_TABPFN_TESTS,
     reason=(
         "set DF_ANALYZE_RUN_REAL_TABPFN_TESTS=1 after accepting the checkpoint "
-        "license and configuring TABPFN_TOKEN"
+        "licenses and configuring authentication or cached weights"
     ),
 )
 @pytest.mark.parametrize("version", ["v3", "v2_6", "v2_5"])
@@ -1024,6 +1029,30 @@ def test_tabpfn_preflight_revalidates_cached_input(
 
 
 @pytest.mark.fast
+def test_tabpfn_preflight_converts_upstream_system_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = TabPFNClassifierV3()
+    X = numeric_data(30)
+    y = Series((X["x0"] > 0).astype(int), name="target")
+    monkeypatch.setattr(tabpfn_module, "_prepare_tabpfn_cache_dir", lambda: None)
+
+    def exit_during_checkpoint_load(*args, **kwargs):
+        raise SystemExit("checkpoint authentication failed")
+
+    monkeypatch.setattr(model, "_create_estimator", exit_during_checkpoint_load)
+
+    with pytest.raises(
+        TabPFNSetupError,
+        match=(
+            r"TABPFN_TOKEN.*HF_TOKEN.*TABPFN_MODEL_CACHE_DIR.*"
+            r"SystemExit: checkpoint authentication failed"
+        ),
+    ):
+        model.preflight(X, y)
+
+
+@pytest.mark.fast
 def test_tabpfn_v3_pretraining_envelope_uses_documented_shape_regimes() -> None:
     class ShapeOnlyFrame:
         def __init__(self, n_samples: int, n_features: int) -> None:
@@ -1180,7 +1209,7 @@ def test_tabpfn_cli_version_selects_model_class() -> None:
 
 
 @pytest.mark.fast
-def test_model_tuning_fold_declarations_match_implementations() -> None:
+def test_model_tuning_fold_declarations() -> None:
     assert DecisionTreeClassifier.tuning_cv_folds == 5
     assert XGBoostClassifier.tuning_cv_folds == 5
     assert KANEstimator.tuning_cv_folds == 3

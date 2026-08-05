@@ -1,12 +1,14 @@
 #!/bin/bash
 
+set -euo pipefail
+
 # Only intended for use on MacOS and/or Linux local install
 TESTS=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT="$(dirname "$TESTS")"
 echo "$ROOT"
 cd "$ROOT" || exit 1
 
-if [[ -z "${CC_CLUSTER}" ]]; then
+if [[ -z "${CC_CLUSTER:-}" ]]; then
     echo "On local machine, will use virtual environment for testing"
     VENV="$ROOT/.venv"
     PYTEST="$VENV/bin/pytest"
@@ -26,7 +28,7 @@ echo "==========================================================================
 echo "Testing basic data inspection, cleaning, preparation, and associational stats"
 echo "================================================================================="
 "$PYTEST" \
-    -m 'not regen' -m 'cached' -m 'fast' -x \
+    -m 'not regen and fast' -x \
     test/test_inspection.py \
     test/test_prepare.py \
     test/test_splitting.py \
@@ -50,6 +52,21 @@ echo "==========================================================================
     test/test_error_consistency.py \
     test/test_error_consistency_cli_e2e.py \
     -x || { echo "Error-consistency testing failed."; exit 1; }
+
+echo "================================================================================="
+echo "Testing added models, devices, downsampling, multi-target, and runtime setup"
+echo "================================================================================="
+"$PYTEST" \
+    test/test_added_models.py \
+    test/test_device.py \
+    test/test_downsampling.py \
+    test/test_lgbm_defaults.py \
+    test/test_multitarget.py \
+    test/test_preprocessing_fit_scope.py \
+    test/test_real_gpu_integrations.py \
+    test/test_runtime_install.py \
+    test/test_sparse_downsampling.py \
+    -x || { echo "New feature testing failed."; exit 1; }
 
 echo "================================================================================="
 echo "Testing test dataset IO"

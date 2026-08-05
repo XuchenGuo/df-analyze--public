@@ -776,7 +776,7 @@ def _snapshot_accelerator_model(
     result: HtuneResult,
     component: RuntimeComponent,
 ) -> bool:
-    """Preserve a reloadable fitted model before releasing accelerator state."""
+    """Save a reloadable fitted model before releasing accelerator state."""
     runtime = getattr(result.model, "runtime", None)
     if runtime is None:
         return False

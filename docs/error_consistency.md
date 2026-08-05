@@ -9,7 +9,7 @@ have the same accuracy or MAE and still have very different EC.
 
 ## How df-analyze runs EC
 
-df-analyze runs EC after preprocessing, feature selection, and hyperparameter
+`df-analyze` runs EC after preprocessing, feature selection, and hyperparameter
 tuning:
 
 1. It keeps the selected features and tuned parameters fixed.
@@ -99,7 +99,7 @@ are `0`, `1`, `nan`, `drop`, and `error`.
 
 ## Regression EC
 
-For a holdout sample `s`, df-analyze defines a residual as:
+For a holdout sample `s`, `df-analyze` defines a residual as:
 
 ```text
 r_i(s) = prediction_i(s) - true_value(s)
@@ -130,7 +130,7 @@ ratio-difference and distance values are 0.
 ### Compatibility note for ratio-diff-sign
 
 The reference implementation signs the ratio difference before averaging.
-Positive and negative values can therefore cancel. df-analyze provides two
+Positive and negative values can therefore cancel. `df-analyze` provides two
 explicit choices:
 
 - `ratio_diff_sign_magnitude` is the default. Its main score uses the unsigned
@@ -178,7 +178,7 @@ model randomness. `fixed` keeps the model seed the same, which focuses the
 comparison on changes in the training rows as far as the estimator and hardware
 allow.
 
-EC uses the external holdout already created by df-analyze. It does not make an
+EC uses the external holdout already created by `df-analyze`. It does not make an
 extra split. Set `--test-val-size 0.2` for an 80/20 train/holdout split.
 
 `--ec-holdout-role test` is the safe default. It calculates EC but leaves
@@ -226,19 +226,20 @@ checking a new dataset. Increasing `--ec-repetitions` improves the stability of
 the descriptive estimate, but it increases refit time in direct proportion.
 
 `--ec-output-detail summary` reduces memory use and output size; it does not
-reduce refit time. CUDA may speed up a large pairwise EC calculation, but it
-does not remove the cost of fitting the models. Small EC calculations stay on
-NumPy because moving data to a GPU can be slower than calculating them on the
-CPU.
+reduce refit time. The pairwise EC calculation can use CUDA when its workload
+reaches the internal threshold. Larger comparison matrices are more likely to
+benefit; smaller calculations remain on NumPy because transfer overhead may
+leave little improvement. Model refits follow each model's own device support,
+so CPU-only models still run on the CPU.
 
 Each configuration has a `.ec_checkpoint` directory. With `--ec-resume`,
-df-analyze continues from the last saved repetition when the data and EC
+`df-analyze` continues from the last saved repetition when the data and EC
 settings match. It refuses to reuse a checkpoint when the prepared data,
 methods, folds, repetitions, seeds, formula version, or output detail differ.
 
 ## Reading the results
 
-df-analyze creates a dataset/run folder below the selected output directory.
+`df-analyze` creates a dataset/run folder below the selected output directory.
 EC files are stored in `results/error_consistency` inside that run folder.
 Start with:
 

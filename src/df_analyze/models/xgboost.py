@@ -129,9 +129,8 @@ class XGBoostEstimator(DfAnalyzeModel):
         model_state = state.pop("_serialized_model", None)
         tuned_model_state = state.pop("_serialized_tuned_model", None)
         self.__dict__.update(state)
-        # A saved model is a portable artifact, not a continuation of the CLI
-        # request that trained it. Restore on CPU; callers may explicitly assign
-        # a new runtime before starting new work.
+        # Load saved models on CPU. Callers can choose another device before
+        # fitting or predicting again.
         self.runtime = get_runtime("cpu")
         self.model = self._restore_models(model_state)
         self.tuned_model = self._restore_models(tuned_model_state)

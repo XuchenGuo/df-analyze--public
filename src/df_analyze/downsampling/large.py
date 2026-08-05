@@ -141,9 +141,8 @@ def large_table_prepared_splits(
     if options.grouper is not None:
         if options.grouper not in frame.columns:
             raise KeyError(f"Grouping column not found: {options.grouper}")
-        # Never call DataFrame.map over the complete ultra-wide table.  Only
-        # normalize the metadata column needed before group-aware splitting;
-        # target cleaning is likewise column-first in usable_training_indices.
+        # Mapping the full table would copy every feature. Normalize only the
+        # grouping column needed for the split.
         cleaned_groups = unify_nans(frame[[options.grouper]].copy())
         frame = frame.copy(deep=False)
         frame[options.grouper] = cleaned_groups[options.grouper].to_numpy()

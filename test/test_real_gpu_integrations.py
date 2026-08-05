@@ -122,6 +122,13 @@ def test_real_cuda_boosted_tree_trains_and_predicts(
 
     model.fit(X, y)
 
+    if component is RuntimeComponent.CatBoost:
+        assert str(model.model.get_param("task_type")).upper() == "GPU"
+    else:
+        estimator = getattr(model.model, "estimator", model.model)
+        config = estimator.get_booster().save_config().replace(" ", "").lower()
+        assert '"device":"cuda' in config
+
     predictions = np.asarray(model.predict(X))
     assert predictions.shape == (len(y),)
     assert np.isfinite(predictions).all()

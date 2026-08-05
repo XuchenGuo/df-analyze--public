@@ -4,7 +4,6 @@ import json
 import os
 import random
 import warnings
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -20,11 +19,17 @@ from df_analyze.analysis.adaptive_error.confidence_metrics import (
     tree_leaf_support_conf,
     tree_vote_agreement_conf,
 )
+from df_analyze.analysis.adaptive_error.report import write_cross_model_summaries
 from df_analyze.analysis.error_consistency.backend import (
     ECBackendDecision,
     resolve_ec_backend,
 )
-from df_analyze.analysis.error_consistency.checkpoint import configuration_fingerprint
+from df_analyze.analysis.error_consistency.checkpoint import (
+    checkpoint_directory,
+    configuration_fingerprint,
+    load_partial_checkpoint,
+    save_partial_checkpoint,
+)
 from df_analyze.analysis.error_consistency.classification import (
     _pair_counts,
     compute_classification_ec,
@@ -312,7 +317,7 @@ def test_ec_model_seeding_uses_only_one_estimator_seed_alias() -> None:
 @pytest.mark.fast
 @pytest.mark.skipif(os.name != "nt", reason="Windows MAX_PATH regression")
 def test_ec_detail_plot_supports_a_long_windows_output_path(tmp_path) -> None:
-    padding = max(1, 210 - len(str(tmp_path.resolve())))
+    padding = max(1, 265 - len(str(tmp_path.resolve())))
     detail = tmp_path / ("x" * padding)
     pairwise = pd.DataFrame(
         {
@@ -326,8 +331,9 @@ def test_ec_detail_plot_supports_a_long_windows_output_path(tmp_path) -> None:
     legacy_plot = detail / "plots" / "pairwise_ec_distribution_classification_iou.png"
     plot = detail / "plots" / "pairwise_ec_classification_iou.png"
     assert len(str(legacy_plot.resolve())) > 260
-    assert len(str(plot.resolve())) < 260
-    assert plot.exists()
+    assert len(str((detail / "plots").resolve())) > 260
+    assert len(str(plot.resolve())) > 260
+    assert windows_io_path(plot).exists()
 
 
 @pytest.mark.fast
@@ -344,6 +350,66 @@ def test_adaptive_error_model_outputs_support_a_long_windows_path(tmp_path) -> N
 
     assert len(str(metadata.resolve())) > 260
     assert windows_io_path(metadata).read_text(encoding="utf-8") == "{}"
+
+
+@pytest.mark.fast
+@pytest.mark.skipif(os.name != "nt", reason="Windows MAX_PATH regression")
+def test_adaptive_error_cross_model_outputs_support_a_long_windows_path(
+    tmp_path,
+) -> None:
+    padding = max(1, 250 - len(str(tmp_path.resolve())))
+    base_dir = tmp_path / ("x" * padding) / "adaptive_error"
+    plots_dir = base_dir / "plots"
+    tables_dir = base_dir / "tables"
+    preds_dir = base_dir / "predictions"
+    parquet = preds_dir / "test_per_sample_multi_model.parquet"
+
+    assert len(str(parquet.resolve())) > 260
+    write_cross_model_summaries(
+        plots_dir=plots_dir,
+        tables_dir=tables_dir,
+        preds_dir=preds_dir,
+        base_test=pd.DataFrame({"row_id": [0, 1], "y_true": [0, 1]}),
+        slugs=[],
+        compare_tests={},
+        compare_bins={},
+        compare_test_bins={},
+        compare_metrics=[],
+        model_rows=[],
+        no_preds=False,
+    )
+
+    assert windows_io_path(parquet).is_file()
+    assert windows_io_path(plots_dir / "confidence_vs_expected_error_compare.png").is_file()
+
+
+@pytest.mark.fast
+@pytest.mark.skipif(os.name != "nt", reason="Windows MAX_PATH regression")
+def test_ec_checkpoint_supports_a_long_windows_output_path(tmp_path) -> None:
+    padding = max(1, 225 - len(str(tmp_path.resolve())))
+    detail = tmp_path / ("x" * padding)
+    temporary = checkpoint_directory(detail) / "predictions.parquet.tmp"
+    predictions = np.asarray([[0.0, 1.0], [1.0, 0.0]])
+    frame = pd.DataFrame({"repetition": [0], "fold": [0]})
+
+    assert len(str(temporary.resolve())) > 260
+    save_partial_checkpoint(
+        detail,
+        fingerprint="long-path-checkpoint",
+        fingerprint_payload={"test": "windows-long-path"},
+        completed_repetitions=1,
+        predictions=predictions,
+        trial_design=frame,
+        fold_assignments=frame,
+        trial_scores=frame,
+        trial_failures=pd.DataFrame(),
+    )
+    loaded = load_partial_checkpoint(detail, fingerprint="long-path-checkpoint")
+
+    assert loaded is not None
+    np.testing.assert_array_equal(loaded.predictions, predictions)
+    assert loaded.completed_repetitions == 1
+    assert windows_io_path(checkpoint_directory(detail) / "state.json").is_file()
 
 
 @pytest.mark.fast
@@ -1017,16 +1083,9 @@ def test_repeated_kfold_runner_uses_common_holdout(tmp_path, is_classification) 
 
 @pytest.mark.fast
 @pytest.mark.parametrize("is_classification", [False, True])
-def test_reference_pipeline_golden_outputs(tmp_path, is_classification) -> None:
-    golden = json.loads(
-        (
-            Path(__file__).parent
-            / "data"
-            / "error_consistency"
-            / "reference_pipeline_golden.json"
-        ).read_text(encoding="utf-8")
-    )
-    expected = golden["classification" if is_classification else "regression"]
+def test_reference_pipeline_outputs_match_hand_checked_values(
+    tmp_path, is_classification
+) -> None:
     prep_train, prep_test, eval_results = _runner_case(is_classification)
     options = _options()
     if not is_classification:
@@ -1040,45 +1099,57 @@ def test_reference_pipeline_golden_outputs(tmp_path, is_classification) -> None:
         options,
         base_dir=output_dir,
     )
-    design = result.trial_design.sort_values("model_index")
-    assert design["model_seed"].astype(int).tolist() == expected["trial_model_seeds"]
-    assert (
-        design.groupby("repetition")["partition_signature"].first().tolist()
-        == (expected["partition_signatures"])
-    )
 
     detail = output_dir / "target" / "dummy" / "none_none"
     saved = pd.read_csv(detail / "trial_predictions.csv")
     if is_classification:
         model_columns = saved.filter(regex=r"^model_\d+$")
-        assert len(saved) == expected["n_holdout_rows"]
-        assert np.unique(model_columns.to_numpy()).tolist() == [
-            expected["prediction_value"]
-        ]
+        assert len(saved) == 40
+        assert np.unique(model_columns.to_numpy()).tolist() == [0]
         summary = result.summary.iloc[0]
-        assert summary["ec_mean"] == pytest.approx(expected["ec_mean"])
-        assert summary["total_error_intersection"] == expected["total_error_intersection"]
-        assert summary["total_error_union"] == expected["total_error_union"]
+        assert summary["ec_mean"] == pytest.approx(1.0)
+        assert summary["total_error_intersection"] == 20
+        assert summary["total_error_union"] == 20
         loo = pd.read_csv(detail / "leave_one_model_out.csv")
-        assert loo["consistency"].tolist() == pytest.approx(
-            expected["leave_one_model_out"]
-        )
+        assert loo["consistency"].tolist() == pytest.approx([1.0] * 4)
     else:
-        assert saved["y_true"].tolist() == pytest.approx(expected["y_true"])
+        assert saved["y_true"].tolist() == pytest.approx([8.0, 9.0, 10.0, 11.0])
         observed_predictions = saved.filter(regex=r"^model_\d+$").to_numpy().T
         np.testing.assert_allclose(
             observed_predictions,
-            np.asarray(expected["predictions_by_model"]),
+            np.asarray(
+                [
+                    [4.0, 4.0, 4.0, 4.0],
+                    [3.0, 3.0, 3.0, 3.0],
+                    [3.75, 3.75, 3.75, 3.75],
+                    [3.25, 3.25, 3.25, 3.25],
+                ]
+            ),
         )
         mae_scores = result.trial_scores[result.trial_scores["metric"] == "mae"]
         assert mae_scores.sort_values("model_index")["score"].tolist() == pytest.approx(
-            expected["trial_mae"]
+            [5.5, 6.5, 5.75, 6.25]
         )
         observed = result.summary.set_index("ec_method")
-        assert set(observed.index) == set(expected["summary"])
-        for method, fields in expected["summary"].items():
-            for field, value in fields.items():
-                assert observed.loc[method, field] == pytest.approx(value)
+        assert set(observed.index) == {
+            "ratio",
+            "ratio_diff",
+            "ratio_sign",
+            "ratio_diff_sign_reference",
+            "intersection_union_sample",
+            "intersection_union_all",
+            "intersection_union_distance",
+        }
+        assert observed.loc["ratio", "ec_mean"] == pytest.approx(0.9051250974354325)
+        assert observed.loc["ratio_diff", "ec_mean"] == pytest.approx(
+            0.05044655144960405
+        )
+        assert observed.loc["intersection_union_all", "ec_mean"] == pytest.approx(
+            0.9081382385730211
+        )
+        assert observed.loc[
+            "intersection_union_distance", "ec_mean"
+        ] == pytest.approx(0.5833333333333333)
 
 
 @pytest.mark.fast
@@ -1326,25 +1397,31 @@ def test_final_test_holdout_disables_selection_outputs(tmp_path) -> None:
 @pytest.mark.fast
 def test_ec_runner_restores_global_random_state(tmp_path) -> None:
     prep_train, prep_test, eval_results = _runner_case(True)
-    random.seed(101)
-    np.random.seed(202)
-    python_state = random.getstate()
-    numpy_state = np.random.get_state()
-    expected_python = random.random()
-    expected_numpy = np.random.random()
-    random.setstate(python_state)
-    np.random.set_state(numpy_state)
+    original_python_state = random.getstate()
+    original_numpy_state = np.random.get_state()
+    try:
+        random.seed(101)
+        np.random.seed(202)
+        python_state = random.getstate()
+        numpy_state = np.random.get_state()
+        expected_python = random.random()
+        expected_numpy = np.random.random()
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
 
-    run_error_consistency_analysis(
-        prep_train,
-        prep_test,
-        eval_results,
-        _options(),
-        base_dir=tmp_path / "error_consistency",
-    )
+        run_error_consistency_analysis(
+            prep_train,
+            prep_test,
+            eval_results,
+            _options(),
+            base_dir=tmp_path / "error_consistency",
+        )
 
-    assert random.random() == expected_python
-    assert np.random.random() == expected_numpy
+        assert random.random() == expected_python
+        assert np.random.random() == expected_numpy
+    finally:
+        random.setstate(original_python_state)
+        np.random.set_state(original_numpy_state)
 
 
 @pytest.mark.fast

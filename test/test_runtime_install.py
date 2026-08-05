@@ -29,6 +29,10 @@ def test_project_version_sources_match() -> None:
 
     assert VERSION == project["project"]["version"]
     assert VERSION == locked_project["version"]
+    assert project["project"]["scripts"] == {
+        "df-analyze": "df_analyze:main",
+        "df-embed": "df_analyze.embed_entrypoint:main",
+    }
 
 
 def _project(root: Path) -> None:

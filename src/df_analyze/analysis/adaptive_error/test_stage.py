@@ -1,3 +1,10 @@
+"""Apply a fitted adaptive-error mapping to the untouched holdout.
+
+The confidence transform and error mapping are learned from training OOF
+predictions. This stage refits the selected base model, predicts the holdout,
+and reports expected error without fitting any risk component on holdout rows.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -40,9 +47,11 @@ from df_analyze.analysis.adaptive_error.proba import (
     scores_to_proba,
 )
 from df_analyze.analysis.adaptive_error.report import (
+    _write_csv,
     _write_not_available_csv,
     _write_not_available_parquet,
     _write_not_available_png,
+    _write_parquet,
     _write_sanity_checks,
 )
 from df_analyze.runtime.hardware import (
@@ -232,6 +241,7 @@ def _evaluate_test_stage_attempt(
     m_plots: Path,
     m_meta: Path,
 ) -> _TestEvalResult:
+    """Run one complete holdout evaluation on the currently resolved device."""
     y_pred_test_raw, proba_test, tuned_model, scores_test = _predict_test_outputs(
         result=result,
         X_train=X_train,
@@ -321,8 +331,12 @@ def _evaluate_test_stage_attempt(
         _write_not_available_parquet(m_preds / "test_per_sample.parquet", reason)
         _write_not_available_csv(m_preds / "test_per_sample.csv", reason)
     else:
-        test_df.to_parquet(m_preds / "test_per_sample.parquet", index=False)
-        test_df.to_csv(m_preds / "test_per_sample.csv", index=False)
+        _write_parquet(
+            test_df,
+            m_preds / "test_per_sample.parquet",
+            index=False,
+        )
+        _write_csv(test_df, m_preds / "test_per_sample.csv", index=False)
 
     sanity_issues: dict[str, Any] = {}
     sanity_info: dict[str, Any] = {}
@@ -403,7 +417,11 @@ def _evaluate_test_stage_attempt(
             test_bins_df = original_test_bins_df
         else:
             test_bins_df = merged_test_bins_df
-        test_bins_df.to_csv(m_tables / "test_confidence_error_bins.csv", index=False)
+        _write_csv(
+            test_bins_df,
+            m_tables / "test_confidence_error_bins.csv",
+            index=False,
+        )
         plot_confidence_vs_error(
             test_bins_df,
             m_plots / "confidence_vs_expected_error.png",
@@ -455,6 +473,7 @@ def _evaluate_test_stage(
     m_plots: Path,
     m_meta: Path,
 ) -> _TestEvalResult:
+    """Evaluate once, restarting the complete stage on CPU after an auto-CUDA failure."""
     attempt_args = {
         "result": result,
         "X_train": X_train,

@@ -10,6 +10,12 @@ import numpy as np
 import pandas as pd
 
 from df_analyze.analysis.adaptive_error.stats import _wilson_interval
+from df_analyze.saving import windows_io_path
+
+
+def _save_figure(fig, outpath: Path) -> None:
+    windows_io_path(outpath.parent).mkdir(parents=True, exist_ok=True)
+    fig.savefig(windows_io_path(outpath), dpi=150)
 
 
 def build_confidence_error_bins_table(
@@ -198,7 +204,7 @@ def plot_placeholder(outpath: Path, title: str, message: Optional[str] = None) -
         fontsize=10,
     )
     fig.tight_layout()
-    fig.savefig(outpath, dpi=150)
+    _save_figure(fig, outpath)
     plt.close(fig)
 
 
@@ -298,7 +304,7 @@ def plot_confidence_vs_error(
             warn("Skipping count annotations in confidence-vs-error plot: too many bins")
 
     fig.tight_layout()
-    fig.savefig(outpath, dpi=150)
+    _save_figure(fig, outpath)
     plt.close(fig)
 
 
@@ -364,7 +370,7 @@ def plot_compare_confidence_vs_error(
     ax.grid(True, alpha=0.25)
     ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
-    fig.savefig(outpath, dpi=150)
+    _save_figure(fig, outpath)
     plt.close(fig)
 
 
@@ -418,7 +424,7 @@ def plot_coverage_vs_accuracy(curve_df: pd.DataFrame, outpath: Path) -> None:
     ax.set_xlim(0.0, 1.0)
     ax.set_ylim(0.0, 1.0)
     fig.tight_layout()
-    fig.savefig(outpath, dpi=150)
+    _save_figure(fig, outpath)
     plt.close(fig)
 
 
@@ -495,7 +501,7 @@ def plot_coverage_vs_accuracy_overlay(
         legend_kwargs["fontsize"] = 7
     ax.legend(**legend_kwargs)
     fig.tight_layout()
-    fig.savefig(outpath, dpi=150)
+    _save_figure(fig, outpath)
     plt.close(fig)
 
 

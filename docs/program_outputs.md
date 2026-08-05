@@ -28,6 +28,8 @@
 - **tuning**: (currently unused) params for each tuned model and each
   selection method
 
+## Multi-Target Outputs
+
 For multi-target runs, target-specific feature reports are stored in subfolders
 named after each target. The `prepared` directory also contains the target and
 split audits. Final results include:
@@ -44,10 +46,12 @@ metrics.
 
 Final holdout cross-validation uses at most five folds. Grouped runs reduce the
 fold count when the holdout contains fewer than five distinct groups, while
-preserving group-disjoint folds. `final_cv_folds` records the count actually
+keeping groups separate. `final_cv_folds` records the count actually
 used. The value column named `5-fold` is retained for output compatibility and
 must be interpreted using `final_cv_folds`. Fewer than five folds also produces
 a warning because the resulting estimate can be unstable.
+
+## Error Consistency Outputs
 
 When `--error-consistency` is enabled, start with these files in
 `results/error_consistency`:
@@ -59,7 +63,7 @@ When `--error-consistency` is enabled, start with these files in
 - `selection_guard.csv`: whether the holdout was declared as `test` or
   `validation`, and whether ranking and correlation output was enabled
 
-The audit files show exactly how the run was made:
+Use these files to check the folds, seeds, and settings used for the run:
 
 - `trial_scores.csv`: predictive score for each fitted model
 - `trial_design.csv`: repetition, fold, split seed, model seed, split sizes, and
@@ -91,7 +95,7 @@ guidance, checkpoints, and interpretation.
 
 ## Output Files
 
-## Makrkdown Reports
+## Markdown Reports
 
 - **`associations_report.md`**
   - summarizes the (statistical) associations between each feature and the
@@ -121,9 +125,9 @@ guidance, checkpoints, and interpretation.
     - **spearman_p**: p-value for Spearman's correlation coefficient
     - **F**: `sklearn.feature_selection.f_regression`, i.e. F-statistic
     - **F_p**: p-value for F-statistic above
-    - **H**: Kruskal-Wallace H, i.e. one-way ANOVA on ranks
+    - **H**: Kruskal-Wallis H, i.e. one-way ANOVA on ranks
       (https://en.wikipedia.org/w/index.php?title=Kruskal%E2%80%93Wallis_one-way_analysis_of_variance&oldid=1193273201)
-    - **H_p**: p-value for Kruskal-Wallace H
+    - **H_p**: p-value for Kruskal-Wallis H
 
 - **`predictions_report.md`**
   - summarizes the univariate predictive performance of each feature on the
