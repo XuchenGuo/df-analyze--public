@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 # Reference: https://docs.priorlabs.ai
+from base64 import b64decode, b64encode
 import os
+import pickle
 from math import ceil, prod
 from pathlib import Path
-from tempfile import gettempdir
+from tempfile import TemporaryDirectory, gettempdir
 from time import time_ns
 from typing import Any, Callable, Mapping, Optional, Type, Union
 from warnings import warn
@@ -24,6 +26,7 @@ from df_analyze.runtime.hardware import (
     RuntimeComponent,
     cleanup_torch_accelerator,
     configure_torch_cuda,
+    get_runtime,
 )
 from df_analyze.splitting import OmniKFold
 
@@ -152,6 +155,7 @@ def _prepare_tabpfn_cache_dir() -> Optional[Path]:
 
 
 class TabPFNEstimator(DfAnalyzeModel):
+    runtime_component = RuntimeComponent.TabPFN
     version = "v3"
     shortname = "tabpfn-v3"
     longname = "TabPFN v3 Estimator"
@@ -177,14 +181,6 @@ class TabPFNEstimator(DfAnalyzeModel):
             show_progress_bar=False,
         )
 
-    def __getstate__(self) -> dict[str, Any]:
-        state = self.__dict__.copy()
-        state["model"] = None
-        state["tuned_model"] = None
-        state["_preflight_done"] = False
-        state["_preflight_config"] = None
-        return state
-
     @staticmethod
     def _assert_available() -> None:
         if _TABPFN_IMPORT_ERROR is not None:
@@ -200,6 +196,98 @@ class TabPFNEstimator(DfAnalyzeModel):
 
     def _cleanup_after_fold(self) -> None:
         cleanup_torch_accelerator(self.runtime, RuntimeComponent.TabPFN)
+
+    @staticmethod
+    def _serialize_model(model: Any) -> dict[str, str]:
+        save_fit_state = getattr(model, "save_fit_state", None)
+        if callable(save_fit_state):
+            with TemporaryDirectory() as tempdir:
+                path = Path(tempdir) / "model.tabpfn_fit"
+                try:
+                    save_fit_state(path)
+                except NotImplementedError as exc:
+                    raise RuntimeError(
+                        "TabPFN fitted-state serialization does not support "
+                        "fit_mode='fit_with_cache'. Use the df-analyze default "
+                        "fit_mode='fit_preprocessors' when results must be reloadable."
+                    ) from exc
+                payload = path.read_bytes()
+            return {
+                "format": "tabpfn_fit",
+                "payload": b64encode(payload).decode("ascii"),
+            }
+
+        # Test doubles and compatible third-party wrappers may not expose the
+        # official fitted-state API. Keep a conventional pickle fallback for
+        # those small objects; official TabPFN estimators always use the format
+        # above so their foundation weights are not duplicated in result JSON.
+        payload = pickle.dumps(model, protocol=pickle.HIGHEST_PROTOCOL)
+        return {
+            "format": "pickle",
+            "payload": b64encode(payload).decode("ascii"),
+        }
+
+    def _serialize_models(self, models: Any) -> Optional[dict[str, Any]]:
+        if models is None:
+            return None
+        if isinstance(models, dict):
+            return {
+                "kind": "multi",
+                "models": {
+                    str(target): self._serialize_model(model)
+                    for target, model in models.items()
+                },
+            }
+        return {"kind": "single", "model": self._serialize_model(models)}
+
+    def _restore_model(self, state: Mapping[str, str]) -> Any:
+        payload = b64decode(state["payload"])
+        if state["format"] == "pickle":
+            return pickle.loads(payload)
+        if state["format"] != "tabpfn_fit":
+            raise ValueError(f"Unknown serialized TabPFN format: {state['format']}")
+
+        self._assert_available()
+        from tabpfn import load_fitted_tabpfn_model
+
+        with TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "model.tabpfn_fit"
+            path.write_bytes(payload)
+            try:
+                return load_fitted_tabpfn_model(path, device=self._device())
+            except Exception as exc:
+                raise TabPFNSetupError(_setup_message(self.longname, exc)) from exc
+
+    def _restore_models(self, state: Optional[Mapping[str, Any]]) -> Any:
+        if state is None:
+            return None
+        if state["kind"] == "multi":
+            return {
+                str(target): self._restore_model(model_state)
+                for target, model_state in state["models"].items()
+            }
+        return self._restore_model(state["model"])
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state["_serialized_model"] = self._serialize_models(state.pop("model", None))
+        state["_serialized_tuned_model"] = self._serialize_models(
+            state.pop("tuned_model", None)
+        )
+        state["_preflight_done"] = False
+        state["_preflight_config"] = None
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        model_state = state.pop("_serialized_model", None)
+        tuned_model_state = state.pop("_serialized_tuned_model", None)
+        self.__dict__.update(state)
+        # Loading results must not require the CUDA policy used for training.
+        # Restore on CPU and let callers select a new runtime for future work.
+        self.runtime = get_runtime("cpu")
+        self._configure_runtime()
+        self.model = self._restore_models(model_state)
+        self.tuned_model = self._restore_models(tuned_model_state)
 
     @staticmethod
     def _move_model(model: Any, device: str) -> None:
@@ -604,7 +692,7 @@ class TabPFNEstimator(DfAnalyzeModel):
             g_train,
             multitarget_y=(
                 y_df
-                if self.is_classifier and y_df.shape[1] > 1
+                if y_df.shape[1] > 1
                 else None
             ),
         )[0]

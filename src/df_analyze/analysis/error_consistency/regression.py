@@ -1,3 +1,9 @@
+"""Calculate regression EC from residuals on one shared holdout.
+
+The seven methods compare residuals from K x R fitted models. Summary mode
+calculates the same aggregate values without keeping large sample-level tables.
+"""
+
 from __future__ import annotations
 
 from itertools import combinations
@@ -13,8 +19,21 @@ from df_analyze.analysis.error_consistency.containers import (
     ECMetricComputation,
     ECMetricInfo,
 )
+from df_analyze.runtime.hardware import DeviceIntent
 
 CUDA_PAIR_WORK_ITEMS = 2_000_000
+RATIO_DIFF_SIGN_LEGACY = "ratio_diff_sign"
+RATIO_DIFF_SIGN_MAGNITUDE = "ratio_diff_sign_magnitude"
+RATIO_DIFF_SIGN_REFERENCE = "ratio_diff_sign_reference"
+RATIO_DIFF_SIGN_METHODS = {
+    RATIO_DIFF_SIGN_LEGACY,
+    RATIO_DIFF_SIGN_MAGNITUDE,
+    RATIO_DIFF_SIGN_REFERENCE,
+}
+RATIO_DIFF_SIGN_MAGNITUDE_PRIMARY = {
+    RATIO_DIFF_SIGN_LEGACY,
+    RATIO_DIFF_SIGN_MAGNITUDE,
+}
 REGRESSION_EC_METRICS: dict[str, ECMetricInfo] = {
     "ratio": ECMetricInfo(
         "ratio", "Ratio", True, 1.0, 0.0, 1.0, None, True, legacy_equation_label="1"
@@ -43,6 +62,17 @@ REGRESSION_EC_METRICS: dict[str, ECMetricInfo] = {
     ),
     "ratio_diff_sign": ECMetricInfo(
         "ratio_diff_sign",
+        "Ratio-diff-sign magnitude (legacy name)",
+        False,
+        0.0,
+        0.0,
+        1.0,
+        None,
+        True,
+        legacy_equation_label="4",
+    ),
+    "ratio_diff_sign_magnitude": ECMetricInfo(
+        "ratio_diff_sign_magnitude",
         "Ratio-diff-sign magnitude",
         False,
         0.0,
@@ -51,6 +81,18 @@ REGRESSION_EC_METRICS: dict[str, ECMetricInfo] = {
         None,
         True,
         legacy_equation_label="4",
+    ),
+    "ratio_diff_sign_reference": ECMetricInfo(
+        "ratio_diff_sign_reference",
+        "Ratio-diff-sign reference signed summary",
+        False,
+        0.0,
+        -1.0,
+        1.0,
+        None,
+        True,
+        legacy_equation_label="4",
+        ranking_supported=False,
     ),
     "intersection_union_sample": ECMetricInfo(
         "intersection_union_sample",
@@ -76,7 +118,7 @@ REGRESSION_EC_METRICS: dict[str, ECMetricInfo] = {
     ),
     "intersection_union_distance": ECMetricInfo(
         "intersection_union_distance",
-        "Intersection-union-distance",
+        "Absolute prediction disagreement (legacy intersection-union-distance)",
         False,
         0.0,
         0.0,
@@ -89,11 +131,11 @@ METHOD_ALIASES = {
     "ratio-diff": "ratio_diff",
     "ratio-signed": "ratio_sign",
     "ratio-sign": "ratio_sign",
-    # ``ratio_diff_sign`` is retained as the serialized compatibility name.
-    # The preferred alias makes clear that primary summaries aggregate the
-    # signed value's magnitude; signed direction remains an auxiliary output.
-    "ratio_diff_sign_magnitude": "ratio_diff_sign",
-    "ratio-diff-sign-magnitude": "ratio_diff_sign",
+    # ``ratio_diff_sign`` remains accepted with its historical magnitude-first
+    # summary. New calls should select one of the two explicit variants.
+    "ratio-diff-sign-magnitude": "ratio_diff_sign_magnitude",
+    "ratio-diff-sign-reference": "ratio_diff_sign_reference",
+    "ratio-diff-sign-signed": "ratio_diff_sign_reference",
     "ratio-diff-sign": "ratio_diff_sign",
     "ratio-diff-signed": "ratio_diff_sign",
     "intersection-union-sample": "intersection_union_sample",
@@ -114,7 +156,18 @@ def normalize_regression_method(method: str) -> str:
 
 
 def default_regression_methods() -> list[str]:
-    return list(REGRESSION_EC_METRICS)
+    # Seven non-ambiguous defaults. The legacy and strict-reference signed
+    # variants remain opt-in so adding compatibility does not change the
+    # historical seven-method run count.
+    return [
+        "ratio",
+        "ratio_diff",
+        "ratio_sign",
+        RATIO_DIFF_SIGN_MAGNITUDE,
+        "intersection_union_sample",
+        "intersection_union_all",
+        "intersection_union_distance",
+    ]
 
 
 def _same_sign_parts(r1: ndarray, r2: ndarray) -> tuple[ndarray, ndarray]:
@@ -168,11 +221,11 @@ def regression_pairwise_consistency(
                 values = sign * values
                 values[denominator == 0] = 1.0
             return np.nan_to_num(values, nan=1.0)
-        if method in {"ratio_diff", "ratio_diff_sign"}:
+        if method == "ratio_diff" or method in RATIO_DIFF_SIGN_METHODS:
             denominator = abs1 + abs2
             values = np.abs(abs1 - abs2) / (denominator + epsilon)
             values[denominator == 0] = 0.0
-            if method == "ratio_diff_sign":
+            if method in {RATIO_DIFF_SIGN_LEGACY, RATIO_DIFF_SIGN_REFERENCE}:
                 values = sign * values
             return np.nan_to_num(values, nan=0.0)
         if method == "intersection_union_sample":
@@ -211,11 +264,11 @@ def _torch_pairwise(r1, r2, method: str, epsilon: float):
             values = sign * values
             values = torch.where(denominator == 0, torch.ones_like(values), values)
         return torch.nan_to_num(values, nan=1.0)
-    if method in {"ratio_diff", "ratio_diff_sign"}:
+    if method == "ratio_diff" or method in RATIO_DIFF_SIGN_METHODS:
         denominator = abs1 + abs2
         values = torch.abs(abs1 - abs2) / (denominator + epsilon)
         values = torch.where(denominator == 0, torch.zeros_like(values), values)
-        if method == "ratio_diff_sign":
+        if method in {RATIO_DIFF_SIGN_LEGACY, RATIO_DIFF_SIGN_REFERENCE}:
             values = sign * values
         return torch.nan_to_num(values, nan=0.0)
 
@@ -256,6 +309,7 @@ def compute_regression_ec(
     epsilon: float = 0.0,
     backend: ECBackendDecision | None = None,
     row_ids=None,
+    output_detail: str = "full",
 ) -> list[ECMetricComputation]:
     residual_matrix = np.asarray(residuals, dtype=float)
     if residual_matrix.ndim != 2 or residual_matrix.shape[0] < 2:
@@ -265,10 +319,15 @@ def compute_regression_ec(
         )
     if residual_matrix.shape[1] == 0:
         raise ValueError("Regression EC requires at least one test sample.")
+    detail = str(output_detail).lower()
+    if detail not in {"summary", "pairwise", "full"}:
+        raise ValueError(
+            "Regression EC output detail must be summary, pairwise, or full."
+        )
+    retain_pairwise = detail in {"pairwise", "full"}
+    retain_samplewise = detail == "full"
     sample_ids = (
-        np.arange(residual_matrix.shape[1])
-        if row_ids is None
-        else np.asarray(row_ids)
+        np.arange(residual_matrix.shape[1]) if row_ids is None else np.asarray(row_ids)
     )
     if sample_ids.size != residual_matrix.shape[1]:
         raise ValueError(
@@ -292,6 +351,11 @@ def compute_regression_ec(
                 residual_matrix, dtype=torch.float64, device="cuda"
             )
         except Exception as error:
+            if backend.requested == DeviceIntent.CUDA.value:
+                raise RuntimeError(
+                    "Regression error consistency failed on CUDA while "
+                    "--device cuda is strict."
+                ) from error
             warn(
                 "Could not compute regression EC on CUDA; falling back to numpy. "
                 f"Details: {error}"
@@ -302,6 +366,7 @@ def compute_regression_ec(
                 epsilon=epsilon,
                 backend=backend.fallback(f"torch_cuda_error:{type(error).__name__}"),
                 row_ids=sample_ids,
+                output_detail=detail,
             )
 
     computations = []
@@ -327,19 +392,25 @@ def compute_regression_ec(
         )
         signed_sample_sum = (
             np.zeros(residual_matrix.shape[1], dtype=float)
-            if method == "ratio_diff_sign"
+            if method in RATIO_DIFF_SIGN_METHODS
             else None
         )
         signed_flat_sum = 0.0
 
-        def record_pair(pair: tuple[int, int], values: ndarray) -> None:
+        def record_pair(
+            pair: tuple[int, int],
+            values: ndarray,
+            primary_values: ndarray | None = None,
+        ) -> None:
             nonlocal flat_count, flat_mean, flat_m2, flat_min, flat_max
             nonlocal signed_flat_sum
             i, j = pair
             values = np.asarray(values, dtype=float).ravel()
-            valid = np.isfinite(values)
+            if primary_values is None:
+                primary_values = values
+            primary_values = np.asarray(primary_values, dtype=float).ravel()
+            valid = np.isfinite(primary_values)
             signed_finite = values[valid]
-            primary_values = np.abs(values) if method == "ratio_diff_sign" else values
             finite = primary_values[valid]
             pair_mean = float(np.mean(finite)) if finite.size else np.nan
             pair_means.append(pair_mean)
@@ -353,17 +424,16 @@ def compute_regression_ec(
                 "pair_min": float(np.min(finite)) if finite.size else np.nan,
                 "pair_max": float(np.max(finite)) if finite.size else np.nan,
             }
-            if method == "ratio_diff_sign":
+            if method in RATIO_DIFF_SIGN_METHODS:
                 pair_row.update(
                     pair_signed_mean=(
-                        float(np.mean(signed_finite))
-                        if signed_finite.size
-                        else np.nan
+                        float(np.mean(signed_finite)) if signed_finite.size else np.nan
                     ),
                     pair_signed_sd=_sample_sd(signed_finite),
                 )
                 signed_flat_sum += float(np.sum(signed_finite))
-            rows.append(pair_row)
+            if retain_pairwise:
+                rows.append(pair_row)
 
             if finite.size:
                 batch_count = int(finite.size)
@@ -377,8 +447,7 @@ def compute_regression_ec(
                     delta = batch_mean - flat_mean
                     flat_mean += delta * batch_count / combined
                     flat_m2 += (
-                        batch_m2
-                        + delta * delta * flat_count * batch_count / combined
+                        batch_m2 + delta * delta * flat_count * batch_count / combined
                     )
                 flat_count = combined
                 flat_min = min(flat_min, float(np.min(finite)))
@@ -400,11 +469,31 @@ def compute_regression_ec(
         if residual_t is None:
             for pair in pairs:
                 i, j = pair
+                if method in RATIO_DIFF_SIGN_METHODS:
+                    values = regression_pairwise_consistency(
+                        residual_matrix[i],
+                        residual_matrix[j],
+                        RATIO_DIFF_SIGN_REFERENCE,
+                        epsilon,
+                    )
+                else:
+                    values = regression_pairwise_consistency(
+                        residual_matrix[i], residual_matrix[j], method, epsilon
+                    )
+                primary_values = (
+                    regression_pairwise_consistency(
+                        residual_matrix[i],
+                        residual_matrix[j],
+                        "ratio_diff",
+                        epsilon,
+                    )
+                    if method in RATIO_DIFF_SIGN_MAGNITUDE_PRIMARY
+                    else None
+                )
                 record_pair(
                     pair,
-                    regression_pairwise_consistency(
-                        residual_matrix[i], residual_matrix[j], method, epsilon
-                    ),
+                    values,
+                    primary_values,
                 )
         else:
             try:
@@ -418,12 +507,39 @@ def compute_regression_ec(
                     pair_i = torch.as_tensor([i for i, _ in batch], device="cuda")
                     pair_j = torch.as_tensor([j for _, j in batch], device="cuda")
                     torch_values = _torch_pairwise(
-                        residual_t[pair_i], residual_t[pair_j], method, epsilon
+                        residual_t[pair_i],
+                        residual_t[pair_j],
+                        (
+                            RATIO_DIFF_SIGN_REFERENCE
+                            if method in RATIO_DIFF_SIGN_METHODS
+                            else method
+                        ),
+                        epsilon,
                     )
                     batch_values = torch_values.detach().cpu().numpy()
-                    for pair, values in zip(batch, batch_values):
-                        record_pair(pair, values)
+                    batch_primary_values = (
+                        _torch_pairwise(
+                            residual_t[pair_i],
+                            residual_t[pair_j],
+                            "ratio_diff",
+                            epsilon,
+                        )
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        if method in RATIO_DIFF_SIGN_MAGNITUDE_PRIMARY
+                        else [None] * len(batch)
+                    )
+                    for pair, values, primary_values in zip(
+                        batch, batch_values, batch_primary_values
+                    ):
+                        record_pair(pair, values, primary_values)
             except Exception as error:
+                if backend.requested == DeviceIntent.CUDA.value:
+                    raise RuntimeError(
+                        "Regression error consistency failed on CUDA while "
+                        "--device cuda is strict."
+                    ) from error
                 warn(
                     "Could not compute regression EC on CUDA; falling back to "
                     f"numpy. Details: {error}"
@@ -432,10 +548,9 @@ def compute_regression_ec(
                     residual_matrix,
                     methods=selected,
                     epsilon=epsilon,
-                    backend=backend.fallback(
-                        f"torch_cuda_error:{type(error).__name__}"
-                    ),
+                    backend=backend.fallback(f"torch_cuda_error:{type(error).__name__}"),
                     row_ids=sample_ids,
+                    output_detail=detail,
                 )
 
         samplewise = None
@@ -456,10 +571,9 @@ def compute_regression_ec(
             }
             if signed_sample_sum is not None:
                 with np.errstate(divide="ignore", invalid="ignore"):
-                    samplewise_data["ec_signed_mean"] = (
-                        signed_sample_sum / sample_count
-                    )
-            samplewise = pd.DataFrame(samplewise_data)
+                    samplewise_data["ec_signed_mean"] = signed_sample_sum / sample_count
+            if retain_samplewise:
+                samplewise = pd.DataFrame(samplewise_data)
             ec_vec_sd = _sample_sd(sample_mean)
             ec_scalar_sd = _sample_sd(np.asarray(pair_means))
         else:
@@ -491,15 +605,29 @@ def compute_regression_ec(
             "ec_model_pair_sd": _sample_sd(np.asarray(pair_means)),
             "ec_sample_profile_sd": ec_vec_sd if info.samplewise_defined else np.nan,
             "ec_epsilon": epsilon,
+            "output_detail": detail,
         }
-        if method == "ratio_diff_sign":
+        if method in RATIO_DIFF_SIGN_METHODS:
+            primary_aggregation = (
+                "mean_unsigned_ratio_difference"
+                if method in RATIO_DIFF_SIGN_MAGNITUDE_PRIMARY
+                else "mean_signed_ratio_difference"
+            )
             extra.update(
-                primary_aggregation="mean_absolute_signed_value",
-                preferred_method_name="ratio_diff_sign_magnitude",
-                compatibility_method_name="ratio_diff_sign",
-                ec_signed_mean=(
-                    signed_flat_sum / flat_count if flat_count else np.nan
+                primary_aggregation=primary_aggregation,
+                method_variant=(
+                    "reference_signed"
+                    if method == RATIO_DIFF_SIGN_REFERENCE
+                    else "magnitude"
                 ),
+                preferred_method_name=(
+                    RATIO_DIFF_SIGN_REFERENCE
+                    if method == RATIO_DIFF_SIGN_REFERENCE
+                    else RATIO_DIFF_SIGN_MAGNITUDE
+                ),
+                compatibility_method_name=RATIO_DIFF_SIGN_LEGACY,
+                legacy_ambiguous_method_name=(method == RATIO_DIFF_SIGN_LEGACY),
+                ec_signed_mean=(signed_flat_sum / flat_count if flat_count else np.nan),
             )
         if backend is not None:
             extra.update(backend.as_metadata())

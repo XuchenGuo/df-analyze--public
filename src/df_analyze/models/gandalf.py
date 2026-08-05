@@ -76,6 +76,7 @@ from df_analyze.runtime.hardware import (
     RuntimeComponent,
     cleanup_torch_accelerator,
     configure_torch_cuda,
+    is_cuda_runtime_error,
 )
 from df_analyze.splitting import ApproximateStratifiedGroupSplit
 
@@ -728,6 +729,7 @@ class GandalfContLightningModel(LightningModule):
 class GandalfEstimator(DfAnalyzeModel):
     shortname = "gandalf"
     longname = "GANDALF - Gated Adaptive Network"
+    runtime_component = RuntimeComponent.Gandalf
     timeout_s = 3600
     # GANDALF tunes against an internal train/validation split rather than
     # OmniKFold, so the shared K-fold support preflight does not apply.
@@ -1236,6 +1238,8 @@ class GandalfEstimator(DfAnalyzeModel):
                 score = metric.tuning_score(y_true=y_true, y_pred=preds)
                 return score
             except Exception as e:
+                if self._uses_accelerator() and is_cuda_runtime_error(e):
+                    raise
                 traceback.print_exc()
                 print(f"Got error: {e}")
                 if metric.higher_is_better():

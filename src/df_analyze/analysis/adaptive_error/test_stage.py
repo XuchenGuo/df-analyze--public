@@ -6,6 +6,7 @@ from typing import (
     Any,
     Optional,
 )
+from warnings import warn
 
 import numpy as np
 import pandas as pd
@@ -43,6 +44,14 @@ from df_analyze.analysis.adaptive_error.report import (
     _write_not_available_parquet,
     _write_not_available_png,
     _write_sanity_checks,
+)
+from df_analyze.runtime.hardware import (
+    DeviceIntent,
+    RuntimeComponent,
+    clear_fitted_model_state,
+    device_reason_text,
+    is_cuda_runtime_error,
+    release_accelerator_memory,
 )
 
 
@@ -204,7 +213,7 @@ def _compute_test_confidence(
     return conf_test, used_conf_metric
 
 
-def _evaluate_test_stage(
+def _evaluate_test_stage_attempt(
     *,
     result,
     X_train,
@@ -411,3 +420,105 @@ def _evaluate_test_stage(
         proba_test_cal=proba_test_cal,
         test_bins_df=test_bins_df,
     )
+
+
+def _clear_model_state_for_cpu_retry(model) -> None:
+    try:
+        clear_fitted_model_state(model)
+    except Exception:
+        pass
+    cleanup = getattr(model, "_cleanup_after_fold", None)
+    if callable(cleanup):
+        try:
+            cleanup()
+        except Exception:
+            pass
+    release_accelerator_memory()
+
+
+def _evaluate_test_stage(
+    *,
+    result,
+    X_train,
+    X_test,
+    y_train,
+    y_test,
+    labels_map,
+    aer: AdaptiveErrorCalculator,
+    calibrator,
+    selected_conf_metric: str,
+    selected_conf_params: dict[str, Any],
+    options,
+    no_preds: bool,
+    m_preds: Path,
+    m_tables: Path,
+    m_plots: Path,
+    m_meta: Path,
+) -> _TestEvalResult:
+    attempt_args = {
+        "result": result,
+        "X_train": X_train,
+        "X_test": X_test,
+        "y_train": y_train,
+        "y_test": y_test,
+        "labels_map": labels_map,
+        "aer": aer,
+        "calibrator": calibrator,
+        "selected_conf_metric": selected_conf_metric,
+        "selected_conf_params": selected_conf_params,
+        "options": options,
+        "no_preds": no_preds,
+        "m_preds": m_preds,
+        "m_tables": m_tables,
+        "m_plots": m_plots,
+        "m_meta": m_meta,
+    }
+    model = result.model
+    base_runtime = getattr(model, "runtime", None)
+    if base_runtime is None:
+        return _evaluate_test_stage_attempt(**attempt_args)
+
+    component = getattr(
+        result.model_cls,
+        "runtime_component",
+        RuntimeComponent.Sklearn,
+    )
+    runtime = base_runtime.for_task(
+        len(X_train),
+        X_train.shape[1],
+        n_queries=len(X_test),
+    )
+    decision = runtime.decision_for(component)
+    print(
+        "[device] Adaptive error holdout "
+        f"{getattr(model, 'shortname', result.model_cls.__name__)} / "
+        f"{getattr(result, 'selection', 'none')}: {decision.resolved.upper()} "
+        f"({len(X_train)} train rows x {len(X_test)} query rows x "
+        f"{X_train.shape[1]} features; {device_reason_text(decision)})"
+    )
+
+    try:
+        model.set_runtime(runtime)
+        return _evaluate_test_stage_attempt(**attempt_args)
+    except Exception as error:
+        cuda_failure = (
+            decision.resolved == "cuda" and is_cuda_runtime_error(error)
+        )
+        if runtime.intent is DeviceIntent.Auto and cuda_failure:
+            _clear_model_state_for_cpu_retry(model)
+            runtime.record_cpu_fallback(
+                component,
+                f"cuda_runtime_fallback:{type(error).__name__}",
+            )
+            model.set_runtime(runtime)
+            warn(
+                "Adaptive error holdout encountered a CUDA runtime failure. "
+                "Restarting this complete model/selection holdout task on CPU once."
+            )
+            return _evaluate_test_stage_attempt(**attempt_args)
+        if runtime.intent is DeviceIntent.CUDA and cuda_failure:
+            raise RuntimeError(
+                "Adaptive error holdout failed on CUDA while --device cuda is "
+                "strict. CPU fallback is disabled."
+            ) from error
+        raise

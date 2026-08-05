@@ -1,198 +1,288 @@
-# Error consistency and repeated K-fold design
+# Error consistency
 
-## Scientific scope
+Error consistency (EC) asks a simple question: when the same model is trained
+again, does it make similar errors on the same samples?
 
-Error consistency (EC) complements ordinary goodness-of-fit metrics by asking
-whether independently refitted models make similar errors on the **same external
-holdout rows**. It is a conditional post-selection stability analysis in
-df-analyze: preprocessing, selected features, and tuned hyperparameters are fixed
-before EC begins.
+Accuracy, MAE, and other performance scores tell us how much error a model
+makes. EC tells us whether repeated fits fail in the same places. Two models can
+have the same accuracy or MAE and still have very different EC.
 
-Classification error IoU implements Equation 1 of
-[Levman et al. (2023)](#references). The first four regression definitions were
-introduced by [Rahman, Berger, and Levman (2022)](#references). The seven-method
-set follows the extended manuscript and reference implementations listed under
-[References](#references). The extended manuscript does not provide a DOI or
-other public publication identifier, so it is cited as an unpublished
-manuscript rather than as a published article.
+## How df-analyze runs EC
 
-The regression residual-consistency methods in df-analyze are experimental
-descriptive extensions. They are not established inferential statistics,
-hypothesis tests, or confidence intervals.
+df-analyze runs EC after preprocessing, feature selection, and hyperparameter
+tuning:
 
-For each of `R` repetitions, the training set is shuffled and partitioned into
-`K` folds. One model is fit on the complement of each fold, so there are
-`M = K * R` fitted models. Every model predicts the unchanged external holdout.
-The main estimate uses all `M * (M - 1) / 2` model pairs.
-Ordinary out-of-fold predictions are not substituted because different folds do
-not predict the same rows and therefore cannot support samplewise EC directly.
+1. It keeps the selected features and tuned parameters fixed.
+2. It splits the training data into `K` folds.
+3. It fits one model on the complement of each fold.
+4. It repeats the shuffled K-fold split `R` times.
+5. Every fitted model predicts the same external holdout rows.
+6. It compares every pair of fitted models.
 
-Grouped data use group-aware splitting. If a group-disjoint repeated K-fold
-partition cannot be created, that model configuration is skipped rather than
-silently falling back to folds with group overlap. Every successful
-validation-fold assignment is recorded in `fold_assignments.csv`; a model's
-training rows are the complement of its recorded validation fold.
-
-## Classification definition
-
-For model `i`, let `E_i` be the set of external-holdout rows it classifies
-incorrectly. Pairwise classification EC is the Jaccard index
+This produces `K * R` models for each target, model, and selected feature set.
+The number of model pairs is:
 
 ```text
-EC(i, j) = |E_i intersection E_j| / |E_i union E_j|.
+(K * R) * (K * R - 1) / 2
 ```
 
-Its range is `[0, 1]`, and the optimum is `1`. When both error sets are empty,
-the result is mathematically undefined. `--ec-empty-unions` makes that policy
-explicit. The default `warn` emits one warning and records the undefined
-comparison as `NaN`; finite summary statistics exclude those comparisons. The
-`0`, `1`, `nan`, `drop`, and `error` policies remain available for explicit use.
+The repeated folds change the rows used for fitting. They do not change the
+holdout rows used to calculate EC. This is different from ordinary repeated
+K-fold cross-validation, where each fold is evaluated on a different set of
+rows.
 
-## Regression definitions
+For grouped data, df-analyze keeps groups in separate folds. If it cannot make a
+valid group-separated split, it skips that configuration and records the
+reason. It does not silently fall back to overlapping groups.
 
-Let `r_i(s)` and `r_j(s)` be residuals from two models on holdout sample `s`,
-with `a = |r_i(s)|`, `b = |r_j(s)|`, and
-`z = sign(r_i(s) * r_j(s))`. The seven implemented definitions are:
+## Quick start
 
-| Method | Samplewise value | Optimum | Range | Source |
-|---|---:|---:|---:|---|
-| `ratio` | `min(a,b) / max(a,b)` | 1 | `[0,1]` | [Rahman et al. (2022)](#references) |
-| `ratio_diff` | `|a-b| / (a+b)` | 0 | `[0,1]` | [Rahman et al. (2022)](#references) |
-| `ratio_sign` | `z * min(a,b) / max(a,b)` | 1 | `[-1,1]` | [Rahman et al. (2022)](#references) |
-| `ratio_diff_sign_magnitude` | primary: `|z * |a-b| / (a+b)|` | 0 | `[0,1]` | [Rahman et al. (2022)](#references), with the aggregation adaptation below |
-| `intersection_union_sample` | `I(s) / U(s)` | 1 | `[0,1]` | [extended manuscript](#references) |
-| `intersection_union_all` | `sum_s I(s) / sum_s U(s)` | 1 | `[0,1]` | [extended manuscript](#references) |
-| `intersection_union_distance` | `D(s)` | 0 | `[0,infinity)` | [extended manuscript](#references) |
+Run these commands from the repository root. Both examples use 2 folds and
+2 repetitions, so each configuration is refitted 4 times.
 
-For residuals on the same side of zero, `I = min(a,b)`, `U = max(a,b)`, and
-`D = |a-b|`. For residuals on opposite sides, `I = 0`, `U = a+b`, and `D = a+b`.
-When both residuals are zero, ratio and intersection-over-union values are `1`,
-while ratio-difference values and distance are `0`.
-
-For `ratio_diff_sign_magnitude`, the raw signed sample value is retained in
-`ec_signed_mean` and `pair_signed_mean` as a direction diagnostic. Its primary
-`ec_mean`, pair matrix, and sample profile aggregate the absolute signed value.
-This prevents equal positive and negative discrepancies from cancelling to zero
-and falsely appearing optimal. The legacy `ratio_diff_sign` spelling remains a
-CLI alias and the compatibility method name in existing serialized result
-schemas. The supplied manuscript and reference implementation aggregate the
-signed values directly, so this magnitude-first summary is an explicit
-df-analyze adaptation rather than an exact reproduction of that one summary.
-
-The default `--ec-epsilon 0` follows the unregularized ratio definitions above. For
-positive epsilon and two non-zero residual magnitudes, `ratio` and `ratio_sign`
-use `(min(a,b) + epsilon) / (max(a,b) + epsilon)`. A zero-over-nonzero endpoint
-remains `0`, and two zero residuals remain `1`. The ratio-difference methods add
-epsilon to their denominator. This preserves a ratio of 1 for equal residual
-magnitudes while keeping the exact zero endpoints. The chosen value is recorded
-in the output. Intersection-union distance is
-unbounded and scale-dependent; it should be treated as a diagnostic and not
-compared numerically across targets with different units.
-
-## Aggregation and dispersion
-
-`ec_mean` retains the all-model-pairs estimate. The output also
-separates `within_repetition` and `between_repetition` pairs and reports one mean
-within-repetition estimate per repetition. This exposes the dependence structure
-without changing the primary estimate.
-
-The dispersion columns have distinct meanings:
-
-- `ec_model_pair_sd`: sample SD of model-pair EC means.
-- `ec_pooled_value_sd` (legacy `ec_sd`): SD after pooling pair-by-sample values
-  for samplewise regression metrics.
-- `ec_sample_profile_sd`: SD across holdout samples after averaging each sample
-  over model pairs.
-- `EC_scalar_sd` and `EC_vec_sd`: preserved legacy output labels.
-
-All are descriptive dispersions. Model pairs share fitted models and all values
-share the same holdout, so these SDs are not standard errors or confidence
-intervals. There is no universal dataset-independent EC cutoff.
-
-## Randomness and reproducibility
-
-Split seeds vary deterministically by repetition. `--ec-model-seed-mode vary`
-(default) assigns a reproducible, distinct model seed to every repetition/fold,
-capturing training-subset and algorithmic instability. `fixed` reuses the base
-model seed to isolate training-subset sensitivity as far as the estimator and
-hardware permit. Python, NumPy, and PyTorch RNGs are seeded, and recognized
-estimator seed arguments are overridden and audited in `trial_design.csv`.
-
-GPU kernels and third-party estimators may still have nondeterministic execution;
-the recorded seeds make the experimental intent reproducible but do not promise
-bit-for-bit equality on every platform.
-
-The default of five repetitions is a runtime-conscious descriptive default, not a
-claim of inferential precision. Increase repetitions when the stability of the
-point estimate matters, and report the chosen value. More repetitions do not turn
-the dependent model-pair dispersions into confidence intervals.
-
-## Command-line use
-
-Classification uses the error-set intersection-over-union method automatically.
-For regression, omitting `--ec-methods` computes all seven methods. A subset can
-be selected with, for example:
+Classification:
 
 ```shell
---ec \
---ec-folds 5 \
---ec-repetitions 3 \
---ec-methods ratio ratio_diff intersection_union_all
+python df-analyze.py \
+    --df data/small_classifier_data.json \
+    --target target \
+    --mode classify \
+    --classifiers lr dummy \
+    --feat-select filter \
+    --htune-trials 1 \
+    --ec \
+    --ec-folds 2 \
+    --ec-repetitions 2 \
+    --ec-output-detail summary \
+    --outdir ./ec_classification_results
 ```
 
-The available controls are:
+Regression:
+
+```shell
+python df-analyze.py \
+    --df data/testing/regression/forest_fires/forest_fires.parquet \
+    --target target \
+    --mode regress \
+    --regressors elastic dummy \
+    --feat-select filter \
+    --htune-trials 1 \
+    --ec \
+    --ec-folds 2 \
+    --ec-repetitions 2 \
+    --ec-methods ratio ratio_diff intersection_union_all \
+    --ec-output-detail summary \
+    --outdir ./ec_regression_results
+```
+
+The regression command calculates three methods to keep the first run short.
+Omit `--ec-methods` to calculate all seven default methods.
+
+## Classification EC
+
+For model `i`, let `E_i` be the holdout rows it classifies incorrectly. EC for
+models `i` and `j` is the intersection-over-union of their error sets:
+
+```text
+EC(i, j) = |E_i intersection E_j| / |E_i union E_j|
+```
+
+The result is between 0 and 1:
+
+- `1` means the two models make errors on the same rows.
+- `0` means their error sets do not overlap.
+
+If neither model makes an error, the union is empty and the ratio is undefined.
+The default `--ec-empty-unions warn` issues one warning and stores the value as
+`NaN`. The finite summary values ignore those comparisons. The other choices
+are `0`, `1`, `nan`, `drop`, and `error`.
+
+## Regression EC
+
+For a holdout sample `s`, df-analyze defines a residual as:
+
+```text
+r_i(s) = prediction_i(s) - true_value(s)
+```
+
+For two models, let `a = |r_i(s)|`, `b = |r_j(s)|`, and
+`z = sign(r_i(s) * r_j(s))`.
+
+| CLI name | Value | Best value | What it compares |
+|---|---:|---:|---|
+| `ratio` | `min(a,b) / max(a,b)` | 1 | Similarity of residual sizes |
+| `ratio_diff` | `|a-b| / (a+b)` | 0 | Relative difference between residual sizes |
+| `ratio_sign` | `z * min(a,b) / max(a,b)` | 1 | Residual size and whether both predictions fall on the same side of the true value |
+| `ratio_diff_sign_magnitude` | `|a-b| / (a+b)` | 0 | Residual-size difference; signed direction is saved separately |
+| `intersection_union_sample` | `I(s) / U(s)` | 1 | Residual overlap for each holdout sample |
+| `intersection_union_all` | `sum I(s) / sum U(s)` | 1 | Residual overlap after pooling the holdout samples |
+| `intersection_union_distance` | `|r_i(s)-r_j(s)|` | 0 | Absolute disagreement between the two predictions |
+
+For the intersection-union methods:
+
+- If the residuals are on the same side of zero, `I = min(a,b)` and
+  `U = max(a,b)`.
+- If they are on opposite sides, `I = 0` and `U = a+b`.
+
+When both residuals are zero, ratio and intersection-over-union values are 1;
+ratio-difference and distance values are 0.
+
+### Compatibility note for ratio-diff-sign
+
+The reference implementation signs the ratio difference before averaging.
+Positive and negative values can therefore cancel. df-analyze provides two
+explicit choices:
+
+- `ratio_diff_sign_magnitude` is the default. Its main score uses the unsigned
+  difference, while `ec_signed_mean` and `pair_signed_mean` keep the direction.
+- `ratio_diff_sign_reference` uses the signed reference calculation directly.
+  It is reported but is not included in automatic rankings.
+
+The older name `ratio_diff_sign` still works and keeps its previous
+magnitude-first behaviour. New commands should use one of the two explicit
+names.
+
+Several regression methods are mathematically related. For example, when both
+residual sizes are nonzero,
+`ratio_diff = (1 - ratio) / (1 + ratio)`. Treat the methods as different views
+of the same fits, not as independent votes.
+
+`intersection_union_distance` is in the target's units and has no upper bound.
+Do not compare its raw value across targets that use different units.
+
+The default `--ec-epsilon 0` uses the formulas above. A positive epsilon can
+stabilize ratio denominators near zero. The value used for a run is saved in the
+metadata.
+
+## Main options
 
 | Option | Default | Meaning |
 |---|---:|---|
-| `--error-consistency`, `--ec` | off | Enable EC after model tuning and feature selection |
-| `--ec-folds` | `5` | Folds per repetition; must be at least 2 |
-| `--ec-repetitions` | `5` | Independently shuffled repetitions; must be at least 1 |
-| `--ec-model-seed-mode` | `vary` | `vary` includes model-seed variation; `fixed` reuses the base model seed |
-| `--ec-methods` | all seven | Regression methods to compute |
+| `--test-val-size` | `0.4` | Fraction or count kept as the shared holdout |
+| `--error-consistency`, `--ec` | off | Run EC after feature selection and tuning |
+| `--ec-folds` | `5` | Folds in each repetition; minimum 2 |
+| `--ec-repetitions` | `5` | Independently shuffled K-fold repetitions; minimum 1 |
+| `--ec-model-seed-mode` | `vary` | `vary` changes the model seed by fold; `fixed` reuses the base seed |
+| `--ec-methods` | all seven | Regression methods to calculate |
+| `--ec-holdout-role` | `test` | Controls whether ranking and EC/performance comparisons are written |
+| `--ec-output-detail` | `full` | Keep `summary`, `pairwise`, or `full` output |
+| `--ec-resume` | off | Continue a matching checkpoint or reuse a completed one |
+| `--ec-checkpoint-every` | `5` | Save a checkpoint after this many repetitions |
 | `--ec-save-predictions` | off | Save holdout predictions and residual/error matrices |
-| `--ec-empty-unions` | `warn` | Classification policy: `0`, `1`, `nan`, `drop`, `error`, or `warn` |
-| `--ec-epsilon` | `0` | Non-negative stabilization for regression ratio denominators |
-| `--ec-recurrence-threshold` | `0.5` | Heuristic for the joined adaptive-error/EC report; not a universal cutoff |
+| `--ec-empty-unions` | `warn` | Handle classification pairs where both error sets are empty |
+| `--ec-epsilon` | `0` | Stabilize regression ratio denominators |
+| `--ec-recurrence-threshold` | `0.5` | Label high recurrence in the combined adaptive-error/EC report |
 
-See [Command-line arguments](arguments.md) for the generated
-CLI help and validation rules.
+`--ec-model-seed-mode vary` measures changes from both the training rows and
+model randomness. `fixed` keeps the model seed the same, which focuses the
+comparison on changes in the training rows as far as the estimator and hardware
+allow.
 
-## Output files
+EC uses the external holdout already created by df-analyze. It does not make an
+extra split. Set `--test-val-size 0.2` for an 80/20 train/holdout split.
 
-The root `results/error_consistency` directory contains:
+`--ec-holdout-role test` is the safe default. It calculates EC but leaves
+`model_ec_ranking.csv` and `correlation_summary.csv` with headers only. Use
+`validation` only when the shared holdout is separate validation or audit data.
+The option records how the holdout is being used; it does not create a new data
+split.
 
-- `summary.csv`: EC summaries for every target, model, selection, and method.
-- `performance_summary.csv`: predictive performance of the repeated fold models
-  on the common holdout.
-- `trial_scores.csv`, `trial_design.csv`, and `fold_assignments.csv`: fold-level
-  scores, split and seed audit, and exact validation-fold assignments.
-- `correlation_summary.csv`, `model_ec_ranking.csv`, and
-  `target_ec_trend.csv`: descriptive performance/stability comparisons.
-- `metadata.json` and `README.md`: run metadata and interpretation notes.
-- `plots/`: EC distributions, EC/performance plots, and correlation heatmaps
-  when the required data are available.
+`--ec-output-detail summary` keeps the main tables and audit files. `pairwise`
+also keeps model-pair tables and plots. `full` adds sample-level tables and
+diagnostics. `--ec-save-predictions` adds prediction and residual/error
+matrices at any detail level.
+
+## Reference experiment profiles
+
+The profiles make it easier to use the split and repetition settings from the
+reference experiments:
+
+```shell
+# 80/20 holdout, 5 folds, 10 repetitions, fixed model seeds
+--ec-profile classification-paper
+
+# 80/20 holdout, 5 folds, 50 repetitions, fixed model seeds
+--ec-profile regression-paper
+```
+
+An option supplied on the command line or in a spreadsheet overrides that one
+profile setting. The profiles do not download the original data or reproduce
+the papers' preprocessing, model implementations, or result tables.
+
+## Runtime and hardware
+
+Runtime grows with the number of folds, repetitions, targets, models, and
+selected feature sets.
+
+| Settings | Refits per configuration | Model pairs |
+|---|---:|---:|
+| 2 folds x 2 repetitions | 4 | 6 |
+| Default: 5 folds x 5 repetitions | 25 | 300 |
+| Classification profile: 5 x 10 | 50 | 1,225 |
+| Regression profile: 5 x 50 | 250 | 31,125 |
+
+Model fitting is usually the largest cost. Start with 2 x 2 and one model when
+checking a new dataset. Increasing `--ec-repetitions` improves the stability of
+the descriptive estimate, but it increases refit time in direct proportion.
+
+`--ec-output-detail summary` reduces memory use and output size; it does not
+reduce refit time. CUDA may speed up a large pairwise EC calculation, but it
+does not remove the cost of fitting the models. Small EC calculations stay on
+NumPy because moving data to a GPU can be slower than calculating them on the
+CPU.
+
+Each configuration has a `.ec_checkpoint` directory. With `--ec-resume`,
+df-analyze continues from the last saved repetition when the data and EC
+settings match. It refuses to reuse a checkpoint when the prepared data,
+methods, folds, repetitions, seeds, formula version, or output detail differ.
+
+## Reading the results
+
+df-analyze creates a dataset/run folder below the selected output directory.
+EC files are stored in `results/error_consistency` inside that run folder.
+Start with:
+
+- `summary.csv`: one EC summary for each target, model, feature set, and method.
+- `performance_summary.csv`: predictive performance of the repeated fits on the
+  shared holdout.
+- `trial_failures.csv`: any refit that failed and the reason.
+- `selection_guard.csv`: the declared holdout role and whether ranking and
+  correlation output was enabled.
+
+In `summary.csv`, use `optimal_value` and `optimization_direction` when reading
+`ec_mean`. A larger value is not better for every regression method.
+
+The main audit files are:
+
+- `trial_scores.csv`: predictive score for each fitted model.
+- `trial_design.csv`: repetition, fold, split seed, model seed, split sizes, and
+  group-overlap checks.
+- `fold_assignments.csv`: the validation fold assigned to each training row.
+- `reproducibility_manifest.json`: input hashes, versions, resolved EC settings,
+  and the command with sensitive values removed.
 
 Each `<target>/<model>/<selection>_<embed-selector>/` directory contains the
-configuration-level trial files, `pairwise_values.csv`,
-`pairwise_matrix_<method>.csv`, applicable `sample_ec_<method>.csv` files,
-sample and optional group diagnostics, and pairwise plots. Classification
-outputs include consistently wrong samples; regression outputs include samples
-with large residual consensus. `--ec-save-predictions` additionally writes
+tables and checkpoint for one configuration. Pairwise and sample-level files
+depend on `--ec-output-detail`. Classification configurations always include
+`leave_one_model_out.csv`. With `--ec-save-predictions`, they also include
 `trial_predictions.csv` and `residual_or_error_matrix.csv`.
 
-With multiple external test sets, EC output is nested under `testXX`. When both
-adaptive error and EC are enabled, the adaptive-error `tables` directory also
-contains `risk_stability_report.csv`, `risk_stability_summary.csv`, and
-`risk_stability_skipped.csv`. See [Program outputs](program_outputs.md) for the
-project-wide directory layout.
+For multiple external test sets, the EC directories are nested under `testXX`.
+When adaptive error and EC are both enabled, the combined report is written to
+`results/adaptive_error/tables/risk_stability_report.csv`.
 
-## Interpretation
+## How to use EC
 
-Rank models by absolute distance from each method's declared optimum, not by an
-assumption that larger is always better. EC should accompany, not replace,
-predictive performance. When goodness-of-fit is materially different, prefer the
-better-performing model; when performance is comparable, EC can be used as a
-stability diagnostic or tie-breaker.
+Use EC beside ordinary predictive performance, not instead of it. A stable
+model can still be inaccurate, and an accurate model can still be unstable.
+
+There is no EC cutoff that works for every dataset. The reported standard
+deviations describe variation across dependent model pairs or holdout samples;
+they are not standard errors or confidence intervals.
+
+If the shared holdout is the final test set, report the results but do not use
+them to choose a model or break a tie. If model comparison is the goal, use a
+separate validation or audit holdout and set `--ec-holdout-role validation`.
 
 ## References
 
@@ -207,15 +297,15 @@ stability diagnostic or tie-breaker.
    [https://doi.org/10.1109/CSDE56538.2022.10089291](https://doi.org/10.1109/CSDE56538.2022.10089291)
 3. Rahman, M. M., Berger, D., Wang, J., Shah, P., Tyrrell, P., and Levman, J.
    "Toward Robust Validation of Regression Models Using Novel Metrics With
-   Application to Deep Learning." Unpublished manuscript supplied as a project
-   reference; no DOI or public publication identifier was provided.
-4. Rahman, M. M. Reference implementations and experiments:
-   [simulated datasets](https://github.com/mostafiz67/Regression_EC_Simulation),
-   [real-world datasets](https://github.com/mostafiz67/Regression_EC_Real_World_Data),
+   Application to Deep Learning." Unpublished manuscript supplied with the
+   project reference material.
+4. Rahman, M. M. Reference implementations:
+   [simulated data](https://github.com/mostafiz67/Regression_EC_Simulation),
+   [real-world data](https://github.com/mostafiz67/Regression_EC_Real_World_Data),
    [classification versus regression](https://github.com/mostafiz67/Class_EC_VS_Reg_EC),
    [MNIST](https://github.com/mostafiz67/Regression_EC_MNIST),
    [rUNet](https://github.com/mostafiz67/Regression_EC_rUnet), and
-   [MIMIC-III](https://github.com/mostafiz67/Regression_EC_MIMIC-III) (2025).
-5. Deep Learning Lab. [Classification Error
-   Consistency](https://github.com/stfxecutables/error-consistency), reference
-   implementation.
+   [MIMIC-III](https://github.com/mostafiz67/Regression_EC_MIMIC-III).
+5. Deep Learning Lab.
+   [Classification Error Consistency](https://github.com/stfxecutables/error-consistency),
+   reference implementation.

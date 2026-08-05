@@ -57,6 +57,26 @@ def test_encode_targets_keeps_low_support_rows() -> None:
     assert labels["target_a"] == {0: "0", 1: "1"}
 
 
+def test_encode_targets_preserves_numeric_label_order() -> None:
+    df = DataFrame(
+        {
+            "feature": np.arange(24),
+            "target_a": np.tile([2, 10], 12),
+            "target_b": np.tile([0, 1], 12),
+        }
+    )
+
+    _, y, labels, _, _ = encode_targets(
+        df,
+        ["target_a", "target_b"],
+        np.arange(20),
+        [np.arange(20, 24)],
+    )
+
+    assert labels["target_a"] == {0: "2", 1: "10"}
+    assert y["target_a"].iloc[:2].tolist() == [0, 1]
+
+
 def test_clean_regression_targets_preserves_units() -> None:
     df = DataFrame(
         {

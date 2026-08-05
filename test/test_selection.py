@@ -33,13 +33,17 @@ from df_analyze.enumerables import (
     WrapperSelectionModel,
 )
 from df_analyze.nonsense import silence_spam
-from df_analyze.selection.embedded import embed_select_features
+from df_analyze.selection.embedded import EmbedSelected, embed_select_features
 from df_analyze.selection.filter import (
     FilterSelected,
     filter_by_univariate_associations,
     filter_by_univariate_predictions,
 )
-from df_analyze.selection.multitarget import aggregate_wrapper_selected
+from df_analyze.selection.multitarget import (
+    aggregate_embed_selected,
+    aggregate_filter_selected,
+    aggregate_wrapper_selected,
+)
 from df_analyze.selection.stepwise import (
     RedundantFeatures,
     StepwiseSelector,
@@ -164,6 +168,32 @@ def test_total_filter_count_is_respected_for_continuous_features() -> None:
     prepared = SimpleNamespace(
         X_cont=DataFrame(np.zeros((4, 6)), columns=columns),
         X_cat=DataFrame(index=range(4)),
+        is_classification=True,
+    )
+    associations = AssocResults(
+        conts=DataFrame(
+            {"mut_info": [0.1, 0.6, 0.3, 0.5, 0.2, 0.4]},
+            index=columns,
+        ),
+        cats=None,
+        is_classification=True,
+    )
+
+    selected = filter_by_univariate_associations(
+        prepared,
+        associations,
+        n_total=3,
+    )
+
+    assert selected.selected == ["feature_1", "feature_3", "feature_5"]
+
+
+@pytest.mark.fast
+def test_total_filter_count_supports_missing_categorical_matrix() -> None:
+    columns = [f"feature_{idx}" for idx in range(6)]
+    prepared = SimpleNamespace(
+        X_cont=DataFrame(np.zeros((4, 6)), columns=columns),
+        X_cat=None,
         is_classification=True,
     )
     associations = AssocResults(
@@ -375,6 +405,78 @@ def test_multitarget_aggregation_without_top_k_keeps_union() -> None:
 
     assert selected is not None
     assert set(selected.selected) == {"a", "b", "c", "d"}
+
+
+def test_multitarget_filter_borda_excludes_unselected_candidates() -> None:
+    first = FilterSelected(
+        selected=["f1"],
+        cont_scores=Series({"f1": 3.0, "f2": 2.0, "f3": 1.0}),
+        cat_scores=None,
+        method="prediction",
+        is_classification=True,
+    )
+    second = FilterSelected(
+        selected=["f2"],
+        cont_scores=Series({"f1": 1.0, "f2": 3.0, "f3": 2.0}),
+        cat_scores=None,
+        method="prediction",
+        is_classification=True,
+    )
+
+    aggregated = aggregate_filter_selected(
+        [first, second],
+        method="prediction",
+        is_cls=True,
+        target_names=["a", "b"],
+    )
+
+    assert set(aggregated.selected) == {"f1", "f2"}
+
+
+def test_multitarget_embed_borda_excludes_unselected_candidates() -> None:
+    first = EmbedSelected(
+        model=EmbedSelectionModel.Linear,
+        selected=["f1"],
+        scores={"f1": 3.0, "f2": 2.0, "f3": 1.0},
+        is_classification=True,
+    )
+    second = EmbedSelected(
+        model=EmbedSelectionModel.Linear,
+        selected=["f2"],
+        scores={"f1": 1.0, "f2": 3.0, "f3": 2.0},
+        is_classification=True,
+    )
+
+    aggregated = aggregate_embed_selected(
+        [[first], [second]], target_names=["a", "b"]
+    )
+
+    assert len(aggregated) == 1
+    assert set(aggregated[0].selected) == {"f1", "f2"}
+
+
+def test_multitarget_frequency_default_keeps_single_target_union() -> None:
+    selected = [
+        WrapperSelected(
+            method=WrapperSelection.StepUp,
+            model=WrapperSelectionModel.Linear,
+            selected=[f"f{idx}"],
+            scores={f"f{idx}": float(idx)},
+            redundants=[],
+            early_stop=False,
+            is_classification=True,
+        )
+        for idx in range(6)
+    ]
+
+    aggregated = aggregate_wrapper_selected(
+        selected,
+        strategy="freq",
+        target_names=[f"target_{idx}" for idx in range(6)],
+    )
+
+    assert aggregated is not None
+    assert set(aggregated.selected) == {f"f{idx}" for idx in range(6)}
 
 
 def do_association_select(dataset: tuple[str, TestDataset]) -> FilterSelected:

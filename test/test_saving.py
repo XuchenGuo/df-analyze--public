@@ -57,6 +57,26 @@ def test_target_markdown_reports_resolved_final_cv_folds() -> None:
     )
     assert "## 3-fold performance on holdout set" in adaptive_report
 
+    scores["positive_class"] = "case"
+    positive_report = ProgramDirs()._target_markdown(
+        scores, target_name="target", is_classification=True
+    )
+    assert "original label `case`" in positive_report
+
+
+def test_safe_target_names_are_collision_resistant() -> None:
+    dirs = ProgramDirs()
+
+    first = dirs._safe_target_name("a/b")
+    second = dirs._safe_target_name("a?b")
+
+    assert first != second
+    assert dirs._safe_target_name("a/b") == first
+    assert first.casefold() != second.casefold()
+    assert dirs._safe_target_name("Outcome").casefold() != dirs._safe_target_name(
+        "outcome"
+    ).casefold()
+
 
 @fast_ds
 def test_random_options(dataset: Tuple[str, TestDataset]) -> None:

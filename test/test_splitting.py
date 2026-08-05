@@ -30,6 +30,8 @@ from df_analyze.splitting import (
     resolve_final_cv_folds,
     validate_multitarget_model_cv_support,
     validate_multitarget_cv_support,
+    validate_multitarget_holdout_coverage,
+    validate_multitarget_regression_support,
     y_split_label_info,
 )
 from df_analyze.testing.datasets import (
@@ -134,6 +136,39 @@ def test_multitarget_cv_support_accepts_feasible_levels() -> None:
     validate_multitarget_cv_support(y, n_splits=5)
 
 
+def test_internal_multitarget_holdout_must_cover_training_levels() -> None:
+    train = DataFrame(
+        {
+            "a": np.tile([0, 1], 20),
+            "b": np.tile([0, 1, 2, 0], 10),
+        }
+    )
+    holdout = DataFrame(
+        {
+            "a": np.tile([0, 1], 10),
+            "b": np.tile([0, 1], 10),
+        }
+    )
+
+    with pytest.raises(ValueError, match="missing level"):
+        validate_multitarget_holdout_coverage(train, holdout, external=False)
+
+
+def test_external_multitarget_holdout_missing_level_warns() -> None:
+    train = DataFrame({"a": np.tile([0, 1, 2], 10)})
+    holdout = DataFrame({"a": np.tile([0, 1], 10)})
+
+    with pytest.warns(UserWarning, match="supplied externally"):
+        validate_multitarget_holdout_coverage(train, holdout, external=True)
+
+
+def test_multitarget_regression_rejects_constant_partition_target() -> None:
+    y = DataFrame({"varying": np.arange(20), "constant": np.zeros(20)})
+
+    with pytest.raises(ValueError, match="'constant' is constant"):
+        validate_multitarget_regression_support(y, phase="test partition")
+
+
 def test_multitarget_model_cv_support_uses_each_declared_fold_design() -> None:
     class ThreeFoldModel:
         shortname = "three-fold"
@@ -210,6 +245,58 @@ def test_multitarget_cv_reseeds_to_preserve_every_target_level_per_fold() -> Non
         for target in y.columns:
             assert y.iloc[train][target].value_counts().min() >= 8
             assert y.iloc[test][target].value_counts().min() >= 2
+
+
+def test_multitarget_regression_cv_reseeds_to_preserve_target_variation() -> None:
+    n = 50
+    y = DataFrame(
+        {
+            "dense": np.arange(n, dtype=float),
+            "sparse": np.r_[np.ones(10), np.zeros(n - 10)],
+        }
+    )
+    splitter = OmniKFold(
+        n_splits=5,
+        is_classification=False,
+        seed=42,
+        warn_on_fallback=False,
+        df_analyze_phase="multi-target regression fold-support test",
+    )
+
+    splits, failed = splitter.split(
+        y,
+        y["dense"],
+        multitarget_y=y,
+    )
+
+    assert not failed
+    for train, validation in splits:
+        for target in y.columns:
+            assert y.iloc[train][target].nunique() >= 2
+            assert y.iloc[validation][target].nunique() >= 2
+
+
+def test_multitarget_regression_cv_rejects_impossible_target_variation() -> None:
+    n = 50
+    y = DataFrame(
+        {
+            "dense": np.arange(n, dtype=float),
+            "sparse": np.r_[np.ones(4), np.zeros(n - 4)],
+        }
+    )
+    splitter = OmniKFold(
+        n_splits=5,
+        is_classification=False,
+        seed=42,
+        warn_on_fallback=False,
+        df_analyze_phase="multi-target regression fold-support test",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="every multi-target regression target varies",
+    ):
+        splitter.split(y, y["dense"], multitarget_y=y)
 
 
 def test_grouped_multitarget_cv_rejects_impossible_per_fold_support() -> None:

@@ -80,6 +80,14 @@ from df_analyze.models.gandalf import GandalfEstimator
 from df_analyze.models.kan import KANEstimator
 from df_analyze.models.mlp import MLPEstimator
 from df_analyze.preprocessing.prepare import PreparedData
+from df_analyze.runtime.hardware import (
+    DeviceIntent,
+    RuntimeComponent,
+    clear_fitted_model_state,
+    device_reason_text,
+    is_cuda_runtime_error,
+    release_accelerator_memory,
+)
 from df_analyze.saving import add_fold_idx
 from df_analyze.scoring import (
     sensitivity,
@@ -117,6 +125,11 @@ class HtuneResult:
     n_downsampled_features: int = 0
     failure_reason: Optional[str] = None
     per_target_tuning_scores: dict[str, float] = field(default_factory=dict)
+    _model_snapshot: Optional[str] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     @no_type_check  # Pyright mucks up the conditionals here...
     def __eq__(self, other: object) -> bool:
@@ -222,6 +235,9 @@ class HtuneResult:
             "probs_dtype": probs_dtype,
             "probs_kind": probs_kind,
             "target": self.target,
+            "downsample_requested": self.downsample_requested,
+            "downsample_resolved": self.downsample_resolved,
+            "n_downsampled_features": self.n_downsampled_features,
             "per_target_tuning_scores": self.per_target_tuning_scores,
         }
         return json.dumps(obj)
@@ -444,10 +460,12 @@ class EvaluationResults:
             )
             .reset_index()
         )
-        sorter = "acc" if self.is_classification else "mae"
-        ascending = not self.is_classification
-        if sorter in df.columns:
-            return df.sort_values(by=sorter, ascending=ascending)
+        sorters = ["acc"] if self.is_classification else ["multi-nmae", "mae"]
+        for sorter in sorters:
+            if sorter in df.columns:
+                return df.sort_values(
+                    by=sorter, ascending=not self.is_classification
+                )
         return df
 
     def to_markdown(self) -> str:
@@ -573,13 +591,20 @@ class EvaluationResults:
             y_test = df_y_test.reset_index(drop=True)
         enc = (root / "eval_htune_results_jsonpickle.json").read_text()
         remain = cast(dict[str, Any], jsonpickle.decode(enc))
+        loaded_results = cast(list[HtuneResult], remain["results"])
+        for result in loaded_results:
+            snapshot = getattr(result, "_model_snapshot", None)
+            if snapshot is None:
+                continue
+            result.model = jsonpickle.decode(snapshot)
+            result._model_snapshot = None
         return EvaluationResults(
             df=df,
             X_train=X_train,
             X_test=X_test,
             y_train=y_train,
             y_test=y_test,
-            results=remain["results"],
+            results=loaded_results,
             is_classification=remain["is_classification"],
             per_target_df=per_target_df,
         )
@@ -613,6 +638,11 @@ class EvaluationResults:
                 probs_test=probs_test,
                 probs_train=probs_train,
                 target=result.get("target"),
+                downsample_requested=result.get("downsample_requested", "none"),
+                downsample_resolved=result.get("downsample_resolved", "none"),
+                n_downsampled_features=int(
+                    result.get("n_downsampled_features", 0)
+                ),
                 per_target_tuning_scores={
                     str(target): float(score)
                     for target, score in result.get(
@@ -647,24 +677,175 @@ def _get_splits(
         X_train = prep_train.X
         X_test = prep_test.X
     else:
-        # clunky way to deal with renames and indicators
-        # should be safe since we sanitize names
-        try:
-            X_train = prep_train.X.filter(regex="|".join(cols))
-            X_test = prep_test.X.filter(regex="|".join(cols))
-        except Exception:
-            to_drop = set()
-            for col in cols:  # may be e.g. colname__target.1
-                for c in prep_train.X.columns:
-                    cname = os.path.commonprefix([col, c])
-                    if cname == "":
-                        continue
-                    if cname in [col, c]:  # handle e.g. car1, car2
-                        to_drop.add(c)
-            X_train = prep_train.X.drop(list(to_drop))
-            X_test = prep_test.X.drop(list(to_drop))
+        requested = {str(col) for col in cols}
+
+        def resolved_columns(prepared: PreparedData) -> list[str]:
+            lineage = getattr(prepared, "feature_lineage", {}) or {}
+            return [
+                str(column)
+                for column in prepared.X.columns
+                if str(column) in requested
+                or str(lineage.get(str(column), str(column))) in requested
+            ]
+
+        train_cols = resolved_columns(prep_train)
+        test_cols = resolved_columns(prep_test)
+        if train_cols != test_cols:
+            raise ValueError(
+                "Selected feature columns do not resolve identically in the "
+                "training and holdout matrices."
+            )
+        if len(train_cols) == 0:
+            raise ValueError(
+                "None of the selected features could be resolved in the prepared "
+                "model matrix."
+            )
+        X_train = prep_train.X.loc[:, train_cols]
+        X_test = prep_test.X.loc[:, test_cols]
 
     return X_train, X_test
+
+
+def _new_model(
+    model_cls: Type[DfAnalyzeModel],
+    prepared: PreparedData,
+) -> DfAnalyzeModel:
+    if model_cls in (MLPEstimator, KANEstimator, GandalfEstimator):
+        return model_cls(num_classes=prepared.num_classes)  # type: ignore
+    return model_cls()  # type: ignore
+
+
+def _record_model_device(
+    options: ProgramOptions,
+    model_name: str,
+    selection: str,
+    runtime,
+    component: RuntimeComponent,
+    *,
+    attempt: int,
+    stage: str,
+    error: Optional[BaseException] = None,
+) -> None:
+    record: dict[str, object] = {
+        "fold": getattr(options, "_runtime_current_fold", None),
+        "model": model_name,
+        "selection": selection,
+        "attempt": attempt,
+        "stage": stage,
+        **runtime.decision_for(component).to_dict(),
+    }
+    if error is not None:
+        record["error_type"] = type(error).__name__
+        record["error_message"] = str(error)
+    audit = getattr(options, "_runtime_model_audit", [])
+    audit.append(record)
+    options._runtime_model_audit = audit
+
+
+def _release_fitted_model_state(
+    model: DfAnalyzeModel,
+    component: RuntimeComponent,
+    *,
+    force: bool = False,
+) -> None:
+    """Drop fitted estimators after predictions/parameters have been captured."""
+    runtime = getattr(model, "runtime", None)
+    resolved = "cpu"
+    if runtime is not None:
+        try:
+            resolved = runtime.decision_for(component).resolved
+        except Exception:
+            resolved = "cpu"
+    if not force and resolved not in {"cuda", "mps"}:
+        return
+    try:
+        clear_fitted_model_state(model)
+        cleanup = getattr(model, "_cleanup_after_fold", None)
+        if callable(cleanup):
+            cleanup()
+    except Exception as error:
+        warn(
+            "Could not completely release fitted model state for "
+            f"{getattr(model, 'shortname', type(model).__name__)}: {error}"
+        )
+    if resolved in {"cuda", "mps"}:
+        release_accelerator_memory()
+
+
+def _snapshot_accelerator_model(
+    result: HtuneResult,
+    component: RuntimeComponent,
+) -> bool:
+    """Preserve a reloadable fitted model before releasing accelerator state."""
+    runtime = getattr(result.model, "runtime", None)
+    if runtime is None:
+        return False
+    try:
+        resolved = runtime.decision_for(component).resolved
+    except Exception:
+        return False
+    if resolved not in {"cuda", "mps"}:
+        return False
+    try:
+        result._model_snapshot = str(
+            jsonpickle.encode(result.model, unpicklable=True)
+        )
+    except Exception as error:
+        warn(
+            "Could not snapshot fitted accelerator model "
+            f"{getattr(result.model, 'shortname', type(result.model).__name__)}; "
+            f"keeping it resident so saved results remain usable: {error}"
+        )
+        return False
+    return True
+
+
+def _tune_and_evaluate_model(
+    model: DfAnalyzeModel,
+    X_train: DataFrame,
+    X_test: DataFrame,
+    prep_train: PreparedData,
+    prep_test: PreparedData,
+    options: ProgramOptions,
+    metric,
+    downsample_result: Optional[FeatureDownsampleResult],
+):
+    tuning_rows = (
+        downsample_result.tuning_rows
+        if downsample_result is not None and downsample_result.tuning_rows
+        else list(range(len(X_train)))
+    )
+    X_tune = X_train.iloc[tuning_rows]
+    y_tune = prep_train.y.iloc[tuning_rows]
+    g_tune = (
+        None if prep_train.groups is None else prep_train.groups.iloc[tuning_rows]
+    )
+    study = model.htune_optuna(
+        X_train=X_tune,
+        y_train=y_tune,
+        g_train=g_tune,
+        n_trials=options.htune_trials,
+        metric=metric,
+        n_jobs=-1,
+        verbosity=optuna.logging.ERROR,
+    )
+    if len(tuning_rows) < len(X_train):
+        model.refit_tuned(
+            X=X_train,
+            y=prep_train.y,
+            g=prep_train.groups,
+            tuned_args=study.best_params,
+        )
+    evaluation = model.htune_eval(
+        X_train=X_train,
+        y_train=prep_train.y,
+        g_train=prep_train.groups,
+        X_test=X_test,
+        y_test=prep_test.y,
+        g_test=prep_test.groups,
+        seed=options.seed,
+    )
+    return study, evaluation
 
 
 def evaluate_tuned(
@@ -730,62 +911,124 @@ def evaluate_tuned(
                     f"selected_cols: {selected_cols}\n"
                 )
 
-            if model_cls in (MLPEstimator, KANEstimator):
-                model = model_cls(num_classes=prepared.num_classes)  # type: ignore
-            elif model_cls is GandalfEstimator:
-                model = model_cls(num_classes=prepared.num_classes)  # type: ignore
-            else:
-                model = model_cls()  # type: ignore
-            model.set_runtime(options.runtime)
-
             is_embed = "embed" in selection
             embed_model = embed_models[selection] if is_embed else None
-            print(f"Tuning {model.longname} for selection={selection}")
+            model_runtime = options.runtime.for_task(
+                len(X_train),
+                X_train.shape[1],
+                n_queries=len(X_train),
+            )
+            component = getattr(
+                model_cls, "runtime_component", RuntimeComponent.Sklearn
+            )
+            model = _new_model(model_cls, prepared)
+            attempt = 0
+            release_model_state = False
             try:
-                tuning_rows = (
-                    downsample_result.tuning_rows
-                    if downsample_result is not None and downsample_result.tuning_rows
-                    else list(range(len(X_train)))
-                )
-                X_tune = X_train.iloc[tuning_rows]
-                y_tune = prep_train.y.iloc[tuning_rows]
-                g_tune = (
-                    None
-                    if prep_train.groups is None
-                    else prep_train.groups.iloc[tuning_rows]
-                )
-                study = model.htune_optuna(
-                    X_train=X_tune,
-                    y_train=y_tune,
-                    g_train=g_tune,
-                    n_trials=options.htune_trials,
-                    metric=metric,  # type: ignore
-                    n_jobs=-1,
-                    verbosity=optuna.logging.ERROR,
-                )
-                if len(tuning_rows) < len(X_train):
-                    model.refit_tuned(
-                        X=X_train,
-                        y=prep_train.y,
-                        g=prep_train.groups,
-                        tuned_args=study.best_params,
+                while True:
+                    attempt += 1
+                    if attempt > 1:
+                        model = _new_model(model_cls, prepared)
+                    decision = model_runtime.decision_for(component)
+                    print(
+                        f"[device] {model.shortname} / {selection}: "
+                        f"{decision.resolved.upper()} "
+                        f"({len(X_train)} rows x {X_train.shape[1]} features; "
+                        f"{device_reason_text(decision)})"
                     )
-                (
-                    df,
-                    preds_train,
-                    preds_test,
-                    probs_train,
-                    probs_test,
-                    df_target,
-                ) = model.htune_eval(
-                    X_train=X_train,
-                    y_train=prep_train.y,
-                    g_train=prep_train.groups,
-                    X_test=X_test,
-                    y_test=prep_test.y,
-                    g_test=prep_test.groups,
-                    seed=options.seed,
-                )
+                    _record_model_device(
+                        options,
+                        model.shortname,
+                        selection,
+                        model_runtime,
+                        component,
+                        attempt=attempt,
+                        stage="started",
+                    )
+                    try:
+                        model.set_runtime(model_runtime)
+                        print(
+                            f"Tuning {model.longname} for selection={selection}"
+                        )
+                        study, evaluation = _tune_and_evaluate_model(
+                            model=model,
+                            X_train=X_train,
+                            X_test=X_test,
+                            prep_train=prep_train,
+                            prep_test=prep_test,
+                            options=options,
+                            metric=metric,
+                            downsample_result=downsample_result,
+                        )
+                        (
+                            df,
+                            preds_train,
+                            preds_test,
+                            probs_train,
+                            probs_test,
+                            df_target,
+                        ) = evaluation
+                        final_decision = model_runtime.decision_for(component)
+                        _record_model_device(
+                            options,
+                            model.shortname,
+                            selection,
+                            model_runtime,
+                            component,
+                            attempt=attempt,
+                            stage="completed",
+                        )
+                        if final_decision.resolved != decision.resolved:
+                            print(
+                                f"[device] {model.shortname} / {selection}: "
+                                f"{final_decision.resolved.upper()} "
+                                f"({device_reason_text(final_decision)})"
+                            )
+                        break
+                    except Exception as error:
+                        _record_model_device(
+                            options,
+                            model.shortname,
+                            selection,
+                            model_runtime,
+                            component,
+                            attempt=attempt,
+                            stage="failed",
+                            error=error,
+                        )
+                        cuda_failure = (
+                            decision.resolved == "cuda"
+                            and is_cuda_runtime_error(error)
+                        )
+                        if (
+                            model_runtime.intent is DeviceIntent.Auto
+                            and cuda_failure
+                            and attempt == 1
+                        ):
+                            _release_fitted_model_state(
+                                model, component, force=True
+                            )
+                            reason = (
+                                "cuda_runtime_fallback:"
+                                f"{type(error).__name__}"
+                            )
+                            model_runtime.record_cpu_fallback(component, reason)
+                            warn(
+                                f"{model.shortname} / {selection} encountered a "
+                                "CUDA runtime failure. Retrying this model on CPU "
+                                "once; other models may continue using CUDA."
+                            )
+                            continue
+                        if (
+                            model_runtime.intent is DeviceIntent.CUDA
+                            and cuda_failure
+                        ):
+                            raise RuntimeError(
+                                f"{model.shortname} / {selection} failed on CUDA "
+                                "while --device cuda is strict. CPU fallback is "
+                                "disabled; use --device auto to allow one CPU retry."
+                            ) from error
+                        raise
                 result = HtuneResult(
                     selection="embed" if is_embed else selection,  # type: ignore
                     selected_cols=X_train.columns.to_list(),
@@ -814,9 +1057,23 @@ def evaluate_tuned(
                         model.per_target_tuning_scores
                     ),
                 )
+                release_model_state = _snapshot_accelerator_model(
+                    result, component
+                )
                 results.append(result)
                 if df_target is not None and len(df_target) > 0:
                     df_target = df_target.copy()
+                    if prepared.is_classification and isinstance(
+                        prep_train.labels, dict
+                    ):
+                        positive_classes = {}
+                        for target_name in prep_train.target_cols:
+                            mapping = prep_train.labels.get(target_name)
+                            if isinstance(mapping, dict) and len(mapping) == 2:
+                                positive_classes[str(target_name)] = mapping.get(1)
+                        df_target["positive_class"] = df_target["target"].astype(
+                            str
+                        ).map(positive_classes)
                     df_target["model"] = model.shortname
                     df_target["selection"] = selection
                     df_target["embed_selector"] = (
@@ -829,6 +1086,12 @@ def evaluate_tuned(
                     )
                     per_target_dfs.append(df_target)
             except Exception as e:
+                if (
+                    model_runtime.intent is DeviceIntent.CUDA
+                    and decision.resolved == "cuda"
+                    and is_cuda_runtime_error(e)
+                ):
+                    raise
                 if prepared.is_classification:
                     nulls = Series(ClassifierScorer.null_scores(), name="metric")
                 else:
@@ -868,6 +1131,7 @@ def evaluate_tuned(
                     n_downsampled_features=n_downsampled_features,
                     failure_reason=str(e),
                 )
+                release_model_state = True
                 results.append(result)
                 if isinstance(prep_test.y, DataFrame):
                     rows = []
@@ -913,6 +1177,12 @@ def evaluate_tuned(
             )
             df["n_downsampled_features"] = n_downsampled_features
             dfs.append(df)
+            if release_model_state:
+                _release_fitted_model_state(
+                    model,
+                    component,
+                    force=result.failure_reason is not None,
+                )
     df = pd.concat(dfs, axis=0, ignore_index=True)
     per_target_df = (
         pd.concat(per_target_dfs, axis=0, ignore_index=True)

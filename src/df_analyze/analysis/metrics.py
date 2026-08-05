@@ -32,9 +32,15 @@ def cohens_d(g0: Union[ndarray, Series], g1: Union[ndarray, Series]) -> float:
 
 
 def auroc(x: Union[ndarray, Series], y_bin: Union[ndarray, Series]) -> float:
+    """Return directionless one-feature discrimination strength.
+
+    This is an association statistic, not a model-performance AUROC. A feature
+    that ranks a class perfectly in the decreasing direction is just as
+    informative as one that ranks it in the increasing direction.
+    """
+
     raw = float(roc_auc_score(y_bin, x, multi_class="raise"))
-    normed = 0.5 + abs(0.5 - raw)
-    return normed
+    return max(raw, 1.0 - raw)
 
 
 def relative_entropy(x: Union[ndarray, Series], y: Union[ndarray, Series]) -> float:

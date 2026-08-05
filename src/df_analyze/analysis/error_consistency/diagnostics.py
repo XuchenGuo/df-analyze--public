@@ -1,3 +1,9 @@
+"""Build sample summaries and optional validation-holdout comparisons.
+
+Model ranking and EC/performance correlations are disabled for a holdout marked
+as final test data.
+"""
+
 from __future__ import annotations
 
 import re
@@ -8,7 +14,6 @@ from numpy import ndarray
 from pandas import DataFrame, Series
 
 from df_analyze.enumerables import ClassifierScorer, RegressorScorer
-
 
 IDENTITY_COLUMNS = ["target", "model", "selection", "embed_selector"]
 CORRELATION_COLUMNS = [
@@ -163,22 +168,41 @@ def compute_model_ec_ranking(summary: DataFrame, performance: DataFrame) -> Data
         return DataFrame()
     keys = [col for col in IDENTITY_COLUMNS if col in summary and col in performance]
     ranking = summary.copy()
-    ranking["stability_distance"] = np.abs(ranking["ec_mean"] - ranking["optimal_value"])
+    supported = (
+        ranking["ranking_supported"].fillna(True).astype(bool)
+        if "ranking_supported" in ranking
+        else Series(True, index=ranking.index)
+    )
+    ranking["stability_distance"] = np.where(
+        supported,
+        np.abs(ranking["ec_mean"] - ranking["optimal_value"]),
+        np.nan,
+    )
     rank_groups = [col for col in ["target", "ec_method"] if col in ranking]
-    ranking["rank_by_stability"] = ranking.groupby(rank_groups, dropna=False)[
-        "stability_distance"
-    ].rank(method="min", ascending=True)
+    ranking["rank_by_stability"] = np.nan
+    if supported.any():
+        rankable = ranking.loc[supported]
+        ranking.loc[supported, "rank_by_stability"] = rankable.groupby(
+            rank_groups, dropna=False
+        )["stability_distance"].rank(method="min", ascending=True)
     if performance.empty:
         return ranking
 
     ranking = ranking.merge(performance, on=keys, how="left")
     if "metric" not in ranking or "ec_trial_mean" not in ranking:
         return ranking
+    supported = (
+        ranking["ranking_supported"].fillna(True).astype(bool)
+        if "ranking_supported" in ranking
+        else Series(True, index=ranking.index)
+    )
     perf_groups = [
         col for col in ["target", "ec_method", "metric"] if col in ranking
     ]
     ranking["rank_by_performance"] = np.nan
-    for _, idx in ranking.groupby(perf_groups, dropna=False).groups.items():
+    for _, idx in ranking.loc[supported].groupby(
+        perf_groups, dropna=False
+    ).groups.items():
         indices = list(idx)
         metric = str(ranking.loc[indices[0], "metric"])
         ranking.loc[indices, "rank_by_performance"] = ranking.loc[

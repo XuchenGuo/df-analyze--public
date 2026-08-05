@@ -19,6 +19,7 @@ from df_analyze.enumerables import ValidationMethod
 from df_analyze.preprocessing.inspection.inspection import inspect_data
 from df_analyze.preprocessing.prepare import (
     PreparedData,
+    _build_multitarget_audit,
     _ensure_target_levels_in_training,
     prepare_data,
     raw_train_test_indices,
@@ -32,7 +33,7 @@ from df_analyze.testing.datasets import (
 )
 
 
-def test_multitarget_split_keeps_every_level_in_training() -> None:
+def test_multitarget_split_rejects_level_that_cannot_cover_holdout() -> None:
     n = 40
     df = DataFrame(
         {
@@ -42,20 +43,132 @@ def test_multitarget_split_keeps_every_level_in_training() -> None:
         }
     )
 
-    train, test, audit = raw_train_test_indices(
+    with pytest.raises(ValueError, match="containing every multi-target"):
+        raw_train_test_indices(
+            df,
+            ["target_a", "target_b"],
+            grouper=None,
+            is_classification=True,
+            test_size=0.8,
+            seed=42,
+        )
+
+
+def test_multitarget_split_retries_until_holdout_covers_every_level() -> None:
+    n = 80
+    df = DataFrame(
+        {
+            "feature": np.arange(n),
+            "target_a": np.tile([0, 1], n // 2),
+            "target_b": [2, 2, *np.tile([0, 1], (n - 2) // 2)],
+        }
+    )
+
+    train, test, _ = raw_train_test_indices(
         df,
         ["target_a", "target_b"],
         grouper=None,
         is_classification=True,
-        test_size=0.8,
+        test_size=0.5,
         seed=42,
     )
 
-    assert len(test) > 0
     for target in ("target_a", "target_b"):
         assert set(df.iloc[train][target]) == set(df[target])
-    if audit is not None and len(train) > int(round(n * 0.2)):
-        assert "Moved" in audit.reason
+        assert set(df.iloc[test][target]) == set(df[target])
+
+
+def test_grouped_multitarget_split_retries_with_distinct_seeds() -> None:
+    n_groups = 12
+    group_size = 3
+    groups = np.repeat(np.arange(n_groups), group_size)
+    df = DataFrame(
+        {
+            "feature": np.arange(n_groups * group_size),
+            "group": groups,
+            "target_a": 0,
+            "target_b": 0,
+        }
+    )
+    df.loc[df["group"].isin([2, 9]), "target_a"] = 1
+    df.loc[df["group"].isin([3, 11]), "target_b"] = 1
+
+    train, test, _ = raw_train_test_indices(
+        df,
+        ["target_a", "target_b"],
+        grouper="group",
+        is_classification=True,
+        test_size=0.25,
+        seed=0,
+    )
+
+    assert set(df.iloc[train]["group"]).isdisjoint(df.iloc[test]["group"])
+    for target in ("target_a", "target_b"):
+        assert set(df.iloc[train][target]) == set(df[target])
+        assert set(df.iloc[test][target]) == set(df[target])
+
+
+def test_prepared_multitarget_split_rejects_impossible_level_coverage() -> None:
+    n = 60
+    prepared = PreparedData(
+        X=DataFrame({"feature": np.arange(n, dtype=float)}),
+        y=DataFrame(
+            {
+                "target_a": np.tile([0, 1], n // 2),
+                "target_b": [1, *([0] * (n - 1))],
+            }
+        ),
+        groups=None,
+        is_classification=True,
+    )
+
+    with pytest.raises(ValueError, match="containing every multi-target"):
+        prepared.split(train_size=0.6, seed=0)
+
+
+def test_prepared_multitarget_regression_split_rejects_constant_partition() -> None:
+    n = 40
+    prepared = PreparedData(
+        X=DataFrame({"feature": np.arange(n, dtype=float)}),
+        y=DataFrame(
+            {
+                "target_a": np.arange(n, dtype=float),
+                "target_b": [1.0, *([0.0] * (n - 1))],
+            }
+        ),
+        groups=None,
+        is_classification=False,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="every target varies in both training and holdout",
+    ):
+        prepared.split(train_size=0.6, seed=0)
+
+
+def test_multitarget_regression_split_retries_until_every_target_varies() -> None:
+    n = 40
+    df = DataFrame(
+        {
+            "feature": np.arange(n, dtype=float),
+            "target_a": np.arange(n, dtype=float),
+            "target_b": np.r_[np.ones(2), np.zeros(n - 2)],
+        }
+    )
+
+    train, test, _ = raw_train_test_indices(
+        df,
+        ["target_a", "target_b"],
+        grouper=None,
+        is_classification=False,
+        test_size=0.4,
+        seed=0,
+    )
+
+    for target in ("target_a", "target_b"):
+        assert df.iloc[train][target].nunique() >= 2
+        assert df.iloc[test][target].nunique() >= 2
 
 
 def test_multitarget_training_coverage_moves_whole_groups() -> None:
@@ -133,6 +246,23 @@ def test_multitarget_preparation_report_contains_audit() -> None:
     assert prepared.info.multitarget_audit.n_original_rows == n
     assert prepared.info.multitarget_audit.n_final_rows == n
     assert "Multi-Target Target Audit" in prepared.to_markdown()
+
+
+def test_multitarget_audit_records_missingness_patterns() -> None:
+    raw = DataFrame(
+        {
+            "a": [1.0, np.nan, np.nan, 1.0],
+            "b": [1.0, 1.0, np.nan, np.nan],
+        }
+    )
+    complete = DataFrame({"a": [1.0], "b": [1.0]})
+
+    audit = _build_multitarget_audit(
+        raw, complete, labels=None, is_classification=False
+    )
+
+    assert audit.missing_patterns == {"a": 1, "a, b": 1, "b": 1}
+    assert "Missing-Target Patterns" in audit.to_markdown()
 
 
 def do_prepare(dataset: tuple[str, TestDataset]) -> None:

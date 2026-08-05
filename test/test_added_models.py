@@ -18,6 +18,10 @@ from torch.nn import Linear, Module
 
 import df_analyze.models.tabpfn as tabpfn_module
 from df_analyze._main import _run
+from df_analyze.analysis.adaptive_error.base_models_runner import (
+    _model_matrix_for_result,
+)
+from df_analyze.analysis.adaptive_error.oof import build_oof_for_result
 from df_analyze.cli.cli import ProgramOptions, get_options, make_parser
 from df_analyze.enumerables import (
     ClassifierScorer,
@@ -26,6 +30,7 @@ from df_analyze.enumerables import (
     TabPFNVersion,
 )
 from df_analyze.hypertune import EvaluationResults, HtuneResult, evaluate_tuned
+from df_analyze.models.base import DfAnalyzeModel
 from df_analyze.models.kan import KANEstimator, SkorchKAN
 from df_analyze.models.tabpfn import (
     TABPFN_CLASSIFIERS,
@@ -95,8 +100,34 @@ def test_real_kan_backend_smoke(task: str) -> None:
     predictions = np.asarray(model.predict(X))
     assert predictions.shape == (len(y),)
     assert np.isfinite(predictions).all()
+    restored = jsonpickle.decode(jsonpickle.encode(model, unpicklable=True))
     if task == "classification":
-        assert np.asarray(model.predict_proba_untuned(X)).shape == (len(y), 2)
+        np.testing.assert_array_equal(restored.predict(X), predictions)
+        probabilities = np.asarray(model.predict_proba_untuned(X))
+        assert probabilities.shape == (len(y), 2)
+        np.testing.assert_allclose(restored.predict_proba_untuned(X), probabilities)
+    else:
+        np.testing.assert_allclose(
+            restored.predict(X), predictions, rtol=1e-6, atol=1e-7
+        )
+
+    tuned_args = {
+        "module__width": 8,
+        "module__depth": 1,
+        "module__grid_size": 3,
+        "module__spline_order": 2,
+        "module__grid_eps": 0.1,
+        "module__sparse_init": False,
+        "early_stopping": False,
+        "restarts": False,
+        "optimizer__lr": 0.01,
+        "optimizer__weight_decay": 1e-6,
+    }
+    model.refit_tuned(X, y, tuned_args=tuned_args)
+    tuned_score = model.tuned_scores(X, y.to_frame())
+    assert np.isfinite(tuned_score)
+    restored_tuned = jsonpickle.decode(jsonpickle.encode(model, unpicklable=True))
+    assert restored_tuned.tuned_scores(X, y) == pytest.approx(tuned_score)
 
 
 @pytest.mark.integration
@@ -130,8 +161,12 @@ def test_real_tabpfn_backend_smoke(version: str, task: str) -> None:
     predictions = np.asarray(model.predict(X))
     assert predictions.shape == (len(y),)
     assert np.isfinite(predictions).all()
+    restored = jsonpickle.decode(jsonpickle.encode(model, unpicklable=True))
+    np.testing.assert_array_equal(restored.predict(X), predictions)
     if task == "classification":
-        assert np.asarray(model.predict_proba_untuned(X)).shape == (len(y), 2)
+        probabilities = np.asarray(model.predict_proba_untuned(X))
+        assert probabilities.shape == (len(y), 2)
+        np.testing.assert_allclose(restored.predict_proba_untuned(X), probabilities)
 
 
 @pytest.mark.fast
@@ -168,6 +203,13 @@ def test_prepared_data_preserves_tabpfn_raw_view_and_lineage() -> None:
     assert prepared.model_matrix(object, ["city_a"]).columns.tolist() == ["city_a"]
     assert prepared.model_matrix(TabPFNClassifierV3, slice(None)).equals(raw)
     assert prepared.model_matrix(object, slice(None)).equals(processed)
+    result = SimpleNamespace(
+        model_cls=TabPFNClassifierV3,
+        selected_cols=["city_a", "age_NAN"],
+    )
+    aer_selected = _model_matrix_for_result(prepared, result)
+    assert aer_selected.equals(selected)
+    assert str(aer_selected["city"].dtype) == "category"
 
     with TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -176,6 +218,45 @@ def test_prepared_data_preserves_tabpfn_raw_view_and_lineage() -> None:
 
     assert loaded.X_tabpfn.equals(prepared.X_tabpfn)
     assert loaded.feature_lineage == prepared.feature_lineage
+
+
+@pytest.mark.fast
+def test_adaptive_error_tree_confidence_supports_new_tree_models() -> None:
+    X = numeric_data(40)
+    y = Series([0, 1] * 20, name="target")
+    cases = [
+        (
+            DecisionTreeClassifier(),
+            {},
+            {"conf_tree_leaf_support"},
+        ),
+        (
+            ExtraTreesClassifier(model_args={"n_estimators": 5, "n_jobs": 1}),
+            {"n_estimators": 5},
+            {"conf_tree_vote_agreement", "conf_tree_leaf_support"},
+        ),
+    ]
+    for model, params, expected in cases:
+        model.set_runtime(get_runtime("cpu"))
+        result = SimpleNamespace(
+            model_cls=type(model),
+            model=model,
+            params=params,
+            selection="none",
+        )
+        oof, probabilities = build_oof_for_result(
+            result,
+            X,
+            y,
+            groups=None,
+            n_folds=2,
+            seed=13,
+        )
+        assert probabilities.shape == (len(X), 2)
+        for column in expected:
+            values = oof[column].to_numpy(dtype=float)
+            assert np.isfinite(values).all()
+            assert ((0.0 <= values) & (values <= 1.0)).all()
 
 
 @pytest.mark.fast
@@ -287,7 +368,7 @@ def test_tree_regressors_support_multitarget(model: Any) -> None:
         (
             "regress",
             "--regressors dtree et",
-            {"multi-rmse", "multi-rmse-uniform", "multi-r2"},
+            {"multi-nrmse", "raw-macro-rmse", "multi-r2"},
         ),
     ],
     ids=["classification", "regression"],
@@ -352,9 +433,15 @@ def test_xgboost_multitarget_protocol() -> None:
             "second": (X["x1"] > 0).astype(int),
         }
     )
-    args = {"n_estimators": 3, "max_depth": 2, "n_jobs": 1}
+    args = {"n_estimators": 3, "max_depth": 2}
     classifier = XGBoostClassifier(model_args=args)
+    assert classifier.default_args["n_jobs"] == -1
     classifier.fit(X, y_cls)
+    assert isinstance(classifier.model, dict)
+    assert all(
+        target_model.estimator.get_params()["n_jobs"] == -1
+        for target_model in classifier.model.values()
+    )
     assert classifier.predict(X).shape == y_cls.shape
     probabilities = classifier.predict_proba_untuned(X)
     assert isinstance(probabilities, dict)
@@ -513,10 +600,19 @@ def test_kan_skorch_adapter_and_multitarget(
         },
     )
     model.fit(X, y)
-    assert model.predict(X).shape == y.shape
+    predictions = model.predict(X)
+    assert predictions.shape == y.shape
     probabilities = model.predict_proba_untuned(X)
     assert isinstance(probabilities, dict)
     assert set(probabilities) == set(y.columns)
+    restored = jsonpickle.decode(jsonpickle.encode(model, unpicklable=True))
+    np.testing.assert_array_equal(restored.predict(X), predictions)
+    restored_probabilities = restored.predict_proba_untuned(X)
+    assert isinstance(restored_probabilities, dict)
+    for target in probabilities:
+        np.testing.assert_allclose(
+            restored_probabilities[target], probabilities[target], atol=1e-7
+        )
     fixed_trial = optuna.trial.FixedTrial(
         {
             "module__width": 8,
@@ -539,6 +635,103 @@ def test_kan_skorch_adapter_and_multitarget(
         n_folds=2,
     )
     assert np.isfinite(objective(fixed_trial))
+
+    tuned = KANEstimator(
+        num_classes=2,
+        model_args={
+            "max_epochs": 1,
+            "batch_size": 8,
+            "train_split": None,
+        },
+    )
+    tuned.refit_tuned(X, y["first"], tuned_args=fixed_trial.params)
+    tuned_predictions = tuned.tuned_predict(X)
+    tuned_probabilities = tuned.predict_proba(X)
+    tuned_score = tuned.tuned_scores(X, y[["first"]])
+    assert np.isfinite(tuned_score)
+    restored_tuned = jsonpickle.decode(jsonpickle.encode(tuned, unpicklable=True))
+    np.testing.assert_array_equal(restored_tuned.tuned_predict(X), tuned_predictions)
+    np.testing.assert_allclose(
+        restored_tuned.predict_proba(X), tuned_probabilities, atol=1e-7
+    )
+    assert restored_tuned.tuned_scores(X, y["first"]) == pytest.approx(tuned_score)
+
+    tuned_multi = KANEstimator(
+        num_classes=2,
+        model_args={
+            "max_epochs": 1,
+            "batch_size": 8,
+            "train_split": None,
+        },
+    )
+    tuned_multi.refit_tuned(X, y, tuned_args=fixed_trial.params)
+    multi_score = tuned_multi.tuned_scores(X, y)
+    assert np.isfinite(multi_score)
+    restored_multi = jsonpickle.decode(
+        jsonpickle.encode(tuned_multi, unpicklable=True)
+    )
+    assert restored_multi.tuned_scores(X, y) == pytest.approx(multi_score)
+
+    y_reg = DataFrame(
+        {
+            "first": X["x0"] - 0.5 * X["x1"],
+            "second": X["x2"] + X["x3"],
+        }
+    )
+    tuned_regression = KANEstimator(
+        num_classes=1,
+        model_args={
+            "max_epochs": 1,
+            "batch_size": 8,
+            "train_split": None,
+        },
+    )
+    tuned_regression.refit_tuned(X, y_reg, tuned_args=fixed_trial.params)
+    regression_score = tuned_regression.tuned_scores(X, y_reg)
+    assert np.isfinite(regression_score)
+    restored_regression = jsonpickle.decode(
+        jsonpickle.encode(tuned_regression, unpicklable=True)
+    )
+    assert restored_regression.tuned_scores(X, y_reg) == pytest.approx(
+        regression_score
+    )
+
+
+@pytest.mark.fast
+def test_kan_scheduler_uses_training_batches() -> None:
+    assert KANEstimator._scheduler_period(1_000, 8, has_validation=True) == 56
+    assert KANEstimator._scheduler_period(1_000, 8, has_validation=False) == 64
+    assert (
+        KANEstimator._scheduler_period(
+            1_000, 8, has_validation=True, batch_size=100
+        )
+        == 64
+    )
+
+
+@pytest.mark.fast
+def test_kan_optuna_trials_are_serial(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_htune_optuna(
+        self: DfAnalyzeModel, *args: Any, **kwargs: Any
+    ) -> SimpleNamespace:
+        captured.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(DfAnalyzeModel, "htune_optuna", fake_htune_optuna)
+    X = numeric_data(20)
+    y = Series((X["x0"] > 0).astype(int), name="target")
+    model = KANEstimator(num_classes=2)
+    model.htune_optuna(
+        X,
+        y,
+        g_train=None,
+        metric=ClassifierScorer.Accuracy,
+        n_trials=2,
+        n_jobs=-1,
+    )
+    assert captured["n_jobs"] == 1
 
 
 class FakeTabPFNClassifier:
@@ -609,6 +802,69 @@ class FakeTabPFNRegressor:
 
 
 @pytest.mark.fast
+def test_tabpfn_adaptive_error_oof_uses_native_feature_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "df_analyze.models.tabpfn.OfficialTabPFNClassifier", FakeTabPFNClassifier
+    )
+    monkeypatch.setattr("df_analyze.models.tabpfn.ModelVersion", str)
+    monkeypatch.setattr("df_analyze.models.tabpfn._TABPFN_IMPORT_ERROR", None)
+    monkeypatch.setattr("df_analyze.models.tabpfn.torch.cuda.is_available", lambda: False)
+
+    n = 40
+    processed = DataFrame(
+        {
+            "age": np.arange(n, dtype=float),
+            "age_NAN": [1.0, *([0.0] * (n - 1))],
+            "city_a": [1.0, 0.0] * (n // 2),
+            "city_b": [0.0, 1.0] * (n // 2),
+        }
+    )
+    raw = DataFrame(
+        {
+            "age": [np.nan, *np.arange(1, n, dtype=float)],
+            "city": Series(["a", "b"] * (n // 2), dtype="category"),
+        }
+    )
+    prepared = PreparedData(
+        X=processed,
+        X_tabpfn=raw,
+        y=Series([0, 1] * (n // 2), name="target"),
+        groups=None,
+        is_classification=True,
+        validate=False,
+    )
+    model = TabPFNClassifierV3(
+        model_args={"n_estimators": 2, "auto_scale_n_estimators": False}
+    )
+    model.set_runtime(get_runtime("cpu"))
+    result = SimpleNamespace(
+        model_cls=TabPFNClassifierV3,
+        model=model,
+        params={"n_estimators": 2, "auto_scale_n_estimators": False},
+        selected_cols=["age_NAN", "city_a"],
+        selection="none",
+    )
+    X_aer = _model_matrix_for_result(prepared, result)
+    assert X_aer.columns.tolist() == ["age", "city"]
+    assert X_aer["age"].isna().sum() == 1
+    assert str(X_aer["city"].dtype) == "category"
+
+    oof, probabilities = build_oof_for_result(
+        result,
+        X_aer,
+        prepared.y,
+        groups=None,
+        n_folds=2,
+        seed=13,
+    )
+    assert len(oof) == n
+    assert probabilities.shape == (n, 2)
+    assert np.isfinite(probabilities).all()
+
+
+@pytest.mark.fast
 def test_tabpfn_versions_and_multitarget_protocol(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -644,12 +900,37 @@ def test_tabpfn_versions_and_multitarget_protocol(
         n_trials=1,
     )
     assert study.best_trial.number == 0
+    predictions = classifier.predict(X)
+    tuned_predictions = classifier.tuned_predict(X)
+    probabilities = classifier.predict_proba_untuned(X)
+    tuned_probabilities = classifier.predict_proba(X)
+    restored_classifier = jsonpickle.decode(
+        jsonpickle.encode(classifier, unpicklable=True)
+    )
+    np.testing.assert_array_equal(restored_classifier.predict(X), predictions)
+    np.testing.assert_array_equal(
+        restored_classifier.tuned_predict(X), tuned_predictions
+    )
+    restored_probabilities = restored_classifier.predict_proba_untuned(X)
+    restored_tuned_probabilities = restored_classifier.predict_proba(X)
+    for target in probabilities:
+        np.testing.assert_allclose(
+            restored_probabilities[target], probabilities[target]
+        )
+        np.testing.assert_allclose(
+            restored_tuned_probabilities[target], tuned_probabilities[target]
+        )
 
     regressor = TabPFNRegressorV25(model_args={"n_estimators": 2})
     target = Series(X["x0"] + X["x1"], name="target")
     regressor.fit(X, target)
     assert regressor.version == "v2.5"
-    assert len(regressor.predict(X)) == len(target)
+    predictions = regressor.predict(X)
+    assert len(predictions) == len(target)
+    restored_regressor = jsonpickle.decode(
+        jsonpickle.encode(regressor, unpicklable=True)
+    )
+    np.testing.assert_allclose(restored_regressor.predict(X), predictions)
 
 
 @pytest.mark.fast

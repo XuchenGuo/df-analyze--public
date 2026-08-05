@@ -49,49 +49,45 @@ used. The value column named `5-fold` is retained for output compatibility and
 must be interpreted using `final_cv_folds`. Fewer than five folds also produces
 a warning because the resulting estimate can be unstable.
 
-When `--error-consistency` is enabled, `results/error_consistency` contains:
+When `--error-consistency` is enabled, start with these files in
+`results/error_consistency`:
 
-See [Error consistency and repeated K-fold design](error_consistency.md) for the
-formulas, aggregation rules, randomness controls, and interpretation limits.
+- `summary.csv`: EC for every target, model, selected feature set, and method
+- `performance_summary.csv`: predictive performance of the repeated fits on the
+  shared holdout
+- `trial_failures.csv`: failed refits and their error messages
+- `selection_guard.csv`: whether the holdout was declared as `test` or
+  `validation`, and whether ranking and correlation output was enabled
 
-- `summary.csv`: EC values for every target, model, selection, and EC method,
-  together with `scientific_status`, `reference_url`, and `inferential_status`.
-  Classification error IoU identifies its published reference; regression
-  residual-consistency methods are marked as experimental descriptive diagnostics.
-- `performance_summary.csv`: mean and sample standard deviation of the repeated
-  K-fold models on the common holdout
-- `trial_scores.csv`: predictive score from every repeated fold model
-- `trial_design.csv`: repetition/fold split and model seeds, split sizes, and
-  group-overlap audit for successful configurations; grouped configurations that
-  require a non-grouped fallback are skipped
-- `fold_assignments.csv`: exact validation-fold assignment of every training-row
-  position in every repetition (the training fold is its complement)
-- `correlation_summary.csv` and `model_ec_ranking.csv`: target-specific
-  performance/stability diagnostics
-- `target_ec_trend.csv`: target-level EC trend summaries
-- `metadata.json` and `README.md`: run metadata and interpretation guidance
-- `plots/`: EC distributions, EC/performance comparisons, and a correlation
-  heatmap when the required data are available
-- `<target>/<model>/<selection>_<embed-selector>/`: pairwise matrices, sample diagnostics,
-  trial scores, exact fold assignments, difficult/unstable sample tables,
-  optional group diagnostics, and pairwise plots. Pairwise values label
-  within- versus between-repetition comparisons. `--ec-save-predictions`
-  additionally writes `trial_predictions.csv` and
-  `residual_or_error_matrix.csv`.
+The audit files show exactly how the run was made:
+
+- `trial_scores.csv`: predictive score for each fitted model
+- `trial_design.csv`: repetition, fold, split seed, model seed, split sizes, and
+  group-overlap checks
+- `fold_assignments.csv`: the validation fold assigned to each training row
+- `metadata.json` and `reproducibility_manifest.json`: input hashes, versions,
+  resolved EC settings, and the redacted command
+
+`correlation_summary.csv` and `model_ec_ranking.csv` contain results only when
+`--ec-holdout-role validation` is used. With the default `test` role, they
+contain headers only so that final-test results are not presented as a model
+selection step.
+
+Each `<target>/<model>/<selection>_<embed-selector>/` directory contains the
+tables and checkpoint for one configuration. `--ec-output-detail pairwise`
+adds model-pair tables and plots. `full` also adds sample-level diagnostics.
+Classification directories always include `leave_one_model_out.csv`.
+`--ec-save-predictions` adds `trial_predictions.csv` and
+`residual_or_error_matrix.csv`.
 
 When adaptive error and EC are both enabled,
 `results/adaptive_error/tables` also contains
 `risk_stability_report.csv`, `risk_stability_summary.csv`, and
 `risk_stability_skipped.csv`.
 
-For multiple external test sets these files are nested under `testXX`. Error
-consistency holds feature selection and tuned hyperparameters fixed; it measures
-refit stability and is not a nested re-selection analysis.
-
-`ec_model_pair_sd` is the sample standard deviation of model-pair EC means.
-`ec_pooled_value_sd` (and the legacy `ec_sd`) pools pair-by-sample values for
-samplewise regression methods. These are descriptive dispersions of dependent
-comparisons, not standard errors or confidence intervals.
+For multiple external test sets, these files are nested under `testXX`. See the
+[error-consistency guide](error_consistency.md) for the formulas, runtime
+guidance, checkpoints, and interpretation.
 
 ## Output Files
 

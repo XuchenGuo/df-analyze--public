@@ -1,3 +1,10 @@
+"""Classification EC based on error-set intersection over union.
+
+Each row of the input matrix is one fitted model and each column is the same
+holdout sample. Pairwise EC is the IoU of the models' misclassification sets,
+with an explicit policy for pairs whose error union is empty.
+"""
+
 from __future__ import annotations
 
 from itertools import combinations
@@ -12,7 +19,7 @@ from df_analyze.analysis.error_consistency.containers import (
     ECMetricComputation,
     ECMetricInfo,
 )
-
+from df_analyze.runtime.hardware import DeviceIntent
 
 CLASSIFICATION_EC_INFO = ECMetricInfo(
     name="classification_iou",
@@ -74,9 +81,7 @@ def _pair_counts(errors: ndarray, pairs: list[tuple[int, int]], use_cuda: bool):
         intersections[start:stop] = (
             torch.sum(err[pair_i] & err[pair_j], dim=1).cpu().numpy()
         )
-        unions[start:stop] = (
-            torch.sum(err[pair_i] | err[pair_j], dim=1).cpu().numpy()
-        )
+        unions[start:stop] = torch.sum(err[pair_i] | err[pair_j], dim=1).cpu().numpy()
     return intersections, unions
 
 
@@ -99,8 +104,15 @@ def compute_classification_ec(
     y_true: ndarray,
     empty_unions: str = "warn",
     backend: ECBackendDecision | None = None,
+    output_detail: str = "full",
 ) -> ECMetricComputation:
     preds, truth = _as_prediction_matrix(predictions, y_true)
+    detail = str(output_detail).lower()
+    if detail not in {"summary", "pairwise", "full"}:
+        raise ValueError(
+            "Classification EC output detail must be summary, pairwise, or full."
+        )
+    retain_pairwise = detail in {"pairwise", "full"}
     policy = str(empty_unions).lower()
     if policy not in EMPTY_UNION_POLICIES:
         raise ValueError(
@@ -116,6 +128,11 @@ def compute_classification_ec(
     except Exception as error:
         if not use_cuda:
             raise
+        if backend is not None and backend.requested == DeviceIntent.CUDA.value:
+            raise RuntimeError(
+                "Classification error consistency failed on CUDA while "
+                "--device cuda is strict."
+            ) from error
         warn(
             "Could not compute classification EC on CUDA; falling back to numpy. "
             f"Details: {error}"
@@ -130,11 +147,7 @@ def compute_classification_ec(
 
     matrix = np.full((preds.shape[0], preds.shape[0]), np.nan, dtype=float)
     for model_idx in range(preds.shape[0]):
-        diagonal = (
-            _empty_union_value(policy)
-            if not np.any(errors[model_idx])
-            else 1.0
-        )
+        diagonal = _empty_union_value(policy) if not np.any(errors[model_idx]) else 1.0
         if diagonal is not None:
             matrix[model_idx, model_idx] = diagonal
     values: list[float] = []
@@ -147,16 +160,17 @@ def compute_classification_ec(
             continue
         matrix[i, j] = matrix[j, i] = value
         values.append(value)
-        rows.append(
-            {
-                "ec_method": CLASSIFICATION_EC_INFO.name,
-                "model_i": i,
-                "model_j": j,
-                "error_intersection": int(intersection),
-                "error_union": int(union),
-                "pair_mean": value,
-            }
-        )
+        if retain_pairwise:
+            rows.append(
+                {
+                    "ec_method": CLASSIFICATION_EC_INFO.name,
+                    "model_i": i,
+                    "model_j": j,
+                    "error_intersection": int(intersection),
+                    "error_union": int(union),
+                    "pair_mean": value,
+                }
+            )
 
     pair_values = np.asarray(values, dtype=float)
     total_intersection = int(np.count_nonzero(np.all(errors, axis=0)))
@@ -167,7 +181,7 @@ def compute_classification_ec(
         else float(total_intersection / total_union)
     )
 
-    leave_one_out = []
+    leave_one_model_out_rows = []
     aggregate_empty_union = total_union == 0
     if preds.shape[0] >= 3:
         for model_idx in range(preds.shape[0]):
@@ -176,12 +190,21 @@ def compute_classification_ec(
             union = int(np.count_nonzero(np.any(retained, axis=0)))
             aggregate_empty_union = aggregate_empty_union or union == 0
             value = (
-                _empty_union_value(policy)
-                if union == 0
-                else float(intersection / union)
+                _empty_union_value(policy) if union == 0 else float(intersection / union)
             )
-            if value is not None:
-                leave_one_out.append(value)
+            stored_value = np.nan if value is None else float(value)
+            leave_one_model_out_rows.append(
+                {
+                    "model_removed": model_idx,
+                    "n_models_retained": preds.shape[0] - 1,
+                    "error_intersection": intersection,
+                    "error_union": union,
+                    "consistency": stored_value,
+                    "empty_union": union == 0,
+                    "included_in_summary": bool(np.isfinite(stored_value)),
+                    "empty_union_policy": policy,
+                }
+            )
 
     if policy == "warn" and aggregate_empty_union and not np.any(unions == 0):
         warn(
@@ -189,26 +212,47 @@ def compute_classification_ec(
             "union; recording NaN."
         )
 
-    finite_loo = np.asarray(leave_one_out, dtype=float)
+    leave_one_model_out = pd.DataFrame(
+        leave_one_model_out_rows,
+        columns=[
+            "model_removed",
+            "n_models_retained",
+            "error_intersection",
+            "error_union",
+            "consistency",
+            "empty_union",
+            "included_in_summary",
+            "empty_union_policy",
+        ],
+    )
+    finite_loo = leave_one_model_out.get("consistency", pd.Series(dtype=float)).to_numpy(
+        dtype=float
+    )
     finite_loo = finite_loo[np.isfinite(finite_loo)]
+    leave_one_model_out_mean = (
+        float(np.mean(finite_loo)) if finite_loo.size > 0 else np.nan
+    )
+    leave_one_model_out_sd = (
+        float(np.std(finite_loo, ddof=1)) if finite_loo.size > 1 else np.nan
+    )
     extra = {
         "n_model_pairs": len(pairs),
         "n_valid_model_pairs": int(np.count_nonzero(np.isfinite(pair_values))),
         "n_pair_sample_values": len(pairs) * preds.shape[1],
         "comparison_unit": "model_pair",
-        "total_consistency": (
-            np.nan if total_consistency is None else total_consistency
-        ),
+        "total_consistency": (np.nan if total_consistency is None else total_consistency),
         "total_error_intersection": total_intersection,
         "total_error_union": total_union,
         "empty_union_policy": policy,
         "empty_union_pairs": int(np.count_nonzero(unions == 0)),
-        "leave_one_out_mean": (
-            float(np.mean(finite_loo)) if finite_loo.size > 0 else np.nan
-        ),
-        "leave_one_out_sd": (
-            float(np.std(finite_loo, ddof=1)) if finite_loo.size > 1 else np.nan
-        ),
+        "leave_one_model_out_mean": leave_one_model_out_mean,
+        "leave_one_model_out_sd": leave_one_model_out_sd,
+        "n_leave_one_model_out": len(leave_one_model_out),
+        "output_detail": detail,
+        # Backward-compatible aliases. "Leave one model out" is the precise
+        # name; this is not leave-one-sample-out cross-validation.
+        "leave_one_out_mean": leave_one_model_out_mean,
+        "leave_one_out_sd": leave_one_model_out_sd,
     }
     if backend is not None:
         extra.update(backend.as_metadata())
@@ -218,5 +262,6 @@ def compute_classification_ec(
         values=pair_values,
         matrix=matrix,
         pairwise=pd.DataFrame(rows),
+        leave_one_model_out=leave_one_model_out,
         extra=extra,
     )

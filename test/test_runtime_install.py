@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 import os
-import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import tomllib
 
 from df_analyze._constants import VERSION
 from df_analyze.runtime import bootstrap, install
@@ -44,6 +44,22 @@ def test_device_install_defaults_to_never() -> None:
 
 
 @pytest.mark.fast
+def test_nvidia_probe_respects_hidden_cuda_devices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
+    monkeypatch.setattr(
+        install.shutil,
+        "which",
+        lambda name: (_ for _ in ()).throw(
+            AssertionError("hidden CUDA devices must not invoke nvidia-smi")
+        ),
+    )
+
+    assert not install.nvidia_gpu_available()
+
+
+@pytest.mark.fast
 def test_bootstrap_detects_pytorch_tasks() -> None:
     catboost = bootstrap._parse_args(["--classifiers", "catboost"], "df-analyze")
     mlp = bootstrap._parse_args(["--classifiers", "catboost", "mlp"], "df-analyze")
@@ -54,11 +70,80 @@ def test_bootstrap_detects_pytorch_tasks() -> None:
     ec = bootstrap._parse_args(
         ["--classifiers", "catboost", "--error-consistency"], "df-analyze"
     )
+    wrapper_cuda = bootstrap._parse_args(
+        [
+            "--device",
+            "cuda",
+            "--classifiers",
+            "catboost",
+            "--wrapper-select",
+            "step-up",
+            "--wrapper-model",
+            "knn",
+        ],
+        "df-analyze",
+    )
+    ec_cuda = bootstrap._parse_args(
+        [
+            "--device",
+            "cuda",
+            "--classifiers",
+            "catboost",
+            "--error-consistency",
+        ],
+        "df-analyze",
+    )
 
     assert not bootstrap._needs_torch(catboost, "df-analyze")
     assert bootstrap._needs_torch(mlp, "df-analyze")
-    assert bootstrap._needs_torch(wrapper, "df-analyze")
-    assert bootstrap._needs_torch(ec, "df-analyze")
+    assert not bootstrap._needs_torch(wrapper, "df-analyze")
+    assert not bootstrap._needs_torch(ec, "df-analyze")
+    assert bootstrap._needs_torch(wrapper_cuda, "df-analyze")
+    assert bootstrap._needs_torch(ec_cuda, "df-analyze")
+    assert not bootstrap._can_reuse_torch(catboost, "df-analyze")
+    assert bootstrap._can_reuse_torch(mlp, "df-analyze")
+    assert bootstrap._can_reuse_torch(wrapper, "df-analyze")
+    assert bootstrap._can_reuse_torch(ec, "df-analyze")
+
+
+@pytest.mark.fast
+def test_bootstrap_device_options_are_case_insensitive() -> None:
+    args = bootstrap._parse_args(
+        ["--device", "CUDA", "--device-install", "ASK"],
+        "df-analyze",
+    )
+
+    assert args.device == "cuda"
+    assert args.device_install == "ask"
+
+
+@pytest.mark.fast
+def test_auto_reports_cpu_only_torch_when_nvidia_gpu_is_visible(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        bootstrap,
+        "probe_torch",
+        lambda: {"usable": False, "torch": "2.9.1+cpu", "cuda": None},
+    )
+    monkeypatch.setattr(
+        bootstrap, "cached_managed_environment", lambda root: None
+    )
+    monkeypatch.setattr(bootstrap, "nvidia_gpu_available", lambda: True)
+
+    bootstrap.bootstrap(
+        "df-analyze",
+        tmp_path / "df-analyze.py",
+        tmp_path,
+        ["--device", "auto", "--classifiers", "mlp"],
+    )
+
+    error = capsys.readouterr().err
+    assert "NVIDIA GPU was detected" in error
+    assert "PyTorch 2.9.1+cpu" in error
+    assert "--device-install auto" in error
 
 
 @pytest.mark.fast
@@ -70,7 +155,9 @@ def test_cuda_task_relaunches_in_managed_environment(
     relaunched = []
     monkeypatch.setattr(bootstrap, "probe_torch", lambda: None)
     monkeypatch.setattr(bootstrap, "nvidia_gpu_available", lambda: True)
-    monkeypatch.setattr(bootstrap, "managed_environment", lambda root: None)
+    monkeypatch.setattr(
+        bootstrap, "cached_managed_environment", lambda root: None
+    )
     monkeypatch.setattr(bootstrap, "setup_environment", lambda root: python)
     monkeypatch.setattr(
         bootstrap,
@@ -99,7 +186,9 @@ def test_existing_environment_is_reused_without_install_request(
     python = tmp_path / "cuda-python"
     relaunched = []
     monkeypatch.setattr(bootstrap, "probe_torch", lambda: None)
-    monkeypatch.setattr(bootstrap, "managed_environment", lambda root: python)
+    monkeypatch.setattr(
+        bootstrap, "cached_managed_environment", lambda root: python
+    )
     monkeypatch.setattr(
         bootstrap,
         "_relaunch",
@@ -111,6 +200,42 @@ def test_existing_environment_is_reused_without_install_request(
         tmp_path / "df-analyze.py",
         tmp_path,
         ["--device", "cuda", "--classifiers", "mlp"],
+    )
+
+    assert relaunched == [python]
+
+
+@pytest.mark.fast
+def test_auto_knn_reuses_existing_environment_without_installing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _project(tmp_path)
+    python = tmp_path / "cuda-python"
+    relaunched = []
+    monkeypatch.setattr(bootstrap, "probe_torch", lambda: None)
+    monkeypatch.setattr(
+        bootstrap, "cached_managed_environment", lambda root: python
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "setup_environment",
+        lambda root: (_ for _ in ()).throw(
+            AssertionError("auto KNN must not trigger installation")
+        ),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "_relaunch",
+        lambda executable, script, argv, module=None: relaunched.append(
+            executable
+        ),
+    )
+
+    bootstrap.bootstrap(
+        "df-analyze",
+        tmp_path / "df-analyze.py",
+        tmp_path,
+        ["--device", "auto", "--classifiers", "knn"],
     )
 
     assert relaunched == [python]

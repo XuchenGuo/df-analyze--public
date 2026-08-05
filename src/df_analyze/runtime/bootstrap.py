@@ -13,7 +13,7 @@ from zipfile import ZipFile
 
 from df_analyze.runtime.install import (
     DeviceInstall,
-    managed_environment,
+    cached_managed_environment,
     nvidia_gpu_available,
     probe_torch,
     setup_environment,
@@ -21,6 +21,7 @@ from df_analyze.runtime.install import (
 
 BOOTSTRAP_ENV = "DF_ANALYZE_BOOTSTRAPPED"
 TORCH_MODELS = {"knn", "mlp", "kan", "gandalf", "tabpfn"}
+ACCELERATOR_PREFERRED_TORCH_MODELS = {"mlp", "kan", "gandalf", "tabpfn"}
 
 
 def _csv_options(path: Path, separator: str) -> list[str]:
@@ -84,8 +85,18 @@ def _spreadsheet_options(path: Optional[str], separator: str) -> list[str]:
 
 def _parse_args(argv: Sequence[str], entrypoint: str) -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    parser.add_argument("--device-install", choices=DeviceInstall.choices(), default=None)
+    parser.add_argument(
+        "--device",
+        type=str.lower,
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+    )
+    parser.add_argument(
+        "--device-install",
+        type=str.lower,
+        choices=DeviceInstall.choices(),
+        default=None,
+    )
     if entrypoint == "df-analyze":
         parser.add_argument("--mode", choices=["classify", "regress"], default="classify")
         parser.add_argument("--classifiers", nargs="+", default=None)
@@ -112,6 +123,34 @@ def _parse_args(argv: Sequence[str], entrypoint: str) -> argparse.Namespace:
 def _needs_torch(args: argparse.Namespace, entrypoint: str) -> bool:
     if entrypoint == "df-embed":
         return not (getattr(args, "download", False) or getattr(args, "force_download", False))
+    strict_cuda = str(getattr(args, "device", "auto")).lower() == "cuda"
+    if strict_cuda and getattr(args, "error_consistency", False):
+        return True
+    wrapper = str(getattr(args, "wrapper_select", "") or "").lower()
+    wrapper_model = str(getattr(args, "wrapper_model", "") or "").lower()
+    if (
+        strict_cuda
+        and wrapper not in {"", "none"}
+        and wrapper_model == "knn"
+    ):
+        return True
+    models = args.classifiers if args.mode == "classify" else args.regressors
+    selected = {"knn"} if models is None else set(models)
+    required = (
+        TORCH_MODELS
+        if strict_cuda
+        else ACCELERATOR_PREFERRED_TORCH_MODELS
+    )
+    return bool(required.intersection(selected))
+
+
+def _can_reuse_torch(args: argparse.Namespace, entrypoint: str) -> bool:
+    """Whether an existing CUDA environment could benefit the selected work."""
+    if entrypoint == "df-embed":
+        return not (
+            getattr(args, "download", False)
+            or getattr(args, "force_download", False)
+        )
     if getattr(args, "error_consistency", False):
         return True
     wrapper = str(getattr(args, "wrapper_select", "") or "").lower()
@@ -119,7 +158,8 @@ def _needs_torch(args: argparse.Namespace, entrypoint: str) -> bool:
     if wrapper not in {"", "none"} and wrapper_model == "knn":
         return True
     models = args.classifiers if args.mode == "classify" else args.regressors
-    return True if models is None else bool(TORCH_MODELS.intersection(models))
+    selected = {"knn"} if models is None else set(models)
+    return bool(TORCH_MODELS.intersection(selected))
 
 
 def _approve_install(policy: DeviceInstall) -> bool:
@@ -168,7 +208,7 @@ def bootstrap(
     if any(arg in argv for arg in ("-h", "--help", "--version")):
         return
     args = _parse_args(argv, entrypoint)
-    if args.device == "cpu" or not _needs_torch(args, entrypoint):
+    if args.device == "cpu" or not _can_reuse_torch(args, entrypoint):
         return
     current = probe_torch()
     if current is not None and current.get("usable") is True:
@@ -178,17 +218,36 @@ def bootstrap(
     if (project_root / "pyproject.toml").exists() and (
         project_root / "uv.lock"
     ).exists():
-        existing = managed_environment(project_root)
+        existing = cached_managed_environment(project_root)
         if existing is not None:
             _relaunch(existing, script, argv, module=module)
+    if not _needs_torch(args, entrypoint):
+        return
 
     policy = DeviceInstall.from_arg(args.device_install, args.device)
     if policy is DeviceInstall.Never:
         if args.device == "cuda":
             print(
                 "CUDA was requested, but the current PyTorch cannot use it. "
-                "Continuing on CPU. Pass `--device-install auto` to create a "
-                "managed CUDA environment.",
+                "Selected PyTorch-based models will fail strict device validation. "
+                "Pass `--device auto` to allow CPU fallback, or "
+                "`--device-install auto` to create a managed CUDA environment.",
+                file=sys.stderr,
+            )
+        elif args.device == "auto" and nvidia_gpu_available():
+            if current is None:
+                detail = "PyTorch is not installed"
+            else:
+                torch_version = current.get("torch", "version unknown")
+                cuda_version = current.get("cuda")
+                detail = f"installed PyTorch {torch_version}"
+                if cuda_version is None:
+                    detail += " has no CUDA runtime"
+            print(
+                "An NVIDIA GPU was detected, but the current PyTorch cannot use "
+                f"CUDA ({detail}). --device auto will continue on CPU for "
+                "PyTorch-based models. Pass `--device-install auto` to create "
+                "a managed CUDA environment.",
                 file=sys.stderr,
             )
         return
@@ -203,7 +262,7 @@ def bootstrap(
         if args.device == "cuda":
             print(
                 "Managed CUDA setup requires a source checkout with pyproject.toml "
-                "and uv.lock. Continuing in the current environment.",
+                "and uv.lock. Strict CUDA validation will use the current environment.",
                 file=sys.stderr,
             )
         return
@@ -214,8 +273,8 @@ def bootstrap(
         python = setup_environment(project_root)
     except Exception as exc:
         print(
-            "Could not create the managed CUDA environment. Continuing in the "
-            f"current environment.\n{exc}",
+            "Could not create the managed CUDA environment. Strict CUDA validation "
+            f"will use the current environment.\n{exc}",
             file=sys.stderr,
         )
         return

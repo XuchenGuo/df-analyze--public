@@ -53,6 +53,7 @@ class _EncodedXGBClassifier:
 class XGBoostEstimator(DfAnalyzeModel):
     shortname = "xgb"
     longname = "XGBoost Estimator"
+    runtime_component = RuntimeComponent.XGBoost
     timeout_s = 60 * 60
 
     def __init__(self, model_args: Optional[Mapping] = None) -> None:
@@ -63,6 +64,9 @@ class XGBoostEstimator(DfAnalyzeModel):
             n_estimators=100,
             max_depth=6,
             learning_rate=0.1,
+            # Normal/final CPU fits can use all cores. The Optuna objective
+            # overrides this to one thread because trials parallelize outside.
+            n_jobs=-1,
             random_state=SEED,
             tree_method="hist",
             verbosity=0,
@@ -125,7 +129,10 @@ class XGBoostEstimator(DfAnalyzeModel):
         model_state = state.pop("_serialized_model", None)
         tuned_model_state = state.pop("_serialized_tuned_model", None)
         self.__dict__.update(state)
-        self.runtime = get_runtime(self.runtime.intent)
+        # A saved model is a portable artifact, not a continuation of the CLI
+        # request that trained it. Restore on CPU; callers may explicitly assign
+        # a new runtime before starting new work.
+        self.runtime = get_runtime("cpu")
         self.model = self._restore_models(model_state)
         self.tuned_model = self._restore_models(tuned_model_state)
 
@@ -274,7 +281,7 @@ class XGBoostEstimator(DfAnalyzeModel):
             g_train,
             multitarget_y=(
                 y_df
-                if self.is_classifier and y_df.shape[1] > 1
+                if y_df.shape[1] > 1
                 else None
             ),
         )[0]
@@ -286,6 +293,9 @@ class XGBoostEstimator(DfAnalyzeModel):
                 **self.model_args,
                 **self.optuna_args(trial),
             }
+            # Never nest XGBoost's thread pool inside parallel Optuna trials.
+            # Final refit still uses the configured/default all-core setting.
+            args["n_jobs"] = 1
             scores = []
             scores_by_target: dict[str, list[float]] = {}
             for step, (idx_train, idx_test) in enumerate(splits):

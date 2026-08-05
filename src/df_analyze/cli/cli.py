@@ -11,6 +11,9 @@ sys.path.append(str(ROOT))  # isort: skip
 """
 File for defining all options passed to `df-analyze.py`.
 """
+import bz2
+import gzip
+import lzma
 import os
 import secrets
 import shlex
@@ -103,13 +106,18 @@ from df_analyze.cli.text import (
     DF_TRAIN_HELP_STR,
     DOWNSAMPLE_SCREENING_HELP,
     DROP_HELP_STR,
+    EC_CHECKPOINT_EVERY_HELP,
     EC_EMPTY_UNIONS_HELP,
     EC_EPSILON_HELP,
     EC_FOLDS_HELP,
+    EC_HOLDOUT_ROLE_HELP,
     EC_METHODS_HELP,
     EC_MODEL_SEED_MODE_HELP,
+    EC_OUTPUT_DETAIL_HELP,
+    EC_PROFILE_HELP,
     EC_RECURRENCE_THRESHOLD_HELP,
     EC_REPETITIONS_HELP,
+    EC_RESUME_HELP,
     EC_SAVE_PREDICTIONS_HELP,
     EMBED_SELECT_MODEL_HELP,
     ERROR_CONSISTENCY_HELP,
@@ -185,6 +193,74 @@ from df_analyze.saving import ProgramDirs, get_hash
 from df_analyze.utils import Debug
 
 Size = Union[float, int]
+SVMLIGHT_SUFFIXES = (".svm", ".svmlight", ".libsvm", ".binary")
+COMPRESSION_SUFFIXES = ("", ".gz", ".bz2", ".xz")
+TABLE_SUFFIXES = (".csv", ".json", ".parquet", ".xlsx")
+INPUT_SNIFF_BYTES = 64 * 1024
+
+
+def looks_like_svmlight_path(path: Path) -> bool:
+    """Recognize SVMlight by a known suffix or a bounded text prefix.
+
+    Content sniffing is deliberately limited to unknown suffixes. This lets
+    extensionless benchmark files such as ``log1p.E2006.train`` work in auto
+    mode without scanning a multi-gigabyte input merely to choose its loader.
+    """
+    name = path.name.lower()
+    if any(
+        name.endswith(suffix + compression)
+        for suffix in SVMLIGHT_SUFFIXES
+        for compression in COMPRESSION_SUFFIXES
+    ):
+        return True
+    if any(
+        name.endswith(suffix + compression)
+        for suffix in TABLE_SUFFIXES
+        for compression in COMPRESSION_SUFFIXES
+    ):
+        return False
+    try:
+        if name.endswith(".gz"):
+            source_context = gzip.open(path, "rb")
+        elif name.endswith(".bz2"):
+            source_context = bz2.open(path, "rb")
+        elif name.endswith(".xz"):
+            source_context = lzma.open(path, "rb")
+        else:
+            source_context = path.open("rb")
+        with source_context as source:
+            prefix = source.read(INPUT_SNIFF_BYTES)
+    except (EOFError, OSError, lzma.LZMAError):
+        return False
+    if not prefix or b"\x00" in prefix:
+        return False
+    for raw_line in prefix.splitlines():
+        line = raw_line.split(b"#", 1)[0].strip()
+        if not line:
+            continue
+        tokens = line.split()
+        try:
+            float(tokens[0])
+        except (IndexError, ValueError):
+            return False
+        found_feature = False
+        for token in tokens[1:33]:
+            if token.startswith(b"qid:"):
+                continue
+            index, separator, value = token.partition(b":")
+            if not separator:
+                return False
+            try:
+                int(index)
+                float(value)
+            except ValueError:
+                return False
+            found_feature = True
+        if found_feature:
+            return True
+        # A target-only row is valid SVMlight. Continue looking for the first
+        # non-empty feature row within the bounded prefix.
+    return False
 
 
 class ArgumentError(Exception):
@@ -286,16 +362,27 @@ class ProgramOptions(Debug):
         skip_full_prepared_save_before_downsample: bool = False,
         input_format: str = "auto",
         svmlight_index_base: str = "auto",
+        svmlight_metadata: Optional[list[Path]] = None,
+        svmlight_feature_map: Optional[Path] = None,
+        svmlight_sample_id_column: Optional[str] = None,
+        downsample_protected_features: Optional[list[str]] = None,
         device: Union[str, DeviceIntent] = DeviceIntent.Auto,
         device_install: Union[str, DeviceInstall, None] = None,
         targets: Optional[list[str]] = None,
         mt_agg_strategy: str = "borda",
         mt_top_k: Optional[int] = None,
         error_consistency: bool = False,
+        ec_profile: str = "none",
+        ec_profile_scope: str = "df-analyze defaults",
+        ec_profile_overrides: Optional[dict[str, Any]] = None,
         ec_folds: int = 5,
         ec_repetitions: int = 5,
         ec_model_seed_mode: str = "vary",
         ec_methods: Optional[tuple[str, ...]] = None,
+        ec_holdout_role: str = "test",
+        ec_output_detail: str = "full",
+        ec_resume: bool = False,
+        ec_checkpoint_every: int = 5,
         ec_save_predictions: bool = False,
         ec_empty_unions: str = "warn",
         ec_epsilon: float = 0.0,
@@ -350,7 +437,17 @@ class ProgramOptions(Debug):
         if len(self.targets) == 0:
             raise ValueError("Expected at least one target column name.")
         if len(set(self.targets)) != len(self.targets):
-            raise ValueError("Target column names must be unique.")
+            duplicates = sorted(
+                {
+                    name
+                    for name in self.targets
+                    if self.targets.count(name) > 1
+                }
+            )
+            raise ValueError(
+                "Target column names must be unique. Repeated target(s): "
+                f"{', '.join(duplicates)}."
+            )
         self.target: str = self.targets[0]
         self.grouper: Optional[str] = grouper
         self.categoricals: list[str] = categoricals
@@ -387,6 +484,9 @@ class ProgramOptions(Debug):
         if self.mt_top_k is not None and self.mt_top_k <= 0:
             self.mt_top_k = None
         self.error_consistency: bool = bool(error_consistency)
+        self.ec_profile: str = str(ec_profile).lower()
+        self.ec_profile_scope: str = str(ec_profile_scope)
+        self.ec_profile_overrides: dict[str, Any] = dict(ec_profile_overrides or {})
         self.ec_folds: int = int(ec_folds)
         self.ec_repetitions: int = int(ec_repetitions)
         self.ec_model_seed_mode: str = str(ec_model_seed_mode).lower()
@@ -395,6 +495,16 @@ class ProgramOptions(Debug):
         self.ec_methods: Optional[tuple[str, ...]] = (
             None if ec_methods is None or len(ec_methods) == 0 else tuple(ec_methods)
         )
+        self.ec_holdout_role: str = str(ec_holdout_role).lower()
+        if self.ec_holdout_role not in {"test", "validation"}:
+            raise ValueError("EC holdout role must be 'test' or 'validation'.")
+        self.ec_output_detail: str = str(ec_output_detail).lower()
+        if self.ec_output_detail not in {"summary", "pairwise", "full"}:
+            raise ValueError("EC output detail must be summary, pairwise, or full.")
+        self.ec_resume: bool = bool(ec_resume)
+        self.ec_checkpoint_every: int = int(ec_checkpoint_every)
+        if self.ec_checkpoint_every < 1:
+            raise ValueError("EC checkpoint interval must be at least 1.")
         self.ec_save_predictions: bool = bool(ec_save_predictions)
         self.ec_empty_unions: str = str(ec_empty_unions)
         self.ec_epsilon: float = float(ec_epsilon)
@@ -403,9 +513,7 @@ class ProgramOptions(Debug):
         self.classifiers: Tuple[DfAnalyzeClassifier, ...] = tuple(
             sorted(set(classifiers))
         )
-        self.regressors: Tuple[DfAnalyzeRegressor, ...] = tuple(
-            sorted(set(regressors))
-        )
+        self.regressors: Tuple[DfAnalyzeRegressor, ...] = tuple(sorted(set(regressors)))
         self.tabpfn_version = TabPFNVersion.from_arg(tabpfn_version)
         self._validate_optional_model_dependencies()
         # self.htune: bool = htune
@@ -426,7 +534,18 @@ class ProgramOptions(Debug):
         self.no_preds: bool = no_preds
         self.feat_downsample = FeatureDownsampleMethod.from_arg(feat_downsample)
         self.n_feat_downsample = n_feat_downsample
-        self.downsample_variance_threshold = downsample_variance_threshold
+        self.downsample_variance_threshold = (
+            None
+            if downsample_variance_threshold is None
+            else float(downsample_variance_threshold)
+        )
+        if self.downsample_variance_threshold is not None and (
+            not np.isfinite(self.downsample_variance_threshold)
+            or self.downsample_variance_threshold < 0.0
+        ):
+            raise ValueError(
+                "Downsample variance threshold must be a finite non-negative value."
+            )
         self.downsample_save_scores = bool(downsample_save_scores)
         self.downsample_chunk_size = int(downsample_chunk_size)
         if self.downsample_chunk_size <= 0:
@@ -441,6 +560,20 @@ class ProgramOptions(Debug):
         )
         self.input_format = str(input_format).lower()
         self.svmlight_index_base = str(svmlight_index_base).lower()
+        self.svmlight_metadata = [
+            self.validate_test_path(path) for path in (svmlight_metadata or [])
+        ]
+        self.svmlight_feature_map = (
+            None
+            if svmlight_feature_map is None
+            else self.validate_test_path(svmlight_feature_map)
+        )
+        self.svmlight_sample_id_column = (
+            None if svmlight_sample_id_column is None else str(svmlight_sample_id_column)
+        )
+        self.downsample_protected_features = list(
+            dict.fromkeys(downsample_protected_features or [])
+        )
         self.device: DeviceIntent = DeviceIntent.from_arg(device)
         self.device_install: DeviceInstall = DeviceInstall.from_arg(
             device_install, self.device.value
@@ -474,9 +607,7 @@ class ProgramOptions(Debug):
         self.aer_ens_tau_high: float = aer_ens_tau_high
 
         # Normalize model order so JSON round trips and hashes are stable.
-        self.classifiers = tuple(
-            sorted({*self.classifiers, DfAnalyzeClassifier.Dummy})
-        )
+        self.classifiers = tuple(sorted({*self.classifiers, DfAnalyzeClassifier.Dummy}))
         self.regressors = tuple(sorted({*self.regressors, DfAnalyzeRegressor.Dummy}))
 
         self.program_dirs: ProgramDirs = ProgramDirs.new(self.outdir, self.hash())
@@ -775,8 +906,29 @@ class ProgramOptions(Debug):
             return None
 
     def hash(self) -> str:
+        hashable = {**self.__dict__}
+        # Resume and checkpoint cadence change execution mechanics, not the
+        # scientific result. Keep them out of the output-directory hash so a
+        # second invocation with --ec-resume reaches the first run's checkpoint.
+        hashable["ec_resume"] = False
+        hashable["ec_checkpoint_every"] = 5
+        argv = list(hashable.get("cli_argv", []))
+        normalized_argv = []
+        skip_next = False
+        for value in argv:
+            if skip_next:
+                skip_next = False
+                continue
+            if value == "--ec-resume":
+                continue
+            if value == "--ec-checkpoint-every":
+                skip_next = True
+                continue
+            normalized_argv.append(value)
+        hashable["cli_argv"] = normalized_argv
+        hashable["cli_args"] = " ".join(normalized_argv)
         return get_hash(
-            self.__dict__,
+            hashable,
             ignores=[
                 "cleaning_options",
                 "selection_options",
@@ -869,6 +1021,12 @@ class ProgramOptions(Debug):
             opts.tabpfn_version = TabPFNVersion.V3
         if not hasattr(opts, "error_consistency"):
             opts.error_consistency = False
+        if not hasattr(opts, "ec_profile"):
+            opts.ec_profile = "none"
+        if not hasattr(opts, "ec_profile_scope"):
+            opts.ec_profile_scope = "df-analyze defaults"
+        if not hasattr(opts, "ec_profile_overrides"):
+            opts.ec_profile_overrides = {}
         if not hasattr(opts, "ec_folds"):
             opts.ec_folds = 5
         if not hasattr(opts, "ec_repetitions"):
@@ -877,6 +1035,14 @@ class ProgramOptions(Debug):
             opts.ec_model_seed_mode = "vary"
         if not hasattr(opts, "ec_methods"):
             opts.ec_methods = None
+        if not hasattr(opts, "ec_holdout_role"):
+            opts.ec_holdout_role = "test"
+        if not hasattr(opts, "ec_output_detail"):
+            opts.ec_output_detail = "full"
+        if not hasattr(opts, "ec_resume"):
+            opts.ec_resume = False
+        if not hasattr(opts, "ec_checkpoint_every"):
+            opts.ec_checkpoint_every = 5
         if not hasattr(opts, "ec_save_predictions"):
             opts.ec_save_predictions = False
         if not hasattr(opts, "ec_empty_unions"):
@@ -897,6 +1063,10 @@ class ProgramOptions(Debug):
             "skip_full_prepared_save_before_downsample": False,
             "input_format": "auto",
             "svmlight_index_base": "auto",
+            "svmlight_metadata": [],
+            "svmlight_feature_map": None,
+            "svmlight_sample_id_column": None,
+            "downsample_protected_features": [],
         }
         for name, value in defaults.items():
             if not hasattr(opts, name):
@@ -908,10 +1078,7 @@ class ProgramOptions(Debug):
             return True
         if self.input_format == "table" or self.datapath is None:
             return False
-        name = self.datapath.name.lower()
-        suffixes = (".svm", ".svmlight", ".libsvm", ".binary")
-        compression = ("", ".gz", ".bz2", ".xz")
-        return any(name.endswith(suffix + comp) for suffix in suffixes for comp in compression)
+        return looks_like_svmlight_path(self.datapath)
 
     def _load_df(self, path: Path) -> DataFrame:
         if path is None:
@@ -997,9 +1164,7 @@ class ProgramOptions(Debug):
         return df_all, ix_train, ix_tests
 
 
-_COLUMN_LIST_OPTIONS = frozenset(
-    {"--targets", "--categoricals", "--ordinals", "--drops"}
-)
+_COLUMN_LIST_OPTIONS = frozenset({"--targets", "--categoricals", "--ordinals", "--drops"})
 
 
 def _split_cli_args(args: str) -> list[str]:
@@ -1309,13 +1474,52 @@ def make_parser() -> ArgumentParser:
         "--input-format",
         choices=("auto", "table", "svmlight"),
         default="auto",
-        help="Input format; auto recognizes common SVMlight file suffixes.",
+        help=(
+            "Input format; auto recognizes common SVMlight suffixes and bounded "
+            "content signatures for files with nonstandard names."
+        ),
     )
     parser.add_argument(
         "--svmlight-index-base",
         choices=("auto", "zero", "one"),
         default="auto",
         help="Feature index base used to name SVMlight columns.",
+    )
+    parser.add_argument(
+        "--svmlight-metadata",
+        nargs="+",
+        type=Path,
+        default=[],
+        help=(
+            "Row-aligned CSV, TSV, JSON, or Parquet clinical sidecars, one per "
+            "SVMlight input (training file followed by external test files)."
+        ),
+    )
+    parser.add_argument(
+        "--svmlight-feature-map",
+        type=Path,
+        default=None,
+        help=(
+            "CSV, TSV, JSON, or Parquet map with feature_index and feature_name "
+            "columns and an optional protected column."
+        ),
+    )
+    parser.add_argument(
+        "--svmlight-sample-id-column",
+        default=None,
+        help=(
+            "Clinical ID column checked row-by-row against SVMlight comments of "
+            "the form '# column=value' (or '# value')."
+        ),
+    )
+    parser.add_argument(
+        "--downsample-protected-features",
+        nargs="+",
+        default=[],
+        help=(
+            "Source feature names that must survive large-table or SVMlight "
+            "downsampling and count toward --n-feat-downsample."
+        ),
     )
     # parser.add_argument(
     #     "--model-select",
@@ -1538,7 +1742,7 @@ def make_parser() -> ArgumentParser:
     parser.add_argument(
         "--test-val-size",
         type=int_or_percent_parser(default=0.4),
-        default=0.4,
+        default=None,
         help=TEST_VALSIZES_HELP,
     )
     parser.add_argument(
@@ -1550,21 +1754,27 @@ def make_parser() -> ArgumentParser:
         help=ERROR_CONSISTENCY_HELP,
     )
     parser.add_argument(
+        "--ec-profile",
+        choices=["none", "classification-paper", "regression-paper"],
+        default="none",
+        help=EC_PROFILE_HELP,
+    )
+    parser.add_argument(
         "--ec-folds",
         type=int,
-        default=5,
+        default=None,
         help=EC_FOLDS_HELP,
     )
     parser.add_argument(
         "--ec-repetitions",
         type=int,
-        default=5,
+        default=None,
         help=EC_REPETITIONS_HELP,
     )
     parser.add_argument(
         "--ec-model-seed-mode",
         choices=["vary", "fixed"],
-        default="vary",
+        default=None,
         help=EC_MODEL_SEED_MODE_HELP,
     )
     parser.add_argument(
@@ -1572,6 +1782,30 @@ def make_parser() -> ArgumentParser:
         nargs="+",
         default=None,
         help=EC_METHODS_HELP,
+    )
+    parser.add_argument(
+        "--ec-holdout-role",
+        choices=["test", "validation"],
+        default=None,
+        help=EC_HOLDOUT_ROLE_HELP,
+    )
+    parser.add_argument(
+        "--ec-output-detail",
+        choices=["summary", "pairwise", "full"],
+        default="full",
+        help=EC_OUTPUT_DETAIL_HELP,
+    )
+    parser.add_argument(
+        "--ec-resume",
+        action="store_true",
+        default=False,
+        help=EC_RESUME_HELP,
+    )
+    parser.add_argument(
+        "--ec-checkpoint-every",
+        type=int,
+        default=5,
+        help=EC_CHECKPOINT_EVERY_HELP,
     )
     parser.add_argument(
         "--ec-save-predictions",
@@ -2100,11 +2334,19 @@ def get_options(args: Optional[str] = None) -> ProgramOptions:
     # parser = ArgumentParser(description=DESC)
     parser = make_parser()
     cli_args = parse_and_merge_args(parser, args)
+    from df_analyze.analysis.error_consistency.profiles import apply_ec_profile
+
+    try:
+        cli_args = apply_ec_profile(cli_args, cli_args.mode)
+    except ValueError as error:
+        raise ArgumentError(str(error)) from error
 
     if cli_args.ec_folds < 2:
         raise ArgumentError("Argument `--ec-folds` must be at least 2.")
     if cli_args.ec_repetitions < 1:
         raise ArgumentError("Argument `--ec-repetitions` must be at least 1.")
+    if cli_args.ec_checkpoint_every < 1:
+        raise ArgumentError("Argument `--ec-checkpoint-every` must be at least 1.")
     if not np.isfinite(cli_args.ec_epsilon) or cli_args.ec_epsilon < 0:
         raise ArgumentError("Argument `--ec-epsilon` must be a finite value >= 0.")
     if not np.isfinite(cli_args.ec_recurrence_threshold) or not (
@@ -2119,15 +2361,29 @@ def get_options(args: Optional[str] = None) -> ProgramOptions:
         )
 
         normalized = []
+        legacy_ratio_diff_sign = False
         for method in cli_args.ec_methods:
             if str(method).strip().lower() == "all":
                 continue
+            if str(method).strip().lower().replace(" ", "_") in {
+                "ratio_diff_sign",
+                "ratio-diff-sign",
+                "ratio-diff-signed",
+            }:
+                legacy_ratio_diff_sign = True
             try:
                 clean = normalize_regression_method(method)
             except ValueError as error:
                 raise ArgumentError(str(error)) from error
             if clean not in normalized:
                 normalized.append(clean)
+        if legacy_ratio_diff_sign:
+            warn(
+                "`ratio_diff_sign` is an ambiguous legacy EC method name. "
+                "It retains the historical magnitude-first summary; prefer "
+                "`ratio_diff_sign_magnitude` or request "
+                "`ratio_diff_sign_reference` for the signed reference aggregation."
+            )
         cli_args.ec_methods = tuple(normalized) if normalized else None
 
     mode = str(cli_args.mode).lower()
@@ -2200,16 +2456,10 @@ def get_options(args: Optional[str] = None) -> ProgramOptions:
             "Argument `--targets` must include at least one non-empty value."
         )
 
-    input_name = "" if datapath is None else datapath.name.lower()
-    sparse_suffixes = (".svm", ".svmlight", ".libsvm", ".binary")
-    compression_suffixes = ("", ".gz", ".bz2", ".xz")
     uses_svmlight = cli_args.input_format == "svmlight" or (
         cli_args.input_format == "auto"
-        and any(
-            input_name.endswith(suffix + compression)
-            for suffix in sparse_suffixes
-            for compression in compression_suffixes
-        )
+        and datapath is not None
+        and looks_like_svmlight_path(datapath)
     )
     if uses_svmlight:
         if cli_args.large_feature_mode:
@@ -2219,21 +2469,21 @@ def get_options(args: Optional[str] = None) -> ProgramOptions:
             )
         if len(parsed_targets) > 1:
             raise ArgumentError("SVMlight input supports exactly one target.")
-        unsupported = []
-        if grouper is not None:
-            unsupported.append("--grouper")
-        if cats:
-            unsupported.append("--categoricals")
-        if ords:
-            unsupported.append("--ordinals")
-        if cli_args.drops:
-            unsupported.append("--drops")
-        if unsupported:
-            raise ArgumentError(
-                "SVMlight input does not support table column arguments: "
-                + ", ".join(unsupported)
-                + "."
-            )
+        if len(cli_args.svmlight_metadata) == 0:
+            unsupported = []
+            if grouper is not None:
+                unsupported.append("--grouper")
+            if cats:
+                unsupported.append("--categoricals")
+            if ords:
+                unsupported.append("--ordinals")
+            if cli_args.drops:
+                unsupported.append("--drops")
+            if unsupported:
+                raise ArgumentError(
+                    "SVMlight input requires --svmlight-metadata before using "
+                    "table column arguments: " + ", ".join(unsupported) + "."
+                )
         downsample_method = FeatureDownsampleMethod.from_arg(cli_args.feat_downsample)
         if downsample_method is FeatureDownsampleMethod.None_:
             raise ArgumentError("SVMlight input requires `--feat-downsample`.")
@@ -2241,6 +2491,7 @@ def get_options(args: Optional[str] = None) -> ProgramOptions:
             FeatureDownsampleMethod.Auto,
             FeatureDownsampleMethod.Random,
             FeatureDownsampleMethod.Variance,
+            FeatureDownsampleMethod.NormalizedVariance,
             FeatureDownsampleMethod.FTest,
             FeatureDownsampleMethod.RankEnsemble,
             FeatureDownsampleMethod.SelectorEnsemble,
@@ -2252,8 +2503,49 @@ def get_options(args: Optional[str] = None) -> ProgramOptions:
                 "SVMlight input requires an indexed feature downsampling method. "
                 f"Choose one of: {allowed}."
             )
+    elif cli_args.large_feature_mode:
+        downsample_method = FeatureDownsampleMethod.from_arg(cli_args.feat_downsample)
+        indexed_methods = {
+            FeatureDownsampleMethod.Auto,
+            FeatureDownsampleMethod.Random,
+            FeatureDownsampleMethod.Variance,
+            FeatureDownsampleMethod.NormalizedVariance,
+            FeatureDownsampleMethod.FTest,
+            FeatureDownsampleMethod.RankEnsemble,
+            FeatureDownsampleMethod.SelectorEnsemble,
+            FeatureDownsampleMethod.StableRank,
+        }
+        if downsample_method is FeatureDownsampleMethod.None_:
+            raise ArgumentError("`--large-feature-mode` requires `--feat-downsample`.")
+        if downsample_method not in indexed_methods:
+            allowed = ", ".join(sorted(method.value for method in indexed_methods))
+            raise ArgumentError(
+                "Large-feature table mode requires an indexed feature downsampling "
+                f"method. Choose one of: {allowed}."
+            )
+    elif cli_args.downsample_protected_features:
+        raise ArgumentError(
+            "`--downsample-protected-features` is supported only with "
+            "`--large-feature-mode` or SVMlight input."
+        )
+    if not uses_svmlight and (
+        cli_args.svmlight_metadata
+        or cli_args.svmlight_feature_map is not None
+        or cli_args.svmlight_sample_id_column is not None
+    ):
+        raise ArgumentError(
+            "SVMlight sidecar and sample-ID options require SVMlight input."
+        )
+    if (
+        uses_svmlight
+        and cli_args.svmlight_sample_id_column is not None
+        and len(cli_args.svmlight_metadata) == 0
+    ):
+        raise ArgumentError(
+            "`--svmlight-sample-id-column` requires `--svmlight-metadata`."
+        )
 
-    return ProgramOptions(
+    resolved_options = ProgramOptions(
         datapath=datapath,
         test_paths=cli_args.df_tests,
         tests_method=cli_args.df_tests_method,
@@ -2286,10 +2578,17 @@ def get_options(args: Optional[str] = None) -> ProgramOptions:
         mt_agg_strategy=cli_args.mt_agg_strategy,
         mt_top_k=cli_args.mt_top_k,
         error_consistency=cli_args.error_consistency,
+        ec_profile=cli_args.ec_profile,
+        ec_profile_scope=cli_args.ec_profile_scope,
+        ec_profile_overrides=cli_args.ec_profile_overrides,
         ec_folds=cli_args.ec_folds,
         ec_repetitions=cli_args.ec_repetitions,
         ec_model_seed_mode=cli_args.ec_model_seed_mode,
         ec_methods=cli_args.ec_methods,
+        ec_holdout_role=cli_args.ec_holdout_role,
+        ec_output_detail=cli_args.ec_output_detail,
+        ec_resume=cli_args.ec_resume,
+        ec_checkpoint_every=cli_args.ec_checkpoint_every,
         ec_save_predictions=cli_args.ec_save_predictions,
         ec_empty_unions=cli_args.ec_empty_unions,
         ec_epsilon=cli_args.ec_epsilon,
@@ -2327,6 +2626,10 @@ def get_options(args: Optional[str] = None) -> ProgramOptions:
         ),
         input_format=cli_args.input_format,
         svmlight_index_base=cli_args.svmlight_index_base,
+        svmlight_metadata=cli_args.svmlight_metadata,
+        svmlight_feature_map=cli_args.svmlight_feature_map,
+        svmlight_sample_id_column=cli_args.svmlight_sample_id_column,
+        downsample_protected_features=cli_args.downsample_protected_features,
         device=cli_args.device,
         device_install=cli_args.device_install,
         adaptive_error=cli_args.adaptive_error,
@@ -2357,6 +2660,10 @@ def get_options(args: Optional[str] = None) -> ProgramOptions:
         aer_ens_tau_low=cli_args.aer_ens_tau_low,
         aer_ens_tau_high=cli_args.aer_ens_tau_high,
     )
+    if args is not None:
+        resolved_options.cli_argv = ["df-analyze", *_split_cli_args(args)]
+        resolved_options.cli_args = " ".join(resolved_options.cli_argv)
+    return resolved_options
 
 
 if __name__ == "__main__":

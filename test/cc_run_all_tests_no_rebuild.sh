@@ -26,6 +26,14 @@ echo "==========================================================================
     -x
 
 echo "================================================================================="
+echo "Testing error consistency, repeated K-fold, and EC CLI integration"
+echo "================================================================================="
+"$PYTEST" \
+    test/test_error_consistency.py \
+    test/test_error_consistency_cli_e2e.py \
+    -x
+
+echo "================================================================================="
 echo "Testing test dataset IO and basics"
 echo "================================================================================="
 "$PYTEST" -n auto \
@@ -66,6 +74,8 @@ echo "==========================================================================
 # test_loading.py
 # test_cli_random.py
 # test_cli_parsing.py
+# test_error_consistency.py
+# test_error_consistency_cli_e2e.py
 # test_datasets.py
 # test_saving.py
 # test_models.py

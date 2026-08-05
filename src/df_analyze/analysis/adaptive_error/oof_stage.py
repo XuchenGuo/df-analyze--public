@@ -127,6 +127,7 @@ def _run_oof_stage(
         groups=groups,
         n_folds=options.aer_oof_folds,
         seed=seed,
+        options=options,
     )
     groups_arr = None
     if groups is not None:

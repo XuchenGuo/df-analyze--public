@@ -159,7 +159,7 @@ def aggregate_filter_selected(
     is_cls: bool,
     strategy: str = "borda",
     alpha: float = 1.0,
-    min_support: float = 0.2,
+    min_support: float = 0.0,
     top_k: Optional[int] = None,
     target_names: Optional[Iterable[str]] = None,
 ) -> FilterSelected:
@@ -180,12 +180,17 @@ def aggregate_filter_selected(
     target_keys, _ = _resolve_target_keys(len(per_target), target_names)
     for idx, sel in enumerate(per_target):
         key = target_keys[idx]
+        selected_features = set(sel.selected)
         if sel.cont_scores is not None and not sel.cont_scores.empty:
-            cont_scores_by_target[key] = sel.cont_scores
+            cont_scores_by_target[key] = sel.cont_scores.loc[
+                sel.cont_scores.index.intersection(selected_features)
+            ]
             if cont_name is None:
                 cont_name = sel.cont_scores.name
         if sel.cat_scores is not None and not sel.cat_scores.empty:
-            cat_scores_by_target[key] = sel.cat_scores
+            cat_scores_by_target[key] = sel.cat_scores.loc[
+                sel.cat_scores.index.intersection(selected_features)
+            ]
             if cat_name is None:
                 cat_name = sel.cat_scores.name
 
@@ -261,7 +266,7 @@ def aggregate_embed_selected(
     per_target: Iterable[list[EmbedSelected]],
     strategy: str = "borda",
     alpha: float = 1.0,
-    min_support: float = 0.2,
+    min_support: float = 0.0,
     top_k: Optional[int] = None,
     target_names: Optional[Iterable[str]] = None,
 ) -> list[EmbedSelected]:
@@ -280,6 +285,7 @@ def aggregate_embed_selected(
         target_key = target_keys[idx]
         for embed in embeds:
             scores = Series(embed.scores, dtype=float)
+            scores = scores.loc[scores.index.intersection(embed.selected)]
             if embed.model is EmbedSelectionModel.Linear:
                 scores = scores.abs()
             score_maps[embed.model][target_key] = scores
@@ -323,7 +329,7 @@ def aggregate_wrapper_selected(
     per_target: Iterable[Optional[WrapperSelected]],
     strategy: str = "borda",
     alpha: float = 1.0,
-    min_support: float = 0.2,
+    min_support: float = 0.0,
     top_k: Optional[int] = None,
     target_names: Optional[Iterable[str]] = None,
 ) -> Optional[WrapperSelected]:
@@ -342,7 +348,10 @@ def aggregate_wrapper_selected(
         if first is None:
             first = selected
         early_stop = early_stop or selected.early_stop
-        score_by_target[target_keys[idx]] = Series(selected.scores, dtype=float)
+        scores = Series(selected.scores, dtype=float)
+        score_by_target[target_keys[idx]] = scores.loc[
+            scores.index.intersection(selected.selected)
+        ]
         selected_by_target.append(selected.selected)
     if first is None or not score_by_target:
         return None
@@ -390,7 +399,7 @@ def aggregate_model_selected(
     is_cls: bool,
     strategy: str = "borda",
     alpha: float = 1.0,
-    min_support: float = 0.2,
+    min_support: float = 0.0,
     top_k: Optional[int] = None,
     target_names: Optional[Iterable[str]] = None,
 ) -> ModelSelected:

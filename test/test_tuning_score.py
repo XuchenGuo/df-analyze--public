@@ -126,6 +126,14 @@ def test_multiclass_auroc_is_nan_when_a_fold_omits_a_class() -> None:
 
 
 @pytest.mark.fast
+def test_binary_auroc_does_not_reflect_below_chance_scores() -> None:
+    y_true = np.asarray([0, 0, 1, 1])
+    reversed_prob = np.asarray([[0.9], [0.8], [0.2], [0.1]])
+
+    assert robust_auroc_score(y_true, reversed_prob) == pytest.approx(0.0)
+
+
+@pytest.mark.fast
 class TestLinear:
     @pytest.mark.parametrize("metric", CLS_SCORERS)
     def test_lin_cls_tune(self, metric: Scorer, capsys: CaptureFixture) -> None:

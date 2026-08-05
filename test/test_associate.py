@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 from df_analyze._constants import TEST_RESULTS
+from df_analyze.analysis.metrics import auroc as directionless_feature_auroc
 from df_analyze.analysis.univariate.associate import AssocResults
 from df_analyze.testing.datasets import (
     FAST_INSPECTION,
@@ -31,6 +32,13 @@ logger = logging.getLogger("py.warnings")
 handler = logging.StreamHandler()
 logger.addHandler(handler)
 logger.addFilter(lambda record: "ConvergenceWarning" not in record.getMessage())
+
+
+def test_univariate_auroc_is_explicitly_directionless() -> None:
+    y = np.asarray([0, 0, 1, 1])
+    decreasing_feature = np.asarray([0.9, 0.8, 0.2, 0.1])
+
+    assert directionless_feature_auroc(decreasing_feature, y) == pytest.approx(1.0)
 
 
 def do_associate(dataset: tuple[str, TestDataset]) -> None:

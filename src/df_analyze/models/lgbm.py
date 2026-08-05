@@ -16,9 +16,11 @@ from typing import Any, Type
 from lightgbm import LGBMClassifier, LGBMRegressor
 
 from df_analyze.models.base import DfAnalyzeModel
+from df_analyze.runtime.hardware import RuntimeComponent
 
 
 class LightGBMEstimator(DfAnalyzeModel):
+    runtime_component = RuntimeComponent.LightGBM
     shortname = "lgbm"
     longname = "LightGBM Estimator"
     timeout_s = 3600  # one hour for tuning is plenty
@@ -48,6 +50,7 @@ class LightGBMEstimator(DfAnalyzeModel):
 
 
 class LightGBMRFEstimator(DfAnalyzeModel):
+    runtime_component = RuntimeComponent.LightGBM
     shortname = "rf"
     longname = "LightGBM Random Forest Estimator"
     timeout_s = 3600  # one hour for tuning is plenty

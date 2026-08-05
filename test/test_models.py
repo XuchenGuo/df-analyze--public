@@ -18,6 +18,7 @@ from shutil import rmtree
 from types import SimpleNamespace
 from typing import Literal, Union
 
+import jsonpickle
 import numpy as np
 import pandas as pd
 import pytest
@@ -29,7 +30,12 @@ from sklearn.preprocessing import KBinsDiscretizer
 
 from df_analyze.analysis.adaptive_error.oof import _init_model as init_aer_model
 from df_analyze.enumerables import ClassifierScorer, RegressorScorer
-from df_analyze.models.base import DfAnalyzeModel, PerTargetEstimator, _calibration_folds
+from df_analyze.models.base import (
+    DfAnalyzeModel,
+    PerTargetEstimator,
+    ScaledMultiTargetRegressor,
+    _calibration_folds,
+)
 from df_analyze.models.catboost import CatBoostClassifier, CatBoostRegressor
 from df_analyze.models.dummy import DummyClassifier, DummyRegressor
 from df_analyze.models.gandalf import (
@@ -52,6 +58,7 @@ from df_analyze.models.linear import (
 )
 from df_analyze.models.mlp import MLPEstimator
 from df_analyze.models.svm import SVMClassifier, SVMRegressor
+from df_analyze.models.trees import DecisionTreeRegressor
 
 C = 10
 
@@ -165,6 +172,19 @@ def test_linear_models_use_per_target_fallback() -> None:
     assert list(reg_preds.columns) == list(y_reg.columns)
 
 
+def test_scaled_per_target_regressor_jsonpickle_roundtrip() -> None:
+    X, _, y_reg = lightweight_multitarget_data()
+    model = SGDRegressor(
+        model_args={"max_iter": 100, "tol": 1e-3, "random_state": 0}
+    )
+    model.refit_tuned(X, y_reg, tuned_args={})
+    expected = model.tuned_predict(X)
+
+    restored = jsonpickle.decode(jsonpickle.encode(model, unpicklable=True))
+
+    np.testing.assert_allclose(restored.tuned_predict(X), expected)
+
+
 def test_logistic_regression_avoids_deprecated_penalty_argument() -> None:
     X, y_cls, _ = lightweight_multitarget_data()
     model = LRClassifier(model_args={"C": 1.0, "l1_ratio": 0.5})
@@ -192,6 +212,30 @@ def test_multitarget_optuna_refits_fallback_model() -> None:
     predictions = model.tuned_predict(X)
     assert isinstance(predictions, DataFrame)
     assert list(predictions.columns) == list(y_cls.columns)
+
+
+def test_multitarget_regression_tuning_rejects_degenerate_cv_target() -> None:
+    n = 50
+    X = DataFrame({"feature": np.arange(n, dtype=float)})
+    y = DataFrame(
+        {
+            "dense": np.arange(n, dtype=float),
+            "sparse": np.r_[np.ones(4), np.zeros(n - 4)],
+        }
+    )
+    objective = DummyRegressor().optuna_objective(
+        X,
+        y,
+        g_train=None,
+        metric=RegressorScorer.MAE,
+        n_folds=5,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="every multi-target regression target varies",
+    ):
+        objective(object())  # type: ignore[arg-type]
 
 
 def test_non_deep_models_support_multitarget_outputs() -> None:
@@ -238,7 +282,7 @@ def test_non_deep_models_support_multitarget_outputs() -> None:
         predictions = model.tuned_predict(X)
         scores = model._score_outputs(y_reg, predictions)
         assert np.asarray(predictions).shape == y_reg.shape, model.longname
-        assert np.isfinite(scores["multi-rmse"]), model.longname
+        assert np.isfinite(scores["multi-nrmse"]), model.longname
 
 
 def test_multitarget_joint_metrics_are_reported() -> None:
@@ -253,14 +297,120 @@ def test_multitarget_joint_metrics_are_reported() -> None:
     reg_scores = SGDRegressor()._score_outputs(y_reg, pred_reg)
 
     expected = {
-        "multi-mae",
-        "multi-mse",
-        "multi-rmse",
-        "multi-rmse-uniform",
+        "multi-nmae",
+        "multi-nmse",
+        "multi-nrmse",
+        "raw-macro-mae",
+        "raw-macro-mse",
+        "raw-vector-rmse",
+        "raw-macro-rmse",
         "multi-r2",
         "multi-r2-var",
     }
     assert expected <= set(reg_scores)
+
+
+def test_native_multitarget_regression_fit_is_target_unit_invariant() -> None:
+    X = DataFrame(
+        {
+            "x_first": np.tile([0.0, 0.0, 1.0, 1.0], 100),
+            "x_second": np.tile([0.0, 1.0, 0.0, 1.0], 100),
+        }
+    )
+    y = DataFrame(
+        {
+            "first": 10.0 * X["x_first"],
+            "second": X["x_second"],
+        }
+    )
+    rescaled = y.assign(second=y["second"] * 1_000.0)
+
+    original_model = DecisionTreeRegressor(
+        model_args={"max_depth": 1, "random_state": 0}
+    )
+    rescaled_model = DecisionTreeRegressor(
+        model_args={"max_depth": 1, "random_state": 0}
+    )
+    original_model.fit(X, y)
+    rescaled_model.fit(X, rescaled)
+
+    np.testing.assert_allclose(
+        original_model.model.feature_importances_,
+        rescaled_model.model.feature_importances_,
+    )
+    original_predictions = original_model.predict(X)
+    rescaled_predictions = rescaled_model.predict(X)
+    np.testing.assert_allclose(
+        original_predictions["first"], rescaled_predictions["first"]
+    )
+    np.testing.assert_allclose(
+        original_predictions["second"],
+        rescaled_predictions["second"] / 1_000.0,
+    )
+
+
+def test_catboost_native_multitarget_regression_scales_targets() -> None:
+    class RecordingRegressor:
+        def __init__(self, **kwargs) -> None:
+            self.fit_y = DataFrame()
+            self.means = np.array([])
+
+        def fit(self, X: DataFrame, y: DataFrame) -> None:
+            self.fit_y = y.copy()
+            self.means = y.mean(axis=0).to_numpy(dtype=float)
+
+        def predict(self, X: DataFrame) -> np.ndarray:
+            return np.tile(self.means, (len(X), 1))
+
+    X, _, y = lightweight_multitarget_data()
+    model = CatBoostRegressor()
+    model.model_cls = RecordingRegressor
+    fitted = model._fit_target_models(X, y, {})
+
+    assert isinstance(fitted, ScaledMultiTargetRegressor)
+    np.testing.assert_allclose(fitted.estimator.fit_y.mean(axis=0), 0.0, atol=1e-12)
+    np.testing.assert_allclose(
+        fitted.estimator.fit_y.std(axis=0, ddof=0),
+        1.0,
+        atol=1e-12,
+    )
+    predictions = fitted.predict(X)
+    expected = np.tile(y.mean(axis=0).to_numpy(dtype=float), (len(X), 1))
+    np.testing.assert_allclose(predictions.to_numpy(), expected)
+
+
+def test_scaled_native_multitarget_regressor_jsonpickle_roundtrip() -> None:
+    X, _, y = lightweight_multitarget_data()
+    model = DecisionTreeRegressor(model_args={"max_depth": 2, "random_state": 0})
+    model.fit(X, y)
+    expected = model.predict(X)
+
+    restored = jsonpickle.decode(jsonpickle.encode(model, unpicklable=True))
+
+    np.testing.assert_allclose(restored.predict(X), expected)
+
+
+def test_multitarget_normalized_regression_metrics_are_unit_invariant() -> None:
+    model = SGDRegressor()
+    y_true = DataFrame(
+        {
+            "small": [0.0, 1.0, 2.0, 3.0],
+            "large": [0.0, 2.0, 4.0, 6.0],
+        }
+    )
+    y_pred = DataFrame(
+        {
+            "small": [0.5, 1.0, 1.5, 2.5],
+            "large": [1.0, 2.0, 3.0, 5.0],
+        }
+    )
+    original = model._score_outputs(y_true, y_pred)
+    scaled_true = y_true.assign(large=y_true["large"] * 1_000_000)
+    scaled_pred = y_pred.assign(large=y_pred["large"] * 1_000_000)
+    rescaled = model._score_outputs(scaled_true, scaled_pred)
+
+    for metric in ("multi-nmae", "multi-nmse", "multi-nrmse", "multi-r2"):
+        assert rescaled[metric] == pytest.approx(original[metric])
 
 
 def test_multitarget_regression_tuning_score_is_scale_invariant() -> None:

@@ -36,9 +36,9 @@ options:
   --df DF
                         The dataframe to analyze.
 
-                        Currently only tables saved as either `.xlsx`, `.json` or `.csv`, or NumPy
-                        `ndarray`s saved as "<filename>.npy" are supported, but a file exported by
-                        Pandas `DataFrame.to_*` method is preferred.
+                        Currently only tables saved as `.parquet`, `.xlsx`, `.json` or `.csv`, or
+                        NumPy `ndarray`s saved as "<filename>.npy" are supported, but a file exported
+                        by a Pandas `DataFrame.to_*` method is preferred.
 
                         If your data is saved as a Pandas `DataFrame`, it must have shape
                         `(n_samples, n_features)` or `(n_samples, n_features + 1)`. The name of the
@@ -58,7 +58,9 @@ options:
   --targets TARGETS
 
                         Comma-separated target columns for a multi-target classification or
-                        regression run. This takes precedence over `--target`.
+                        regression run. All targets in one run must use the same `--mode`.
+                        Rows missing any target are removed. This takes precedence over
+                        `--target`; single-target usage is unchanged.
 
   --grouper GROUPER [GROUPER ...]
 
@@ -115,12 +117,11 @@ options:
                         If "classify", do classification. If "regress", do regression.
 
   --device {auto,cpu,cuda}
-                        Runtime device for supported models. Auto uses workload-aware
-                        thresholds for KNN, CatBoost, and XGBoost so small jobs stay on
-                        CPU; compute-heavy neural and embedding backends prefer an
-                        available accelerator. CUDA falls back to CPU with a warning
-                        when a backend is unavailable. GANDALF may use MPS in auto mode
-                        on supported Apple systems.
+                        GPU policy. Auto is recommended: supported models use CUDA when
+                        available and beneficial, and a failed CUDA model task retries
+                        once on CPU. CPU disables GPU use. CUDA is strict for selected
+                        models with CUDA support; models without a CUDA backend still
+                        run normally on CPU. GANDALF may use MPS in auto mode.
 
   --device-install {auto,ask,never}
                         Managed CUDA PyTorch setup policy. The default is never.
@@ -233,7 +234,7 @@ options:
                         is to prevent double-dipping / circular analysis that can result in
                         (extremely) biased performance estimates.
 
-  --feat-downsample {none,auto,random,variance,f-test,mutual-info,linear,lgbm,svd,sparse-rp,rank-ensemble,selector-ensemble,stable-rank}
+  --feat-downsample {none,auto,random,variance,normalized-variance,f-test,mutual-info,linear,lgbm,svd,sparse-rp,rank-ensemble,selector-ensemble,stable-rank}
 
                         Reduce a wide matrix before the usual feature-selection and tuning
                         stages. Supervised methods use a screening subset disjoint from the
@@ -274,11 +275,32 @@ options:
 
   --input-format {auto,table,svmlight}
 
-                        Input format; auto recognizes common SVMlight suffixes.
+                        Input format; auto recognizes common SVMlight suffixes and bounded
+                        content signatures for files with nonstandard names.
 
   --svmlight-index-base {auto,zero,one}
 
                         Feature index base used to name SVMlight columns.
+
+  --svmlight-metadata SVMLIGHT_METADATA [SVMLIGHT_METADATA ...]
+
+                        Row-aligned CSV, TSV, JSON, or Parquet clinical sidecars, one per
+                        SVMlight input (training file followed by external test files).
+
+  --svmlight-feature-map SVMLIGHT_FEATURE_MAP
+
+                        CSV, TSV, JSON, or Parquet map with feature_index and feature_name
+                        columns and an optional protected column.
+
+  --svmlight-sample-id-column SVMLIGHT_SAMPLE_ID_COLUMN
+
+                        Clinical ID column checked row-by-row against SVMlight comments of
+                        the form '# column=value' (or '# value').
+
+  --downsample-protected-features DOWNSAMPLE_PROTECTED_FEATURES [DOWNSAMPLE_PROTECTED_FEATURES ...]
+
+                        Source feature names that must survive large-table or SVMlight
+                        downsampling and count toward --n-feat-downsample.
 
   --mt-agg-strategy {borda,freq}
 
@@ -678,31 +700,66 @@ options:
                         An integer specifies the number of samples to set aside for testing.
 
   --error-consistency, --ec
-                        Enable repeated K-fold error consistency analysis on the final
-                        holdout set.
+                        Run error consistency after feature selection and tuning. The
+                        training folds change, but every fitted model predicts the same
+                        external holdout. Do not use a final-test holdout to select a model.
+  --ec-profile {none,classification-paper,regression-paper}
+                        Use settings from an EC reference experiment.
+                        classification-paper uses an 80/20 holdout, 5 folds, 10
+                        repetitions, and fixed model seeds. regression-paper uses an 80/20
+                        holdout, 5 folds, 50 repetitions, fixed model seeds, and the seven
+                        reference methods. Explicit CLI or spreadsheet values override
+                        the matching profile setting. Profiles do not reproduce the
+                        original datasets, preprocessing, models, or result tables.
   --ec-folds EC_FOLDS
-                        Number of folds in each error-consistency repetition (minimum 2).
+                        Number of folds in each error-consistency repetition.
   --ec-repetitions EC_REPETITIONS
-                        Number of independently shuffled K-fold repetitions (minimum 1,
-                        default 5).
+                        Number of shuffled K-fold repetitions. Each configuration is
+                        fitted --ec-folds * --ec-repetitions times. The default is 5.
   --ec-model-seed-mode {vary,fixed}
-                        Whether fitted-model RNG seeds vary deterministically by fold
-                        (split plus algorithmic instability) or stay fixed (training-
-                        subset sensitivity). Default: vary.
+                        Choose whether the fitted-model seed changes across folds. vary
+                        (the default) measures changes from both training rows and model
+                        randomness. fixed reuses the base seed for every fit.
   --ec-methods EC_METHODS [EC_METHODS ...]
-                        Regression EC metrics to compute. The default is all seven methods.
+                        Regression EC methods to calculate. The default is all seven
+                        methods: ratio, ratio_diff, ratio_sign,
+                        ratio_diff_sign_magnitude, intersection_union_sample,
+                        intersection_union_all, and intersection_union_distance.
+                        ratio_diff_sign_reference is an optional signed compatibility
+                        method and is not ranked.
+  --ec-holdout-role {test,validation}
+                        Describe how the shared holdout is used. test (the default)
+                        calculates EC but disables model ranking and EC/performance
+                        correlations. validation enables those outputs for a separate
+                        validation or audit holdout. This option does not change the split.
+  --ec-output-detail {summary,pairwise,full}
+                        Choose how much EC output to keep. summary writes the main tables
+                        and audit files; pairwise adds model-pair tables and plots; full
+                        adds sample-level diagnostics. --ec-save-predictions adds
+                        prediction and residual/error matrices at any level. The default
+                        is full.
+  --ec-resume
+                        Continue EC from a matching checkpoint, or reuse a completed
+                        result. The prepared training data, holdout data, and EC settings
+                        must match.
+  --ec-checkpoint-every EC_CHECKPOINT_EVERY
+                        Save an EC checkpoint after this many completed repetitions. The
+                        default is 5.
   --ec-save-predictions
-                        Save the holdout prediction and residual/error matrices used by EC.
+                        Save the prediction and residual/error matrices used to calculate
+                        EC, including holdout positions and true target values.
   --ec-empty-unions {0,1,nan,drop,error,warn}
-                        Classification policy when neither model in a pair makes an error.
-                        The default is warn, which records the undefined comparison as NaN.
+                        Handle classification pairs where neither model makes a holdout
+                        error. Choices are 0, 1, nan, drop, error, and warn. The default,
+                        warn, issues one warning and stores the undefined comparison as
+                        NaN.
   --ec-epsilon EC_EPSILON
-                        Non-negative denominator stabilization for regression ratio metrics.
+                        Non-negative value added to regression ratio denominators near
+                        zero. The default is 0.
   --ec-recurrence-threshold EC_RECURRENCE_THRESHOLD
-                        Error-rate threshold used to label high recurrence in the joint
-                        adaptive-error and error-consistency report. This is a
-                        configurable heuristic, not a universal scientific cutoff.
-                        Default: 0.5.
+                        Error-rate threshold used to label high recurrence in the combined
+                        adaptive-error/EC report. The default is 0.5; it is not a
+                        universal cutoff.
 
   --outdir OUTDIR
                         Specifies location of all results, as well as cache files for slow

@@ -1,3 +1,9 @@
+"""Join EC recurrence and adaptive-error results by holdout row.
+
+The join uses tables that have already been calculated and does not change
+either method.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -11,7 +17,6 @@ from df_analyze.analysis.adaptive_error.base_models_selection import (
     _slug_from_options,
 )
 from df_analyze.analysis.error_consistency.runner import detail_output_dir
-
 
 REPORT_COLUMNS = [
     "target",

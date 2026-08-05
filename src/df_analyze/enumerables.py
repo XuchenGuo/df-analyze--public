@@ -523,6 +523,7 @@ class FeatureDownsampleMethod(RandEnum, Enum):
     Auto = "auto"
     Random = "random"
     Variance = "variance"
+    NormalizedVariance = "normalized-variance"
     FTest = "f-test"
     MutualInfo = "mutual-info"
     Linear = "linear"

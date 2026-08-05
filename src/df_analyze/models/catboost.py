@@ -15,10 +15,11 @@ import numpy as np
 import optuna
 from optuna import Study, Trial
 from pandas import DataFrame, Series
+from sklearn.preprocessing import StandardScaler
 
 from df_analyze._constants import SEED
 from df_analyze.enumerables import Scorer
-from df_analyze.models.base import DfAnalyzeModel
+from df_analyze.models.base import DfAnalyzeModel, ScaledMultiTargetRegressor
 from df_analyze.runtime.hardware import RuntimeComponent
 from df_analyze.splitting import OmniKFold
 
@@ -36,6 +37,7 @@ else:
 class CatBoostEstimator(DfAnalyzeModel):
     shortname = "catboost"
     longname = "CatBoost Estimator"
+    runtime_component = RuntimeComponent.CatBoost
     timeout_s = 30 * 60
 
     def __init__(self, model_args: Optional[Mapping] = None) -> None:
@@ -43,6 +45,7 @@ class CatBoostEstimator(DfAnalyzeModel):
         self.needs_calibration = False
         self.model_cls: Type[Any] = type(None)
         self.target_cols: list[str] = []
+        self._tuning_thread_count: Optional[int] = None
         self.default_args = dict(
             iterations=100,
             depth=6,
@@ -144,7 +147,32 @@ class CatBoostEstimator(DfAnalyzeModel):
                 model_args.setdefault("loss_function", native_loss)
                 model_cls, clean_args = self.model_cls_args(model_args)
                 model = model_cls(**clean_args)
-                model.fit(X, y)
+                y_fit = y
+                target_scaler: Optional[StandardScaler] = None
+                if not self.is_classifier:
+                    constant = [
+                        str(col)
+                        for col in y.columns
+                        if y[col].nunique(dropna=False) < 2
+                    ]
+                    if constant:
+                        raise ValueError(
+                            "Multi-target regression has constant target(s) in a "
+                            f"CatBoost training partition: {constant}."
+                        )
+                    target_scaler = StandardScaler()
+                    y_fit = DataFrame(
+                        target_scaler.fit_transform(y.to_numpy(dtype=float)),
+                        index=y.index,
+                        columns=y.columns,
+                    )
+                model.fit(X, y_fit)
+                if target_scaler is not None:
+                    return ScaledMultiTargetRegressor(
+                        estimator=model,
+                        scaler=target_scaler,
+                        target_cols=[str(col) for col in y.columns],
+                    )
                 return model
             return {
                 str(col): self._fit_single_target(X, y[col], kwargs)
@@ -249,7 +277,7 @@ class CatBoostEstimator(DfAnalyzeModel):
             g_train=g_train,
             multitarget_y=(
                 y_df
-                if self.is_classifier and y_df.shape[1] > 1
+                if y_df.shape[1] > 1
                 else None
             ),
         )
@@ -263,6 +291,10 @@ class CatBoostEstimator(DfAnalyzeModel):
                 **opt_args,
             }
             self._maybe_use_gpu(full_args)
+            if self._tuning_thread_count is not None:
+                # Optuna is already parallelizing trials. Keep each CatBoost
+                # fit single-threaded to avoid nested CPU oversubscription.
+                full_args["thread_count"] = self._tuning_thread_count
             scores = []
             scores_by_target: dict[str, list[float]] = {}
             for step, (idx_train, idx_test) in enumerate(splits):
@@ -311,15 +343,22 @@ class CatBoostEstimator(DfAnalyzeModel):
         base_args = {**self.fixed_args, **self.default_args, **self.model_args}
         self._maybe_use_gpu(base_args)
         n_jobs = self.runtime.tuning_jobs(RuntimeComponent.CatBoost, n_jobs)
-        return super().htune_optuna(
-            X_train=X_train,
-            y_train=y_train,
-            g_train=g_train,
-            metric=metric,
-            n_trials=n_trials,
-            n_jobs=n_jobs,
-            verbosity=verbosity,
+        decision = self.runtime.decision_for(RuntimeComponent.CatBoost)
+        self._tuning_thread_count = (
+            1 if decision.resolved == "cpu" and n_jobs != 1 else None
         )
+        try:
+            return super().htune_optuna(
+                X_train=X_train,
+                y_train=y_train,
+                g_train=g_train,
+                metric=metric,
+                n_trials=n_trials,
+                n_jobs=n_jobs,
+                verbosity=verbosity,
+            )
+        finally:
+            self._tuning_thread_count = None
 
     def _score_outputs_joint(
         self,

@@ -6,6 +6,7 @@ import pandas as pd
 from df_analyze.preprocessing.cleaning import encode_target, encode_targets, reindex
 from df_analyze._main import _run
 from df_analyze.cli.cli import get_options
+from df_analyze.hypertune import _get_splits
 from df_analyze.preprocessing.inspection.inspection import inspect_data
 from df_analyze.preprocessing.prepare import prepare_data, usable_training_indices
 from df_analyze.selection.models import model_select_features
@@ -134,6 +135,44 @@ def test_multitarget_holdout_only_label_is_rejected() -> None:
             [np.arange(train_rows, len(frame))],
             _warn=False,
         )
+
+
+def test_selected_feature_resolution_uses_exact_names() -> None:
+    X = pd.DataFrame(
+        {
+            "age": [1.0, 2.0],
+            "stage": [3.0, 4.0],
+            "age2": [5.0, 6.0],
+        }
+    )
+    prepared = SimpleNamespace(X=X, feature_lineage={column: column for column in X})
+
+    X_train, X_test = _get_splits(prepared, prepared, "filter", ["age"])
+
+    assert X_train.columns.tolist() == ["age"]
+    assert X_test.columns.tolist() == ["age"]
+
+
+def test_selected_feature_resolution_expands_declared_lineage() -> None:
+    X = pd.DataFrame(
+        {
+            "cat_blue": [1.0, 0.0],
+            "cat_red": [0.0, 1.0],
+            "category_count": [2.0, 3.0],
+        }
+    )
+    prepared = SimpleNamespace(
+        X=X,
+        feature_lineage={
+            "cat_blue": "cat",
+            "cat_red": "cat",
+            "category_count": "category_count",
+        },
+    )
+
+    X_train, _ = _get_splits(prepared, prepared, "filter", ["cat"])
+
+    assert X_train.columns.tolist() == ["cat_blue", "cat_red"]
 
 
 def test_inspection_rows_exclude_missing_training_targets() -> None:

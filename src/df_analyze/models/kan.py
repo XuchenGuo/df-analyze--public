@@ -9,6 +9,9 @@ ROOT = Path(__file__).resolve().parent.parent.parent  # isort: skip
 sys.path.append(str(ROOT))  # isort: skip
 # fmt: on
 
+from base64 import b64decode, b64encode
+from io import BytesIO
+from math import ceil
 from typing import Any, Callable, Mapping, Optional, Union
 
 import numpy as np
@@ -17,14 +20,20 @@ import torch
 from optuna import Study, Trial
 from pandas import DataFrame, Series
 from skorch import NeuralNetClassifier, NeuralNetRegressor
+from skorch.callbacks import LRScheduler
 from torch import Tensor
 from torch.nn import CrossEntropyLoss, HuberLoss, Module
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts
 
 from df_analyze.enumerables import Scorer
 from df_analyze.models.base import DfAnalyzeModel, classification_output_dim
 from df_analyze.models.mlp import BATCH_SIZE, MLPEstimator
-from df_analyze.runtime.hardware import RuntimeComponent, cleanup_torch_accelerator
+from df_analyze.runtime.hardware import (
+    RuntimeComponent,
+    cleanup_torch_accelerator,
+    get_runtime,
+)
 from df_analyze.splitting import OmniKFold
 
 KAN_GRID_SIZE = 5
@@ -101,6 +110,7 @@ class SkorchKAN(Module):
 
 
 class KANEstimator(MLPEstimator):
+    runtime_component = RuntimeComponent.KAN
     shortname = "kan"
     longname = "Kolmogorov-Arnold Network"
     timeout_s = 3600
@@ -127,11 +137,133 @@ class KANEstimator(MLPEstimator):
     def _cleanup_after_fold(self) -> None:
         cleanup_torch_accelerator(self.runtime, RuntimeComponent.KAN)
 
+    @staticmethod
+    def _serialize_net(model: Any) -> dict[str, Any]:
+        module = getattr(model, "module_", None)
+        if module is None:
+            raise RuntimeError("Cannot serialize an unfitted KAN estimator.")
+
+        params = model.get_params(deep=False)
+        module_args = {
+            key: value for key, value in params.items() if key.startswith("module__")
+        }
+        state_dict = {
+            key: value.detach().cpu() if isinstance(value, Tensor) else value
+            for key, value in module.state_dict().items()
+        }
+        buffer = BytesIO()
+        torch.save(state_dict, buffer)
+        return {
+            "estimator": (
+                "classifier"
+                if isinstance(model, NeuralNetClassifier)
+                else "regressor"
+            ),
+            "module_args": module_args,
+            "classes": params.get("classes"),
+            "state_dict": b64encode(buffer.getvalue()).decode("ascii"),
+        }
+
+    def _serialize_models(self, models: Any) -> Optional[dict[str, Any]]:
+        if models is None:
+            return None
+        if isinstance(models, dict):
+            return {
+                "kind": "multi",
+                "models": {
+                    str(target): self._serialize_net(model)
+                    for target, model in models.items()
+                },
+            }
+        return {"kind": "single", "model": self._serialize_net(models)}
+
+    def _restore_net(self, state: Mapping[str, Any]) -> Any:
+        is_classifier = state["estimator"] == "classifier"
+        estimator_cls = NeuralNetClassifier if is_classifier else NeuralNetRegressor
+        criterion = CrossEntropyLoss if is_classifier else HuberLoss
+        kwargs: dict[str, Any] = {
+            "module": SkorchKAN,
+            "criterion": criterion,
+            "optimizer": AdamW,
+            "max_epochs": 1,
+            "batch_size": BATCH_SIZE,
+            "iterator_train__drop_last": False,
+            "device": self.runtime.device_for(RuntimeComponent.KAN),
+            "verbose": 0,
+            "train_split": None,
+            "callbacks": [],
+            **dict(state["module_args"]),
+        }
+        if state.get("classes") is not None:
+            kwargs["classes"] = state["classes"]
+
+        model = estimator_cls(**kwargs)
+        model.initialize()
+        buffer = BytesIO(b64decode(state["state_dict"]))
+        state_dict = torch.load(buffer, map_location="cpu", weights_only=True)
+        model.module_.load_state_dict(state_dict)
+        return model
+
+    def _restore_models(self, state: Optional[Mapping[str, Any]]) -> Any:
+        if state is None:
+            return None
+        if state["kind"] == "multi":
+            return {
+                str(target): self._restore_net(model_state)
+                for target, model_state in state["models"].items()
+            }
+        return self._restore_net(state["model"])
+
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
-        state["model"] = None
-        state["tuned_model"] = None
+        state["_serialized_model"] = self._serialize_models(state.pop("model", None))
+        state["_serialized_tuned_model"] = self._serialize_models(
+            state.pop("tuned_model", None)
+        )
         return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        model_state = state.pop("_serialized_model", None)
+        tuned_model_state = state.pop("_serialized_tuned_model", None)
+        self.__dict__.update(state)
+        # Restore portable fitted artifacts without requiring the training
+        # machine's CUDA backend. New work can opt into another runtime later.
+        self.runtime = get_runtime("cpu")
+        self._configure_runtime()
+        self.model = self._restore_models(model_state)
+        self.tuned_model = self._restore_models(tuned_model_state)
+
+    @staticmethod
+    def _scheduler_period(
+        n_samples: int,
+        n_epochs: int,
+        has_validation: bool,
+        batch_size: int = BATCH_SIZE,
+    ) -> int:
+        if has_validation:
+            # Skorch's default ValidSplit(5) holds out one fifth. The scheduler
+            # steps once per *training* batch, not once per validation batch.
+            n_samples = n_samples - ceil(n_samples / 5)
+        n_batches = max(1, ceil(max(1, n_samples) / max(1, int(batch_size))))
+        return max(1, int(n_epochs) * n_batches)
+
+    def _get_scheduler(
+        self, X_train: DataFrame, restarts: bool, val_split: bool
+    ) -> LRScheduler:
+        policy = CosineAnnealingWarmRestarts if restarts else CosineAnnealingLR
+        n_epochs = 8 if restarts else 50
+        batch_size = int(self.model_args.get("batch_size", BATCH_SIZE))
+        period = self._scheduler_period(
+            len(X_train), n_epochs, val_split, batch_size=batch_size
+        )
+        shared: Mapping[str, Any] = dict(eta_min=0, step_every="step")
+        if restarts:
+            return LRScheduler(
+                policy=policy, T_0=period, T_mult=2, **shared  # type: ignore[arg-type]
+            )
+        return LRScheduler(
+            policy=policy, T_max=period, **shared  # type: ignore[arg-type]
+        )
 
     def _set_input_dim(self, X: DataFrame) -> None:
         self.fixed_args["module__input_dim"] = int(X.shape[1])
@@ -263,6 +395,30 @@ class KANEstimator(MLPEstimator):
             raise RuntimeError("Need to tune estimator before calling `.predict_proba()`")
         return self._predict_with(self.tuned_model, X, probabilities=True)  # type: ignore
 
+    def tuned_scores(self, X: DataFrame, y: Union[Series, DataFrame]) -> float:
+        if self.tuned_model is None:
+            raise RuntimeError("Need to tune model before calling `.tuned_scores()`")
+
+        if isinstance(self.tuned_model, dict):
+            if not isinstance(y, DataFrame):
+                raise ValueError("Expected DataFrame targets for a multi-target model.")
+            Xt = self._to_torch(X)
+            scores = []
+            for col in y.columns:
+                target = str(col)
+                if target not in self.tuned_model:
+                    raise ValueError(f"No tuned KAN model found for target {target!r}.")
+                _, yt = self._to_torch(X, y[col])
+                scores.append(float(self.tuned_model[target].score(Xt, yt)))
+            return float(np.mean(scores))
+
+        if isinstance(y, DataFrame):
+            if y.shape[1] != 1:
+                raise ValueError("Expected one target for a single-target KAN model.")
+            y = y.iloc[:, 0]
+        Xt, yt = self._to_torch(X, y)
+        return float(self.tuned_model.score(Xt, yt))
+
     def optuna_objective(
         self,
         X_train: DataFrame,
@@ -294,7 +450,7 @@ class KANEstimator(MLPEstimator):
             y_split,
             g_train,
             multitarget_y=(
-                y_train if self.is_classifier else None
+                y_train
             ),
         )[0]
 
@@ -315,12 +471,14 @@ class KANEstimator(MLPEstimator):
                     )
                     child.set_runtime(self.runtime)
                     model_args = child._to_model_args(optuna_args, X_tr)
-                    args = {
-                        **child.fixed_args,
-                        **child.default_args,
-                        **child.model_args,
-                        **model_args,
-                    }
+                    args = child._runtime_model_args(
+                        {
+                            **child.fixed_args,
+                            **child.default_args,
+                            **child.model_args,
+                            **model_args,
+                        }
+                    )
                     estimator = None
                     try:
                         estimator = child.model_cls(**args)
@@ -356,7 +514,12 @@ class KANEstimator(MLPEstimator):
         n_jobs: int = -1,
         verbosity: int = optuna.logging.ERROR,
     ) -> Study:
-        n_jobs = self.runtime.tuning_jobs(RuntimeComponent.KAN, n_jobs)
+        # Each trial creates multiple PyTorch/pykan modules while PyTorch also
+        # manages its own CPU thread pool. Parallel trials therefore multiply
+        # memory use and oversubscribe CPUs; pykan also uses process-global RNG
+        # state during module construction. Keep trials serial for stable,
+        # reproducible tuning while retaining parallelism inside torch itself.
+        n_jobs = self.runtime.tuning_jobs(RuntimeComponent.KAN, 1)
         return DfAnalyzeModel.htune_optuna(
             self,
             X_train=X_train,

@@ -47,13 +47,19 @@ from sklearn.metrics import accuracy_score as acc
 from sklearn.metrics import mean_absolute_error as mae
 from sklearn.metrics import mean_squared_error as mse
 from sklearn.metrics import r2_score as r2
+from sklearn.preprocessing import StandardScaler
 
 from df_analyze._constants import SEED
 from df_analyze.enumerables import (
     Scorer,
     WrapperSelection,
 )
-from df_analyze.runtime.hardware import DeviceIntent, RuntimePolicy, get_runtime
+from df_analyze.runtime.hardware import (
+    DeviceIntent,
+    RuntimeComponent,
+    RuntimePolicy,
+    get_runtime,
+)
 from df_analyze.splitting import OmniKFold, resolve_final_cv_folds, y_split_label
 
 NEG_MAE = "neg_mean_absolute_error"
@@ -109,6 +115,7 @@ class PerTargetEstimator:
         self.needs_calibration = needs_calibration
         self.target_cols: list[str] = []
         self.models: dict[str, Any] = {}
+        self.target_scalers: dict[str, StandardScaler] = {}
 
     def _new_model(self, y: Series) -> Any:
         model = self.model_cls(**self.model_args)
@@ -128,17 +135,35 @@ class PerTargetEstimator:
             raise ValueError("PerTargetEstimator requires DataFrame targets.")
         self.target_cols = [str(col) for col in y.columns]
         self.models = {}
+        self.target_scalers = {}
         for col in y.columns:
             model = self._new_model(y[col])
-            model.fit(X, y[col])
-            self.models[str(col)] = model
+            target = str(col)
+            y_fit = y[col]
+            if not self.is_classifier:
+                if y_fit.nunique(dropna=False) < 2:
+                    raise ValueError(
+                        f"Regression target '{target}' is constant in a model "
+                        "training partition."
+                    )
+                scaler = StandardScaler()
+                scaled = scaler.fit_transform(
+                    y_fit.to_numpy(dtype=float).reshape(-1, 1)
+                ).reshape(-1)
+                y_fit = Series(scaled, index=y_fit.index, name=y_fit.name)
+                self.target_scalers[target] = scaler
+            model.fit(X, y_fit)
+            self.models[target] = model
         return self
 
     def predict(self, X: DataFrame) -> DataFrame:
-        predictions = {
-            target: np.asarray(model.predict(X)).reshape(-1)
-            for target, model in self.models.items()
-        }
+        predictions = {}
+        for target, model in self.models.items():
+            values = np.asarray(model.predict(X)).reshape(-1)
+            scaler = self.target_scalers.get(target)
+            if scaler is not None:
+                values = scaler.inverse_transform(values.reshape(-1, 1)).reshape(-1)
+            predictions[target] = values
         return DataFrame(predictions, index=X.index, columns=self.target_cols)
 
     def predict_proba(self, X: DataFrame) -> dict[str, ndarray]:
@@ -152,6 +177,15 @@ class PerTargetEstimator:
     def score(self, X: DataFrame, y: DataFrame) -> float:
         if not isinstance(y, DataFrame):
             raise ValueError("PerTargetEstimator requires DataFrame targets.")
+        if not self.is_classifier:
+            aligned = y.loc[:, self.target_cols]
+            return float(
+                r2(
+                    aligned.to_numpy(dtype=float),
+                    self.predict(X).to_numpy(dtype=float),
+                    multioutput="uniform_average",
+                )
+            )
         scores = [
             float(self.models[str(col)].score(X, y[col]))
             for col in y.columns
@@ -160,6 +194,53 @@ class PerTargetEstimator:
         if not scores:
             raise ValueError("No target models were available for scoring.")
         return float(np.mean(scores))
+
+
+class ScaledMultiTargetRegressor:
+    """Train a native multi-output regressor with equally scaled targets.
+
+    Predictions are always converted back to the supplied target units. This
+    prevents a change of measurement units in one target from changing that
+    target's implicit weight in a joint squared-error objective.
+    """
+
+    def __init__(
+        self,
+        estimator: Any,
+        scaler: StandardScaler,
+        target_cols: Sequence[str],
+    ) -> None:
+        self.estimator = estimator
+        self.scaler = scaler
+        self.target_cols = [str(col) for col in target_cols]
+
+    def predict(self, X: DataFrame) -> DataFrame:
+        predictions = self.estimator.predict(X)
+        if isinstance(predictions, DataFrame):
+            values = predictions.loc[:, self.target_cols].to_numpy(dtype=float)
+        else:
+            values = np.asarray(predictions, dtype=float)
+        if values.ndim == 1:
+            values = values.reshape(-1, 1)
+        restored = self.scaler.inverse_transform(values)
+        return DataFrame(restored, index=X.index, columns=self.target_cols)
+
+    def score(self, X: DataFrame, y: DataFrame) -> float:
+        aligned = y.loc[:, self.target_cols]
+        return float(
+            r2(
+                aligned.to_numpy(dtype=float),
+                self.predict(X).to_numpy(dtype=float),
+                multioutput="uniform_average",
+            )
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        # Preserve access to estimator attributes such as feature_importances_.
+        estimator = self.__dict__.get("estimator")
+        if estimator is None:
+            raise AttributeError(name)
+        return getattr(estimator, name)
 
 
 class EarlyStopping:
@@ -196,6 +277,7 @@ class EarlyStopping:
 class DfAnalyzeModel(ABC):
     shortname: str = ""
     longname: str = ""
+    runtime_component = RuntimeComponent.Sklearn
     timeout_s: int = 3600  # one hour
     # ``None`` means the model does not use K-fold hyperparameter tuning.
     # Multi-target preflight validation uses this declaration so it checks the
@@ -389,6 +471,16 @@ class DfAnalyzeModel(ABC):
         if len(by_target) == 1:
             return list(by_target.values())[0]
         scores = self._mean_scores(list(by_target.values()))
+        if not self.is_classifier:
+            raw_names = {
+                "mae": "raw-macro-mae",
+                "msqe": "raw-macro-msqe",
+                "mdae": "raw-macro-mdae",
+            }
+            scores = {
+                raw_names.get(metric, metric): value
+                for metric, value in scores.items()
+            }
         joint_scores = self._score_outputs_joint(
             y_true_df=y_true_df, y_pred_df=y_pred_df, y_prob=y_prob
         )
@@ -422,12 +514,37 @@ class DfAnalyzeModel(ABC):
         y_pred = np.asarray(y_pred_df.to_numpy(), dtype=float)
         residual = y_true - y_pred
         sq_norm = np.sum(np.square(residual), axis=1)
-        multi_mse = float(mse(y_true, y_pred, multioutput="uniform_average"))
+        per_target_mae = np.mean(np.abs(residual), axis=0)
+        per_target_mse = np.mean(np.square(residual), axis=0)
+        baseline_mae = np.mean(
+            np.abs(y_true - np.median(y_true, axis=0, keepdims=True)), axis=0
+        )
+        baseline_mse = np.mean(
+            np.square(y_true - np.mean(y_true, axis=0, keepdims=True)), axis=0
+        )
+        valid_mae = baseline_mae > np.finfo(float).eps
+        valid_mse = baseline_mse > np.finfo(float).eps
+        normalized_mae = (
+            float(np.mean(per_target_mae[valid_mae] / baseline_mae[valid_mae]))
+            if valid_mae.any()
+            else float("nan")
+        )
+        normalized_mse = (
+            float(np.mean(per_target_mse[valid_mse] / baseline_mse[valid_mse]))
+            if valid_mse.any()
+            else float("nan")
+        )
+        raw_macro_mse = float(mse(y_true, y_pred, multioutput="uniform_average"))
         return {
-            "multi-mae": float(mae(y_true, y_pred, multioutput="uniform_average")),
-            "multi-mse": multi_mse,
-            "multi-rmse": float(np.sqrt(np.mean(sq_norm))),
-            "multi-rmse-uniform": float(np.sqrt(multi_mse)),
+            "multi-nmae": normalized_mae,
+            "multi-nmse": normalized_mse,
+            "multi-nrmse": float(np.sqrt(normalized_mse)),
+            "raw-macro-mae": float(
+                mae(y_true, y_pred, multioutput="uniform_average")
+            ),
+            "raw-macro-mse": raw_macro_mse,
+            "raw-vector-rmse": float(np.sqrt(np.mean(sq_norm))),
+            "raw-macro-rmse": float(np.sqrt(raw_macro_mse)),
             "multi-r2": float(r2(y_true, y_pred, multioutput="uniform_average")),
             "multi-r2-var": float(r2(y_true, y_pred, multioutput="variance_weighted")),
         }
@@ -593,8 +710,7 @@ class DfAnalyzeModel(ABC):
                 g_train=g_train,
                 multitarget_y=(
                     y_train
-                    if self.is_classifier
-                    and isinstance(y_train, DataFrame)
+                    if isinstance(y_train, DataFrame)
                     and y_train.shape[1] > 1
                     else None
                 ),
@@ -760,8 +876,36 @@ class DfAnalyzeModel(ABC):
                     estimator, method="sigmoid", cv=folds, n_jobs=folds
                 )
 
+        fit_target = y
+        target_scaler: Optional[StandardScaler] = None
+        if (
+            not self.is_classifier
+            and isinstance(y, DataFrame)
+            and y.shape[1] > 1
+        ):
+            constant = [
+                str(col) for col in y.columns if y[col].nunique(dropna=False) < 2
+            ]
+            if constant:
+                raise ValueError(
+                    "Multi-target regression has constant target(s) in a model "
+                    f"training partition: {constant}."
+                )
+            target_scaler = StandardScaler()
+            fit_target = DataFrame(
+                target_scaler.fit_transform(y.to_numpy(dtype=float)),
+                index=y.index,
+                columns=y.columns,
+            )
+
         try:
-            estimator.fit(X, y)
+            estimator.fit(X, fit_target)
+            if target_scaler is not None:
+                return ScaledMultiTargetRegressor(
+                    estimator=estimator,
+                    scaler=target_scaler,
+                    target_cols=[str(col) for col in y.columns],
+                )
             return estimator
         except (TypeError, ValueError) as error:
             if (
@@ -878,6 +1022,8 @@ class DfAnalyzeModel(ABC):
         )
 
         tuned_model_orig = self.tuned_model
+        has_tuned_trainer = hasattr(self, "tuned_trainer")
+        tuned_trainer_orig = getattr(self, "tuned_trainer", None)
         scores = []
         fold_scores_by_target: dict[str, list[dict[str, float]]] = {}
         y_cv = self._split_target_for_cv(y_test)
@@ -888,8 +1034,7 @@ class DfAnalyzeModel(ABC):
                 g_test,
                 multitarget_y=(
                     y_test
-                    if self.is_classifier
-                    and isinstance(y_test, DataFrame)
+                    if isinstance(y_test, DataFrame)
                     and y_test.shape[1] > 1
                     else None
                 ),
@@ -929,9 +1074,13 @@ class DfAnalyzeModel(ABC):
                         target_scores
                     )
                 self.tuned_model = None
+                if has_tuned_trainer:
+                    self.tuned_trainer = None
                 self._cleanup_after_fold()
         finally:
             self.tuned_model = tuned_model_orig
+            if has_tuned_trainer:
+                self.tuned_trainer = tuned_trainer_orig
             self._cleanup_after_fold()
 
         holdout = Series(holdout_scores, name="holdout")
@@ -997,6 +1146,7 @@ class DfAnalyzeModel(ABC):
         groups: Optional[Series],
         metric: Scorer,
         test: bool = False,
+        splits: Optional[Sequence[tuple[ndarray, ndarray]]] = None,
     ) -> float:
         # NOTE: VERY IMPORTANT: This must remain single-threaded! As it is
         # used in stepwise selection in the parallel loop
@@ -1009,24 +1159,25 @@ class DfAnalyzeModel(ABC):
                 score = 1 - score
             return score
 
-        kf = OmniKFold(
-            n_splits=5,
-            is_classification=self.is_classifier,
-            grouped=groups is not None,
-            labels=None,
-            warn_on_fallback=False,
-            allow_group_fallback=False,
-            df_analyze_phase="Tuning CV Score",
-        )
-
         g = groups.copy() if groups is not None else None
+        if splits is None:
+            kf = OmniKFold(
+                n_splits=5,
+                is_classification=self.is_classifier,
+                grouped=groups is not None,
+                labels=None,
+                warn_on_fallback=False,
+                allow_group_fallback=False,
+                df_analyze_phase="Tuning CV Score",
+            )
+            splits = kf.split(y.to_frame(), y.copy(), g)[0]
         scores = []
 
-        for idx_train, idx_test in kf.split(y.to_frame(), y.copy(), g)[0]:
-            X_train = X.loc[idx_train].copy()
-            X_test = X.loc[idx_test].copy()
-            y_train = y.loc[idx_train].copy()
-            y_test = y.loc[idx_test].copy()
+        for idx_train, idx_test in splits:
+            X_train = X.iloc[idx_train].copy()
+            X_test = X.iloc[idx_test].copy()
+            y_train = y.iloc[idx_train].copy()
+            y_test = y.iloc[idx_test].copy()
             self.fit(X_train, y_train)
             preds = self.predict(X=X_test)
             self.model = None  # reset for next fit call

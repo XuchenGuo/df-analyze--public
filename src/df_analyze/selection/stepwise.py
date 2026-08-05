@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, Optional, Type, Union
+from typing import TYPE_CHECKING, Literal, Optional, Sequence, Type, Union
 
 from joblib import Parallel, delayed
 
@@ -9,6 +9,7 @@ if TYPE_CHECKING:
 from dataclasses import dataclass
 from math import ceil
 from time import perf_counter
+from warnings import warn
 
 import numpy as np
 from pandas import DataFrame, Series
@@ -22,7 +23,16 @@ from df_analyze.models.knn import KNNClassifier, KNNRegressor
 from df_analyze.models.lgbm import LightGBMClassifier, LightGBMRegressor
 from df_analyze.models.linear import ElasticNetRegressor, SGDClassifierSelector
 from df_analyze.preprocessing.prepare import PreparedData
-from df_analyze.runtime.hardware import RuntimeComponent, RuntimePolicy, get_runtime
+from df_analyze.runtime.hardware import (
+    DeviceIntent,
+    RuntimeComponent,
+    RuntimePolicy,
+    clear_fitted_model_state,
+    get_runtime,
+    is_cuda_runtime_error,
+    release_accelerator_memory,
+)
+from df_analyze.splitting import OmniKFold
 
 
 @dataclass
@@ -57,6 +67,72 @@ class RedundantFeatures:
         return "".join(lines)
 
 
+@dataclass
+class WrapperScoreResult:
+    score: float
+    audit: list[dict[str, object]]
+
+
+def _largest_fold_workload(
+    splits: Sequence[tuple[np.ndarray, np.ndarray]],
+) -> tuple[int, int]:
+    if not splits:
+        raise RuntimeError("Wrapper selection could not create any cross-validation folds.")
+    train_idx, query_idx = max(
+        splits,
+        key=lambda split: len(split[0]) * len(split[1]),
+    )
+    return len(train_idx), len(query_idx)
+
+
+def _wrapper_cv_splits(
+    y: Series,
+    groups: Optional[Series],
+    *,
+    is_classification: bool,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    splitter = OmniKFold(
+        n_splits=5,
+        is_classification=is_classification,
+        grouped=groups is not None,
+        labels=None,
+        warn_on_fallback=False,
+        allow_group_fallback=False,
+        df_analyze_phase="Tuning CV Score",
+    )
+    splits = splitter.split(y.to_frame(), y.copy(), groups)[0]
+    if not splits:
+        raise RuntimeError("Wrapper selection could not create any cross-validation folds.")
+    return splits
+
+
+def _wrapper_audit_record(
+    *,
+    model_name: str,
+    candidate: str,
+    is_forward: bool,
+    runtime: RuntimePolicy,
+    component: RuntimeComponent,
+    attempt: int,
+    stage: str,
+    error: Optional[BaseException] = None,
+) -> dict[str, object]:
+    direction = "forward" if is_forward else "backward"
+    record: dict[str, object] = {
+        "fold": None,
+        "model": model_name,
+        "selection": f"wrapper-{direction}:{candidate}",
+        "phase": "wrapper",
+        "attempt": attempt,
+        "stage": stage,
+        **runtime.decision_for(component).to_dict(),
+    }
+    if error is not None:
+        record["error_type"] = type(error).__name__
+        record["error_message"] = str(error)
+    return record
+
+
 # def get_dfanalyze_score(
 #     model_cls: Type[DfAnalyzeModel],
 #     X: DataFrame,
@@ -88,17 +164,111 @@ def get_dfanalyze_score(
     is_forward: bool,
     test: bool,
     runtime: Optional[RuntimePolicy] = None,
-) -> float:
+    splits: Optional[Sequence[tuple[np.ndarray, np.ndarray]]] = None,
+) -> WrapperScoreResult:
     includes = selected.copy()
     includes.add(candidate)
     includes = sorted(includes)
     X_new = X.loc[:, includes] if is_forward else X.drop(columns=includes)
     X_new = X_new.copy()
     g = None if g is None else g.copy()
-    model = model_cls()
-    model.set_runtime(runtime or get_runtime("cpu"))
-
-    return model.cv_score(X_new, y.copy(), g, test=test, metric=metric)
+    base_runtime = runtime or get_runtime("cpu")
+    if splits is None:
+        n_train = len(X_new)
+        n_queries = ceil(len(X_new) / 5)
+    else:
+        n_train, n_queries = _largest_fold_workload(splits)
+    actual_runtime = base_runtime.for_task(
+        n_train,
+        X_new.shape[1],
+        n_queries=n_queries,
+    )
+    component = getattr(model_cls, "runtime_component", RuntimeComponent.Sklearn)
+    decision = actual_runtime.decision_for(component)
+    if (
+        decision.resolved == "cpu"
+        and model_cls in (KNNClassifier, KNNRegressor)
+    ):
+        # CPU wrapper candidates parallelize at the outer candidate level.
+        # Keep each sklearn KNN fold single-threaded to avoid nested pools.
+        model = model_cls(model_args={"n_jobs": 1})
+    else:
+        model = model_cls()
+    model.set_runtime(actual_runtime)
+    model_name = getattr(model, "shortname", model_cls.__name__)
+    audit: list[dict[str, object]] = []
+    try:
+        score = model.cv_score(
+            X_new,
+            y.copy(),
+            g,
+            test=test,
+            metric=metric,
+            splits=splits,
+        )
+        audit.append(
+            _wrapper_audit_record(
+                model_name=model_name,
+                candidate=candidate,
+                is_forward=is_forward,
+                runtime=actual_runtime,
+                component=component,
+                attempt=1,
+                stage="completed",
+            )
+        )
+        return WrapperScoreResult(score=score, audit=audit)
+    except Exception as error:
+        audit.append(
+            _wrapper_audit_record(
+                model_name=model_name,
+                candidate=candidate,
+                is_forward=is_forward,
+                runtime=actual_runtime,
+                component=component,
+                attempt=1,
+                stage="failed",
+                error=error,
+            )
+        )
+        if not (
+            actual_runtime.intent is DeviceIntent.Auto
+            and decision.resolved == "cuda"
+            and is_cuda_runtime_error(error)
+        ):
+            raise
+        clear_fitted_model_state(model)
+        model = None
+        release_accelerator_memory()
+        actual_runtime.record_cpu_fallback(
+            component, f"cuda_runtime_fallback:{type(error).__name__}"
+        )
+        warn(
+            f"Wrapper candidate {candidate} encountered a CUDA runtime failure; "
+            "retrying this candidate on CPU once."
+        )
+        model = model_cls()
+        model.set_runtime(actual_runtime)
+        score = model.cv_score(
+            X_new,
+            y.copy(),
+            g,
+            test=test,
+            metric=metric,
+            splits=splits,
+        )
+        audit.append(
+            _wrapper_audit_record(
+                model_name=model_name,
+                candidate=candidate,
+                is_forward=is_forward,
+                runtime=actual_runtime,
+                component=component,
+                attempt=2,
+                stage="completed",
+            )
+        )
+        return WrapperScoreResult(score=score, audit=audit)
 
 
 def n_feat_int(prepared: PreparedData, n_features: Union[int, float, None]) -> int:
@@ -138,20 +308,66 @@ class StepwiseSelector:
         self.redundant_early_stop: bool = False
         self.selected: set[str] = set()
         self.to_consider: set[str] = set(self.prepared.X.columns.tolist())
+        self.cv_splits: Optional[list[tuple[np.ndarray, np.ndarray]]] = None
 
         self.n_iterations = (
             self.n_features if self.is_forward else self.total_feats - self.n_features
         )
 
+    def _ensure_cv_splits(
+        self,
+    ) -> Optional[list[tuple[np.ndarray, np.ndarray]]]:
+        if self.test:
+            return None
+        if self.cv_splits is None:
+            self.cv_splits = _wrapper_cv_splits(
+                self.prepared.y,
+                self.prepared.groups,
+                is_classification=self.prepared.is_classification,
+            )
+        return self.cv_splits
+
     def _candidate_n_jobs(self) -> int:
         if self.options.wrapper_model is WrapperSelectionModel.KNN:
-            return self.options.runtime.tuning_jobs(RuntimeComponent.KNN, -1)
+            if self.is_forward:
+                n_features = len(self.selected) + 1
+            else:
+                n_features = self.total_feats - (len(self.selected) + 1)
+            splits = self._ensure_cv_splits()
+            if splits is None:
+                n_train = len(self.prepared.X)
+                n_queries = ceil(len(self.prepared.X) / 5)
+            else:
+                n_train, n_queries = _largest_fold_workload(splits)
+            runtime = self.options.runtime.for_task(
+                n_train,
+                max(1, n_features),
+                n_queries=n_queries,
+            )
+            return runtime.tuning_jobs(RuntimeComponent.KNN, -1)
         if self.options.wrapper_model is WrapperSelectionModel.LGBM:
             # LightGBM already parallelizes each fit across CPU cores. Running
             # candidate fits in parallel as well causes severe nested
             # oversubscription, especially on Windows.
             return 1
         return -1
+
+    def _record_wrapper_audit(
+        self,
+        outcomes: Sequence[WrapperScoreResult],
+        selected_idx: int,
+    ) -> None:
+        records: list[dict[str, object]] = []
+        for idx, outcome in enumerate(outcomes):
+            failed = any(record.get("stage") == "failed" for record in outcome.audit)
+            if idx == selected_idx or failed:
+                records.extend(dict(record) for record in outcome.audit)
+        fold = getattr(self.options, "_runtime_current_fold", None)
+        for record in records:
+            record["fold"] = fold
+        audit = getattr(self.options, "_runtime_model_audit", [])
+        audit.extend(records)
+        self.options._runtime_model_audit = audit
 
     def fit(self) -> None:
         ddesc = "Forward" if self.is_forward else "Backward"
@@ -232,7 +448,10 @@ class StepwiseSelector:
 
         # loop only over un-flagged features
         candidates = list(self.to_consider.copy())
-        all_scores: list[float] = Parallel(n_jobs=self._candidate_n_jobs())(
+        splits = self._ensure_cv_splits()
+        outcomes: list[WrapperScoreResult] = Parallel(
+            n_jobs=self._candidate_n_jobs()
+        )(
             delayed(get_dfanalyze_score)(  # type: ignore
                 model_cls=model_cls,
                 X=self.prepared.X,
@@ -244,6 +463,7 @@ class StepwiseSelector:
                 is_forward=self.is_forward,
                 test=self.test,
                 runtime=self.options.runtime,
+                splits=splits,
             )
             for candidate in tqdm(
                 candidates,
@@ -252,12 +472,14 @@ class StepwiseSelector:
                 position=1,
             )
         )
+        all_scores = [outcome.score for outcome in outcomes]
         scores = np.array(all_scores)
         feat_names = candidates
         self.candidate_scores = dict(zip(feat_names, scores.tolist()))
         # Now remember redundant selection can stop early, so
 
         best_idx = np.argmax(scores)
+        self._record_wrapper_audit(outcomes, int(best_idx))
         best_score = scores[best_idx]
         best = feat_names[best_idx]
         # scores are such that higher is always better (negation already
@@ -295,7 +517,10 @@ class StepwiseSelector:
             model_cls = SGDClassifierSelector if is_cls else ElasticNetRegressor
 
         candidates = list(self.to_consider.copy())
-        scores: list[float] = Parallel(n_jobs=self._candidate_n_jobs())(
+        splits = self._ensure_cv_splits()
+        outcomes: list[WrapperScoreResult] = Parallel(
+            n_jobs=self._candidate_n_jobs()
+        )(
             delayed(get_dfanalyze_score)(  # type: ignore
                 model_cls=model_cls,
                 X=self.prepared.X,
@@ -307,6 +532,7 @@ class StepwiseSelector:
                 is_forward=self.is_forward,
                 test=self.test,
                 runtime=self.options.runtime,
+                splits=splits,
             )
             for candidate in tqdm(
                 candidates,
@@ -315,9 +541,11 @@ class StepwiseSelector:
                 position=1,
             )
         )
+        scores = [outcome.score for outcome in outcomes]
         self.candidate_scores = dict(zip(candidates, scores))
 
         idx = np.argmax(scores)
+        self._record_wrapper_audit(outcomes, int(idx))
         selected = candidates[idx]
         score = scores[idx]
         return selected, score

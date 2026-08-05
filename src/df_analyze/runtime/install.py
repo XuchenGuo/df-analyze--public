@@ -142,12 +142,22 @@ def project_fingerprint(project_root: Path) -> str:
 
 
 def nvidia_gpu_available() -> bool:
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None and visible.strip().lower() in {"", "-1", "none"}:
+        return False
     executable = shutil.which("nvidia-smi")
     if executable is None:
         return False
-    result = subprocess.run(
-        [executable, "-L"], capture_output=True, text=True, check=False
-    )
+    try:
+        result = subprocess.run(
+            [executable, "-L"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except Exception:
+        return False
     return result.returncode == 0 and "GPU" in result.stdout
 
 
@@ -171,7 +181,8 @@ def verify_environment(python: Path) -> Optional[dict[str, Any]]:
     return _run_probe(python, VERIFY_RUNTIME)
 
 
-def managed_environment(project_root: Path) -> Optional[Path]:
+def cached_managed_environment(project_root: Path) -> Optional[Path]:
+    """Return a fingerprint-matched managed interpreter without importing it."""
     root = runtime_root(project_root)
     python = environment_python(root / ".venv")
     manifest = root / "manifest.json"
@@ -182,6 +193,14 @@ def managed_environment(project_root: Path) -> Optional[Path]:
     except (OSError, json.JSONDecodeError):
         return None
     if info.get("project_fingerprint") != project_fingerprint(project_root):
+        return None
+    return python
+
+
+def managed_environment(project_root: Path) -> Optional[Path]:
+    """Return a managed interpreter after a full CUDA/runtime verification."""
+    python = cached_managed_environment(project_root)
+    if python is None:
         return None
     return python if verify_environment(python) is not None else None
 

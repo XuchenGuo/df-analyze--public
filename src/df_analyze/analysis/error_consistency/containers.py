@@ -1,3 +1,5 @@
+"""Data classes and summary helpers used by EC calculations."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -41,6 +43,7 @@ class ECMetricInfo:
     scientific_status: str = "experimental_descriptive_diagnostic"
     reference_url: str | None = None
     legacy_equation_label: str | None = None
+    ranking_supported: bool = True
 
 
 @dataclass
@@ -50,6 +53,7 @@ class ECMetricComputation:
     matrix: ndarray
     pairwise: DataFrame
     samplewise: DataFrame | None = None
+    leave_one_model_out: DataFrame | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def summary(self) -> dict[str, Any]:
@@ -65,7 +69,11 @@ class ECMetricComputation:
             "higher_is_better": self.info.higher_is_better,
             "optimal_value": self.info.optimal_value,
             "optimization_direction": optimization_direction,
-            "ranking_rule": "minimize_absolute_distance_to_optimal_value",
+            "ranking_rule": (
+                "minimize_absolute_distance_to_optimal_value"
+                if self.info.ranking_supported
+                else "not_ranked"
+            ),
             "range_min": self.info.range_min,
             "range_max": self.info.range_max,
             "paper_equation": self.info.paper_equation,
@@ -74,6 +82,7 @@ class ECMetricComputation:
             "scientific_status": self.info.scientific_status,
             "reference_url": self.info.reference_url,
             "inferential_status": "descriptive_only_not_confidence_interval",
+            "ranking_supported": self.info.ranking_supported,
         }
         row.update(finite_summary(self.values))
         row.update(self.extra)
@@ -87,4 +96,5 @@ class ErrorConsistencyResult:
     trial_scores: DataFrame
     trial_design: DataFrame
     fold_assignments: DataFrame = field(default_factory=DataFrame)
+    trial_failures: DataFrame = field(default_factory=DataFrame)
     metadata: dict[str, Any] = field(default_factory=dict)

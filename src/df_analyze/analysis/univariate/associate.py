@@ -135,7 +135,7 @@ class ContClsStats(ContAssociation, RandEnum, Enum):
             ContClsStats.BrunnerMunzelW: "Brunner-Munzel W",
             ContClsStats.Correlation: "Pearson Correlation",
             ContClsStats.CohensD: "Cohen's d",
-            ContClsStats.AUROC: "Area Under the ROC Curve",
+            ContClsStats.AUROC: "Directionless AUROC Association Strength",
             ContClsStats.MutualInfo: "Mutual Information",
         }[self]
 

@@ -6,7 +6,11 @@ from warnings import warn
 import numpy as np
 from numpy.typing import NDArray
 from pandas import DataFrame, Series
-from sklearn.model_selection import GroupShuffleSplit, ShuffleSplit, StratifiedShuffleSplit
+from sklearn.model_selection import (
+    GroupShuffleSplit,
+    ShuffleSplit,
+    StratifiedShuffleSplit,
+)
 
 from df_analyze._constants import SEED
 from df_analyze.enumerables import FeatureDownsampleMethod
@@ -34,10 +38,33 @@ def _stratification_target(y: Series | DataFrame) -> Optional[Series]:
     return None
 
 
-def _has_all_levels(y: Series | DataFrame, rows: NDArray[np.int_]) -> bool:
+def _supports_supervised_scoring(
+    y: Series | DataFrame,
+    rows: NDArray[np.int_],
+    is_classification: bool,
+) -> bool:
+    if len(rows) < 3:
+        return False
     frame = y.to_frame() if isinstance(y, Series) else y
     subset = frame.iloc[rows]
-    return all(set(frame[col].unique()) == set(subset[col].unique()) for col in frame)
+    if not is_classification:
+        # Preserve the original single-target regression path.  Requiring every
+        # screening/tuning subset to vary is a multi-target safeguard: one
+        # constant output would otherwise invalidate the aggregate scorer.
+        if frame.shape[1] == 1:
+            return True
+        for col in frame:
+            values = subset[col].to_numpy(dtype=float)
+            if not np.isfinite(values).all() or np.unique(values).size < 2:
+                return False
+        return True
+    for col in frame:
+        if set(frame[col].unique()) != set(subset[col].unique()):
+            return False
+        counts = subset[col].value_counts(dropna=False)
+        if len(counts) < 2 or counts.min() < 2:
+            return False
+    return True
 
 
 def screening_tuning_indices(
@@ -48,14 +75,15 @@ def screening_tuning_indices(
     seed: int = SEED,
 ) -> tuple[NDArray[np.int_], NDArray[np.int_]]:
     n_samples = len(y)
-    if n_samples < 4:
+    if n_samples < 6:
         raise ValueError(
-            "Supervised feature downsampling requires at least four training samples."
+            "Supervised feature downsampling requires at least six training samples "
+            "so screening and tuning both have usable statistical support."
         )
     if not 0.0 < fraction < 1.0:
         raise ValueError("Downsample screening fraction must be in (0, 1).")
 
-    screen_size = max(2, min(n_samples - 2, int(round(fraction * n_samples))))
+    screen_size = max(3, min(n_samples - 3, int(round(fraction * n_samples))))
     indices = np.arange(n_samples, dtype=int)
     if groups is not None:
         if len(groups) != n_samples:
@@ -67,40 +95,61 @@ def screening_tuning_indices(
                 "Group-disjoint feature screening requires at least two distinct "
                 "training groups."
             )
-        splitter = GroupShuffleSplit(n_splits=20, train_size=fraction, random_state=seed)
+        splitter = GroupShuffleSplit(
+            n_splits=100, train_size=fraction, random_state=seed
+        )
+        candidates = []
         for screening, tuning in splitter.split(indices, groups=groups.to_numpy()):
-            if not is_classification or (
-                _has_all_levels(y, screening) and _has_all_levels(y, tuning)
+            if (
+                _supports_supervised_scoring(y, screening, is_classification)
+                and _supports_supervised_scoring(y, tuning, is_classification)
             ):
-                return np.sort(screening), np.sort(tuning)
+                candidates.append(
+                    (
+                        abs(len(screening) - screen_size),
+                        np.sort(screening),
+                        np.sort(tuning),
+                    )
+                )
+        if candidates:
+            _, screening, tuning = min(candidates, key=lambda item: item[0])
+            return screening, tuning
         raise ValueError(
             "Could not create group-disjoint screening and tuning subsets that "
-            "both contain every target level."
+            "both have usable statistical support."
         )
 
     target = _stratification_target(y) if is_classification else None
     if target is not None:
         n_classes = target.nunique()
         counts = target.value_counts()
-        if counts.min() >= 2 and n_classes <= n_samples // 2:
-            screen_size = max(n_classes, min(n_samples - n_classes, screen_size))
-            splitter = StratifiedShuffleSplit(
-                n_splits=1, train_size=screen_size, random_state=seed
+        min_partition = 2 * n_classes
+        if counts.min() >= 4 and min_partition <= n_samples // 2:
+            screen_size = max(
+                min_partition,
+                min(n_samples - min_partition, screen_size),
             )
-            screening, tuning = next(splitter.split(indices, target))
-            if _has_all_levels(y, screening) and _has_all_levels(y, tuning):
-                return np.sort(screening), np.sort(tuning)
+            splitter = StratifiedShuffleSplit(
+                n_splits=20, train_size=screen_size, random_state=seed
+            )
+            for screening, tuning in splitter.split(indices, target):
+                if (
+                    _supports_supervised_scoring(y, screening, is_classification)
+                    and _supports_supervised_scoring(y, tuning, is_classification)
+                ):
+                    return np.sort(screening), np.sort(tuning)
 
-    splitter = ShuffleSplit(n_splits=1, train_size=screen_size, random_state=seed)
-    screening, tuning = next(splitter.split(indices))
-    if is_classification and not (
-        _has_all_levels(y, screening) and _has_all_levels(y, tuning)
-    ):
-        raise ValueError(
-            "Could not create disjoint screening and tuning subsets that both "
-            "contain every target level."
-        )
-    return np.sort(screening), np.sort(tuning)
+    splitter = ShuffleSplit(n_splits=100, train_size=screen_size, random_state=seed)
+    for screening, tuning in splitter.split(indices):
+        if (
+            _supports_supervised_scoring(y, screening, is_classification)
+            and _supports_supervised_scoring(y, tuning, is_classification)
+        ):
+            return np.sort(screening), np.sort(tuning)
+    raise ValueError(
+        "Could not create disjoint screening and tuning subsets that both have "
+        "usable statistical support."
+    )
 
 
 def method_needs_screening(method: FeatureDownsampleMethod) -> bool:
@@ -137,8 +186,14 @@ def resolve_screening_split(
         if requested is not FeatureDownsampleMethod.Auto:
             raise
         note = (
-            f"Auto feature downsampling fell back from {resolved.value} to variance "
-            f"because disjoint screening and tuning subsets were not feasible: {error}"
+            f"Auto feature downsampling fell back from {resolved.value} to "
+            "normalized-variance because disjoint screening and tuning subsets "
+            f"were not feasible: {error}"
         )
         warn(note, stacklevel=2)
-        return FeatureDownsampleMethod.Variance, None, np.arange(len(y), dtype=int), note
+        return (
+            FeatureDownsampleMethod.NormalizedVariance,
+            None,
+            np.arange(len(y), dtype=int),
+            note,
+        )

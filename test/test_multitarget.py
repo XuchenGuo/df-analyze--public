@@ -222,6 +222,9 @@ def test_per_target_tuning_scores_prediction_json_roundtrip(tmp_path: Path) -> N
         preds_train=Series([0, 1, 0, 1]),
         probs_test=None,
         probs_train=None,
+        downsample_requested="auto",
+        downsample_resolved="f-test",
+        n_downsampled_features=17,
         per_target_tuning_scores={"target_a": 0.61, "target_b": 0.79},
     )
     payload = '{"predictions": [' + result.to_preds_json() + "]}"
@@ -233,3 +236,6 @@ def test_per_target_tuning_scores_prediction_json_roundtrip(tmp_path: Path) -> N
         "target_a": pytest.approx(0.61),
         "target_b": pytest.approx(0.79),
     }
+    assert loaded[0].downsample_requested == "auto"
+    assert loaded[0].downsample_resolved == "f-test"
+    assert loaded[0].n_downsampled_features == 17

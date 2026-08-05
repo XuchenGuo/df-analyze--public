@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import re
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from hashlib import md5
 from pathlib import Path
@@ -79,6 +79,9 @@ class ProgramDirs(Debug):
     tuning: Optional[Path] = None
     results: Optional[Path] = None
     needs_clean: bool = False
+    _target_name_cache: dict[str, str] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     @staticmethod
     def new(root: Optional[Path], hsh: str) -> ProgramDirs:
@@ -244,11 +247,27 @@ class ProgramDirs(Debug):
             )
         self.save_multitarget_outputs(results, fold_idx=fold_idx)
 
-    @staticmethod
-    def _safe_target_name(target: str) -> str:
-        safe = re.sub(r"[^\w\.-]+", "_", str(target).strip())
+    def _safe_target_name(self, target: str) -> str:
+        raw = str(target)
+        cached = self._target_name_cache.get(raw)
+        if cached is not None:
+            return cached
+
+        safe = re.sub(r"[^\w\.-]+", "_", raw.strip())
         safe = safe.strip("._")
-        return safe if safe else "target"
+        safe = safe if safe else "target"
+        if len(safe) > 80:
+            safe = f"{safe[:64]}_{md5(raw.encode('utf-8')).hexdigest()[:12]}"
+
+        used = {
+            value.casefold(): source
+            for source, value in self._target_name_cache.items()
+        }
+        candidate = safe
+        if candidate.casefold() in used and used[candidate.casefold()] != raw:
+            candidate = f"{safe}_{md5(raw.encode('utf-8')).hexdigest()[:12]}"
+        self._target_name_cache[raw] = candidate
+        return candidate
 
     @staticmethod
     def _natural_target_sort_key(target: Any) -> tuple[tuple[int, Any], ...]:
@@ -291,10 +310,13 @@ class ProgramDirs(Debug):
             .pivot_table(index=idx_cols, columns="metric", values=valset, aggfunc="mean")
             .reset_index()
         )
-        sorter = "acc" if is_classification else "mae"
-        ascending = not is_classification
-        if sorter in wide.columns:
-            wide = wide.sort_values(by=sorter, ascending=ascending)
+        sorters = ["acc"] if is_classification else ["multi-nmae", "mae"]
+        for sorter in sorters:
+            if sorter in wide.columns:
+                wide = wide.sort_values(
+                    by=sorter, ascending=not is_classification
+                )
+                break
         return wide.reset_index(drop=True)
 
     def _target_markdown(
@@ -334,8 +356,17 @@ class ProgramDirs(Debug):
             if len(fold_counts) == 1
             else "adaptive-fold"
         )
+        positive_note = ""
+        if is_classification and "positive_class" in df_target.columns:
+            positive = df_target["positive_class"].dropna().astype(str).unique()
+            if len(positive) == 1:
+                positive_note = (
+                    "For binary sensitivity, specificity, PPV and NPV, the "
+                    f"encoded positive class is original label `{positive[0]}`.\n\n"
+                )
         return (
             f"# Final Model Performances For Target `{target_name}`\n\n"
+            f"{positive_note}"
             "## Training set performance\n\n"
             f"{tab_train}\n\n"
             "## Holdout set performance\n\n"
@@ -381,12 +412,17 @@ class ProgramDirs(Debug):
         target_cols = sorted(target_cols, key=ProgramDirs._natural_target_sort_key)
         if len(target_cols) > 0:
             wide = wide[idx_cols + target_cols]
-            wide["row_mean"] = wide[target_cols].mean(axis=1)
-            wide = (
-                wide.sort_values(by="row_mean", ascending=not is_classification)
-                .drop(columns=["row_mean"])
-                .reset_index(drop=True)
-            )
+            if is_classification:
+                wide["row_mean"] = wide[target_cols].mean(axis=1)
+                wide = (
+                    wide.sort_values(by="row_mean", ascending=False)
+                    .drop(columns=["row_mean"])
+                    .reset_index(drop=True)
+                )
+            else:
+                # MAE columns retain each target's original units. Their row-wise
+                # arithmetic mean is not a meaningful cross-target ranking.
+                wide = wide.sort_values(idx_cols).reset_index(drop=True)
         return wide
 
     def save_multitarget_outputs(
@@ -736,12 +772,18 @@ class ProgramDirs(Debug):
             report.write_text(result.to_markdown(), encoding="utf-8")
             metadata.write_text(result.to_json() + "\n", encoding="utf-8")
             result.selected_frame().to_csv(selected, index=False)
-            scores = result.scores_frame()
-            if scores is not None:
-                score_path = add_fold_idx(
-                    self.downsampling / "feature_scores.csv", fold_idx
+            score_path = add_fold_idx(
+                self.downsampling / "feature_scores.csv", fold_idx
+            )
+            wrote_scores = False
+            for scores in result.iter_score_frames():
+                scores.to_csv(
+                    score_path,
+                    index=False,
+                    mode="a" if wrote_scores else "w",
+                    header=not wrote_scores,
                 )
-                scores.to_csv(score_path, index=False)
+                wrote_scores = True
         except Exception as e:
             warn(
                 "Got exception when attempting to save feature downsampling results. "

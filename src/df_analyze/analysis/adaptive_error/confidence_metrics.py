@@ -235,6 +235,18 @@ def tree_vote_agreement_conf(estimator: Any, X: Any, y_pred: Array) -> Optional[
 def tree_leaf_support_conf(estimator: Any, X: Any, *, n_train: int) -> Optional[Array]:
     n_train_f = float(max(int(n_train), 1))
 
+    # A single sklearn decision tree has no ``estimators_`` collection, but its
+    # fitted leaf sample counts provide the same support statistic used below
+    # for each member of a tree ensemble.
+    if hasattr(estimator, "apply") and hasattr(estimator, "tree_"):
+        tree_X = _as_2d(X)
+        leaf_nodes = np.asarray(estimator.apply(tree_X), dtype=int).ravel()
+        node_counts = getattr(estimator.tree_, "n_node_samples", None)
+        if node_counts is not None:
+            node_counts = np.asarray(node_counts, dtype=float)
+            leaf_nodes = np.clip(leaf_nodes, 0, node_counts.shape[0] - 1)
+            return np.clip(node_counts[leaf_nodes] / n_train_f, 0.0, 1.0)
+
     base = _sklearn_ensemble_estimators(estimator)
     if base is not None:
         tree_X = _as_2d_without_feature_names(X)

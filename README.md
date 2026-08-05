@@ -323,21 +323,30 @@ python df-embed.py --help
 ## CPU and CUDA Devices
 
 Both `df-analyze` and `df-embed` accept `--device auto`, `--device cpu`, or
-`--device cuda`. The default, `auto`, uses workload thresholds for KNN,
-CatBoost, and XGBoost and prefers an available accelerator for compute-heavy
-neural and embedding backends. `cpu` disables all GPU probing and GPU execution.
-An explicit `cuda` request still falls back to CPU with a warning if a backend
-cannot use CUDA.
+`--device cuda`. Treat this option as a GPU-use policy for the mixed pipeline,
+not as a requirement that every step use one device:
 
-The current `auto` route keeps small KNN, CatBoost, and XGBoost jobs on CPU,
+- `auto` (recommended) uses CUDA for supported tasks when it is available and
+  worthwhile. If one CUDA model or analysis configuration fails, only that
+  complete configuration is retried once on CPU.
+- `cpu` disables all GPU probing and GPU execution.
+- `cuda` strictly requires CUDA for every selected model that has a supported
+  CUDA backend. Models with no CUDA implementation still run normally on CPU.
+  If a required backend is unavailable, the run stops with a clear error.
+
+The current `auto` route uses each model's actual post-selection input size and
+keeps small KNN, CatBoost, and XGBoost jobs on CPU,
 where GPU startup and data transfer can cost more than they save. Larger jobs
 and compute-heavy PyTorch models use an available accelerator. GANDALF may also
 use MPS in `auto` mode on a supported Apple system.
 
 CUDA execution is available for CatBoost, XGBoost, KNN, MLP, KAN, GANDALF,
-TabPFN, and image or text embedding. Other estimators, preprocessing, and
-feature analyses continue to use CPU implementations. GPU-backed tuning is
-serialized so that concurrent trials do not compete for the same device.
+TabPFN, image or text embedding, and sufficiently large error-consistency
+pairwise calculations. Other estimators, preprocessing, and other feature
+analyses continue to use CPU implementations. GPU-backed tuning is serialized
+so that concurrent trials do not compete for the same device. Completed
+accelerator models are snapshotted for normal result reloading and then removed
+from live accelerator memory before the next configuration is retained.
 GPU availability does not guarantee a faster run, so `auto` is the recommended
 default.
 
@@ -379,7 +388,15 @@ The environment is stored under `.df-analyze-runtime` and is rebuilt when
 `pyproject.toml` or `uv.lock` changes. Use `--device-install ask` for an
 interactive prompt, or leave the default `never` to keep the current
 environment unchanged. CatBoost and XGBoost do not require this managed
-PyTorch environment.
+PyTorch environment. In `auto`, size-dependent KNN and error-consistency work
+does not trigger managed-environment setup before the real workload is known.
+When an NVIDIA GPU is visible but the selected accelerator-preferred models
+would use a CPU-only PyTorch installation, `auto` prints a concise CPU fallback
+notice with the `--device-install auto` remedy.
+If an isolated managed CUDA environment already exists, it is reused
+automatically without reinstalling, including for `auto` KNN and
+error-consistency work. Strict `--device cuda` still validates or prepares
+those PyTorch paths before running.
 
 ### Verifying CUDA and GPU Visibility
 
@@ -507,8 +524,23 @@ multi-target learning.
 
 ## Multi-Target Analysis
 
-Use `--targets` with comma-separated column names to analyze several outcomes
-in one run:
+For one target, keep using the original `--target outcome` interface. For
+several targets, the only required change is to use comma-separated names with
+`--targets`:
+
+```shell
+# Several categorical outcomes
+python df-analyze.py --df data.csv --targets outcome_a,outcome_b --mode classify
+
+# Several numeric outcomes
+python df-analyze.py --df data.csv --targets score_a,score_b --mode regress
+```
+
+No model or output options are required for a first run; the normal
+single-target defaults are reused. Put only one task type in each run: do not
+mix categorical and continuous targets. If target names contain spaces, quote
+the entire comma-separated value. `--targets` takes precedence if `--target`
+is also present.
 
 Conceptually, multi-target analysis maps one feature matrix **X** to a target
 vector **y** = (y1, y2, ...). Continuous targets form a multi-output regression
@@ -518,20 +550,13 @@ measurements recorded for the same subject. Some estimators learn the targets
 jointly, while the per-target adapter fits independent models; the selected
 backend determines which behavior is used.
 
-```shell
-python df-analyze.py \
-    --df data.csv \
-    --targets outcome_a,outcome_b,outcome_c \
-    --mode classify \
-    --classifiers lgbm xgb dtree et dummy \
-    --outdir ./multi_target_results
-```
-
 Classification and regression are both supported. Rows missing any target are
 removed, and target cleaning is recorded in the preparation report. For
 classification, `df-analyze` checks that every target level has enough samples
 for the requested models and validation folds. If a safe split cannot be made,
-the run stops and reports the target and level that caused the problem.
+the run stops and reports the target and level that caused the problem. For
+regression, every target must vary in the outer training/holdout partitions and
+in every tuning and final-evaluation fold.
 
 Feature selection runs once per target. The results are then combined using
 Borda ranking or selection frequency:
@@ -542,10 +567,15 @@ Borda ranking or selection frequency:
 --mt-top-k 25
 ```
 
-When `--mt-top-k` is omitted, the union of the selected features is retained.
-Models that support multi-output targets use their native implementation;
-other estimators fit one model per target. Final outputs include aggregate and
-per-target performance tables:
+When `--mt-top-k` is omitted, the union of the features actually selected for
+at least one target is retained. Borda scores are computed only over those
+selected features; features that merely received a candidate score are not
+silently reintroduced. Models that support multi-output targets use their
+native implementation; other estimators fit one model per target. Native
+multi-output regressors standardize every target using training-only
+statistics and convert predictions back to the supplied units, so changing one
+target's measurement unit does not change its implicit training weight.
+Final outputs include aggregate and per-target performance tables:
 
 - `results/final_performances_per_target.csv`
 - `results/performance_long_table_per_target.csv`
@@ -555,7 +585,9 @@ per-target performance tables:
 
 Adaptive error analysis also runs separately for each classification target.
 Multi-target support does not mean that every estimator learns relationships
-between the targets.
+between the targets. The default hyperparameter search is shared: it selects
+one configuration by averaging the per-target tuning scores, while fitted
+per-target model weights remain independent.
 
 Each target's internal tuning score is used when selecting candidates for
 adaptive error analysis. The final holdout labels are used only for reporting
@@ -882,7 +914,7 @@ For example, `--n-feat-downsample 500` keeps at most 500 features, while
 available methods are:
 
 ```text
-none auto random variance f-test mutual-info linear lgbm svd sparse-rp
+none auto random variance normalized-variance f-test mutual-info linear lgbm svd sparse-rp
 rank-ensemble selector-ensemble stable-rank
 ```
 
@@ -893,14 +925,16 @@ retaining named source columns.
 
 The recommended method is `auto`. It leaves the data unchanged when the
 requested number of features is already available, normally uses an F-test,
-and uses scalable rank aggregation for extremely wide data. If the target
-cannot support supervised screening, it falls back to variance.
+and uses repeated-subsample supervised `stable-rank` for extremely wide data.
+If the target cannot support supervised screening, it falls back to
+range-normalized variance.
 
 Supervised methods use only training rows when scoring features. A separate
 part of the training data is reserved for model tuning, and holdout or external
 test rows are never used for feature scoring. Grouped data keep complete groups
 together. If a safe supervised split cannot be made, `auto` falls back to
-variance; an explicitly requested supervised method stops with an error.
+range-normalized variance; an explicitly requested supervised method stops with
+an error.
 
 For numeric tables that are too wide for the ordinary preparation path, use
 `--large-feature-mode`:
@@ -936,11 +970,40 @@ python df-analyze.py \
 Files ending in `.svm`, `.svmlight`, `.libsvm`, or `.binary` are recognized,
 including gzip, bzip2, and xz compressed forms. The matrix remains sparse while
 features are scored. SVMlight input requires feature downsampling and exactly
-one target.
+one target. Use `--svmlight-metadata` to append row-aligned clinical CSV, TSV,
+JSON, or Parquet sidecars after imaging downsampling, and
+`--svmlight-feature-map` to restore anatomical feature names. Feature maps may
+mark prior-required imaging columns as protected. SVMlight row comments can be
+checked against a BIDS/clinical ID column with
+`--svmlight-sample-id-column`.
+
+Auto mode also performs a bounded content check for SVMlight files with
+nonstandard names, including extensionless text and gzip, bzip2, or xz files
+such as `log1p.E2006.train.bz2`. For producers with a known feature-index
+convention, pass `--svmlight-index-base zero` or `one`; absence of feature index
+0 is inherently ambiguous. For example, the one-based E2006 regression
+benchmark can be run with external validation using:
+
+```powershell
+python df-analyze.py `
+  --df-train C:\data\log1p.E2006.train `
+  --df-tests C:\data\log1p.E2006.test `
+  --df-tests-method list `
+  --target target --mode regress `
+  --input-format svmlight --svmlight-index-base one `
+  --feat-downsample auto --n-feat-downsample 500 `
+  --regressors sgd dummy --htune-trials 10 `
+  --outdir .\e2006_results
+```
 
 Results are written below `features/downsampling`. The main files are
 `downsampling_report.md`, `downsampling.json`, `selected_features.csv`, and,
 when scores are available, `feature_scores.csv`.
+
+Sparse reports separate input scanning, train/test CSR loading, feature scoring,
+and selected-feature materialization/scaling time. The score-chunk budget is not
+a whole-process memory cap; source sparse matrices, temporary conversions,
+full-length score vectors, and selected dense outputs remain additional.
 
 Downsampling is a screening step and can discard useful interactions. When the
 full analysis is practical, compare its holdout results with a run that does not
@@ -1448,92 +1511,97 @@ provided usable probabilities. Placeholder prediction files indicate that
 
 ### Error Consistency
 
-Pass `--error-consistency` (or `--ec`) to measure how stable a tuned
-configuration's errors are across repeated training splits. For each selected
-feature set and tuned model, df-analyze fits `--ec-folds` models per repetition
-using only the training portion of each fold. All models predict the same final
-holdout set, so their errors or residuals can be compared sample by sample.
+Error consistency (EC) asks whether models trained on slightly different rows
+make similar mistakes on the same samples. df-analyze completes feature
+selection and tuning first. It then repeats K-fold splitting on the training
+data, fits one model per fold, and evaluates every fitted model on the same
+external holdout.
 
-For classification:
+This small classification example uses 2 folds and 2 repetitions, so each
+configuration is refitted 4 times:
 
 ```shell
 python df-analyze.py \
     --df data/small_classifier_data.json \
     --target target \
     --mode classify \
-    --classifiers lgbm xgb dummy \
+    --classifiers lr dummy \
     --feat-select filter \
-    --htune-trials 5 \
+    --htune-trials 1 \
     --ec \
-    --ec-folds 5 \
-    --ec-repetitions 3 \
-    --outdir ./error_consistency_results
+    --ec-folds 2 \
+    --ec-repetitions 2 \
+    --ec-output-detail summary \
+    --outdir ./ec_classification_results
 ```
 
-For regression, omit `--ec-methods` to run all seven methods, or provide the
-methods to run:
+The regression example uses the small Forest Fires dataset included in this
+repository:
 
 ```shell
 python df-analyze.py \
-    --df data/regression.csv \
+    --df data/testing/regression/forest_fires/forest_fires.parquet \
     --target target \
     --mode regress \
-    --regressors elastic lgbm dummy \
+    --regressors elastic dummy \
     --feat-select filter \
-    --htune-trials 5 \
+    --htune-trials 1 \
     --ec \
-    --ec-folds 5 \
-    --ec-repetitions 3 \
-    --ec-methods ratio ratio_diff ratio_sign ratio_diff_sign \
-        intersection_union_sample intersection_union_all \
-        intersection_union_distance \
-    --outdir ./error_consistency_results
+    --ec-folds 2 \
+    --ec-repetitions 2 \
+    --ec-methods ratio ratio_diff intersection_union_all \
+    --ec-output-detail summary \
+    --outdir ./ec_regression_results
 ```
 
-Classification uses the intersection-over-union of the sets of samples
-misclassified by each fitted model. Regression compares residuals. The
-optimum is 1 for `ratio`, `ratio_sign`, `intersection_union_sample`, and
-`intersection_union_all`; it is 0 for `ratio_diff`, `ratio_diff_sign`, and
-`intersection_union_distance`. The `ratio_diff_sign_magnitude` alias makes
-explicit that the primary `ratio_diff_sign` summary uses magnitude, while the
-signed direction is retained separately. Feature selection and hyperparameter
-tuning are completed before the repeated fits.
+Omit `--ec-methods` to calculate all seven regression methods. The short list
+above is only meant to make a first run quicker.
 
-The default is 5 folds and 5 repetitions. This can be expensive because every
-tuned model and feature set is fitted once per fold and repetition. Start with
-fewer repetitions when estimating the runtime. Grouped analyses continue to
-keep groups separate.
+Two profiles provide settings used by the EC reference experiments:
 
-The most useful controls are:
+```shell
+# 80/20 holdout, 5 folds, 10 repetitions, fixed model seeds
+--ec-profile classification-paper
 
-- `--ec-folds`: number of folds in each repetition
-- `--ec-repetitions`: number of independently shuffled repetitions
-- `--ec-model-seed-mode`: use `vary` to include model-seed variation or
-  `fixed` to focus on changes caused by the training rows
-- `--ec-methods`: regression methods to compute; the default is all seven
-- `--ec-empty-unions`: classification policy when neither model makes an error
-- `--ec-epsilon`: denominator stabilization for regression ratio methods
-- `--ec-save-predictions`: save the prediction and residual/error matrices
-- `--ec-recurrence-threshold`: heuristic used only in the joined adaptive-error
-  and error-consistency report
+# 80/20 holdout, 5 folds, 50 repetitions, fixed model seeds
+--ec-profile regression-paper
+```
 
-EC complements rather than replaces ordinary predictive-performance metrics.
-When performance is materially different, prefer the better-performing model;
-when performance is comparable, EC can be used as a stability diagnostic or
-tie-breaker. The reported dispersions are descriptive and are not standard
-errors, confidence intervals, or universal deployment thresholds.
+Explicit CLI or spreadsheet values override individual profile settings. These
+profiles reproduce the split and repetition settings, not the original
+datasets, preprocessing, models, or published result tables.
 
-Results are written below `results/error_consistency`. If adaptive error and
-error consistency are both enabled, a joined
+The normal default is 5 folds and 5 repetitions: 25 refits for every target,
+model, and selected feature set. The classification profile uses 50 refits; the
+regression profile uses 250. Start with 2 folds and 2 repetitions to check the
+workflow and estimate runtime. `--ec-output-detail summary` reduces the files
+kept in memory and written to disk, but it does not reduce the number of model
+fits.
+
+EC uses the holdout already created by df-analyze; it does not create another
+one. Without a profile, `--test-val-size` defaults to `0.4`. Add
+`--test-val-size 0.2` when an 80/20 split is required.
+
+Classification EC is the intersection-over-union of two models' error sets.
+Regression EC compares their residuals. Some regression methods are best at 1
+and others at 0, so read the `optimal_value` and `optimization_direction`
+columns in `summary.csv`.
+
+The default `--ec-holdout-role test` calculates EC for reporting but leaves the
+ranking and EC/performance correlation files empty. Use
+`--ec-holdout-role validation` only when the shared holdout is separate
+validation or audit data. Do not choose a model from final-test results.
+
+df-analyze creates a dataset/run folder below `--outdir`. EC results are in
+`results/error_consistency` inside that run folder. If adaptive error and error
+consistency are both enabled, a joined
 `results/adaptive_error/tables/risk_stability_report.csv` is also produced.
-The classification definition follows
-[Levman et al. (2023)](https://doi.org/10.3390/diagnostics13071315).
-The regression methods build on
-[Rahman et al. (2022)](https://doi.org/10.1109/CSDE56538.2022.10089291)
-and the seven-method extension described in the
-[error-consistency reference](docs/error_consistency.md). See
-[command-line arguments](docs/arguments.md) for every option
-and [program outputs](docs/program_outputs.md) for the generated files.
+Start with `summary.csv`, `performance_summary.csv`, `trial_failures.csv`, and
+`selection_guard.csv`. See the
+[error-consistency guide](docs/error_consistency.md) for the formulas, method
+names, runtime guidance, checkpoints, and interpretation. See
+[command-line arguments](docs/arguments.md) for every option and
+[program outputs](docs/program_outputs.md) for the file layout.
 
 
 # Program Outputs
@@ -1980,9 +2048,10 @@ available in the [`features` directory](#📂-features).
   - serialization of final results object (not human readable, for internal
     use)
 - `run_timing.json`
-  - run status and total time, requested/resolved device decisions, runtime
-    fold counts, model failures, partial analysis failures, and error
-    consistency backend information
+  - run status and total time, separate planned and actually resolved device
+    decisions, per-model-task device records, runtime fold counts, model
+    failures, partial analysis failures, and error-consistency backend
+    information
 
 ## Complete Listing
 
@@ -2255,11 +2324,30 @@ are simply beyond the scope of `df-analyze`.
     preflight. Holdout support is checked against the resolved final-CV fold
     count (up to five, and limited by group count); otherwise the run stops with
     the target, level, observed count, and required count
+  - an internally generated classification holdout must contain every level
+    present in training. An externally supplied holdout may omit a training
+    level; when its remaining levels still satisfy fold support, the run emits
+    an explicit warning because the omitted level's performance cannot be
+    estimated
+  - binary sensitivity, specificity, PPV and NPV use encoded class `1`; each
+    per-target result table and Markdown report records the corresponding
+    original positive-class label
   - each actual multi-target tuning and final-CV fold is also verified after
-    splitting; deterministic alternative partitions are attempted before an
-    impossible grouped or ungrouped design is rejected
-  - multi-target regression targets remain in their original units, so MAE and
-    related metrics have the same units as the supplied outcomes
+    splitting: classification targets retain the required per-level support,
+    and every regression target varies in both sides of every fold.
+    Deterministic alternative partitions are attempted before an impossible
+    grouped or ungrouped design is rejected
+  - multi-target regression targets remain in their original units in saved
+    predictions and per-target MAE/MSE reports. Model fitting uses independent
+    training-only target standardization and then inverse-transforms
+    predictions
+  - raw errors from targets with different units are not averaged for model
+    ranking. Aggregate regression output reports normalized `multi-nmae`,
+    `multi-nmse`, and `multi-nrmse`, plus scale-independent R²; explicitly
+    prefixed `raw-*` metrics are informational only
+  - every regression target must vary in both the outer training and holdout
+    partitions; deterministic alternative outer partitions are tried before an
+    impossible design is rejected
 
 
 

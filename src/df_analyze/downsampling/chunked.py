@@ -9,6 +9,8 @@ from pandas import DataFrame, Series
 from scipy import sparse
 from sklearn.feature_selection import f_classif, f_regression
 
+from df_analyze.downsampling.ranking import descending_rank_percentiles
+
 
 def validate_chunk_size(chunk_size: int) -> int:
     chunk_size = int(chunk_size)
@@ -29,10 +31,35 @@ def _column_chunk(
     return X[row_indices, start:stop]
 
 
+def _chunk_source(
+    X: Any, row_indices: Optional[NDArray[np.int_]]
+) -> Any:
+    if sparse.issparse(X):
+        full_rows = (
+            row_indices is not None
+            and len(row_indices) == X.shape[0]
+            and np.array_equal(row_indices, np.arange(X.shape[0], dtype=int))
+        )
+        if row_indices is not None and not full_rows:
+            X = X[row_indices]
+        if not sparse.isspmatrix_csc(X):
+            return X.tocsc()
+    return X
+
+
+def _source_rows(
+    source: Any, row_indices: Optional[NDArray[np.int_]]
+) -> Optional[NDArray[np.int_]]:
+    # Sparse sources are row-subset once before conversion to CSC. Dense sources
+    # retain row indices so each allocation remains bounded by the column chunk.
+    return None if sparse.issparse(source) else row_indices
+
+
 def _sparse_variance(X: Any) -> NDArray[np.float64]:
     n_samples = int(X.shape[0])
     if n_samples <= 1:
         return np.full(X.shape[1], np.nan, dtype=np.float64)
+    X = X.astype(np.float64, copy=False)
     means = np.asarray(X.mean(axis=0)).ravel().astype(np.float64, copy=False)
     squared = np.asarray(X.multiply(X).mean(axis=0)).ravel().astype(
         np.float64, copy=False
@@ -47,10 +74,12 @@ def chunked_variance_scores(
     row_indices: Optional[NDArray[np.int_]] = None,
 ) -> NDArray[np.float64]:
     chunk_size = validate_chunk_size(chunk_size)
+    source = _chunk_source(X, row_indices)
+    source_rows = _source_rows(source, row_indices)
     scores = np.empty(X.shape[1], dtype=np.float64)
     for start in range(0, X.shape[1], chunk_size):
         stop = min(start + chunk_size, X.shape[1])
-        chunk = _column_chunk(X, start, stop, row_indices)
+        chunk = _column_chunk(source, start, stop, source_rows)
         if sparse.issparse(chunk):
             values = _sparse_variance(chunk)
         elif hasattr(chunk, "var") and hasattr(chunk, "to_numpy"):
@@ -73,10 +102,12 @@ def chunked_range_normalized_variance_scores(
     needed for very wide inputs.
     """
     chunk_size = validate_chunk_size(chunk_size)
+    source = _chunk_source(X, row_indices)
+    source_rows = _source_rows(source, row_indices)
     scores = np.empty(X.shape[1], dtype=np.float64)
     for start in range(0, X.shape[1], chunk_size):
         stop = min(start + chunk_size, X.shape[1])
-        chunk = _column_chunk(X, start, stop, row_indices)
+        chunk = _column_chunk(source, start, stop, source_rows)
         if sparse.issparse(chunk):
             variance = _sparse_variance(chunk)
             minimum = chunk.min(axis=0)
@@ -97,14 +128,17 @@ def chunked_range_normalized_variance_scores(
             variance = np.var(values, axis=0, ddof=1, dtype=np.float64)
             feature_range = np.ptp(values, axis=0).astype(np.float64, copy=False)
 
-        normalized = np.zeros(stop - start, dtype=np.float64)
+        normalized = np.full(stop - start, np.nan, dtype=np.float64)
         np.divide(
             variance,
             feature_range**2,
             out=normalized,
-            where=np.isfinite(feature_range) & (feature_range > 0.0),
+            where=(
+                np.isfinite(variance)
+                & np.isfinite(feature_range)
+                & (feature_range > 0.0)
+            ),
         )
-        normalized[~np.isfinite(variance)] = np.nan
         scores[start:stop] = normalized
     return scores
 
@@ -132,16 +166,7 @@ def _f_scores(X: Any, y: Series, is_classification: bool) -> NDArray[np.float64]
 
 
 def _rank_percentiles(scores: NDArray[np.float64]) -> NDArray[np.float64]:
-    values = np.asarray(scores, dtype=np.float64)
-    usable = ~np.isnan(values) & ~np.isneginf(values)
-    result = np.full(values.shape, np.nan, dtype=np.float64)
-    indices = np.flatnonzero(usable)
-    if len(indices) == 0:
-        return result
-    order = np.lexsort((indices, -values[indices]))
-    ranked = indices[order]
-    result[ranked] = (len(ranked) - np.arange(len(ranked))) / len(ranked)
-    return result
+    return descending_rank_percentiles(scores)
 
 
 def aggregate_target_scores(
@@ -170,11 +195,13 @@ def chunked_f_test_scores(
     row_indices: Optional[NDArray[np.int_]] = None,
 ) -> NDArray[np.float64]:
     chunk_size = validate_chunk_size(chunk_size)
+    source = _chunk_source(X, row_indices)
+    source_rows = _source_rows(source, row_indices)
     targets = _target_series(y)
     target_scores = [np.empty(X.shape[1], dtype=np.float64) for _ in targets]
     for start in range(0, X.shape[1], chunk_size):
         stop = min(start + chunk_size, X.shape[1])
-        chunk = _column_chunk(X, start, stop, row_indices)
+        chunk = _column_chunk(source, start, stop, source_rows)
         for target_idx, target in enumerate(targets):
             target_scores[target_idx][start:stop] = _f_scores(
                 chunk, target, is_classification

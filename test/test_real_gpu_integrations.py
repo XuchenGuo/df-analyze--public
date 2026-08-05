@@ -82,6 +82,8 @@ def test_real_cuda_torch_learner_trains_on_device(model_cls, component) -> None:
     model = model_cls(
         num_classes=2,
         model_args={
+            # Runtime policy must remain authoritative over custom model args.
+            "device": "cpu",
             "max_epochs": 1,
             "batch_size": 8,
             "train_split": None,

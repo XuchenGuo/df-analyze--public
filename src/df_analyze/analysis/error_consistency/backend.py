@@ -1,9 +1,18 @@
+"""Choose NumPy or CUDA for the model-pair EC calculation.
+
+This choice does not affect model fitting. Small calculations stay on NumPy
+because moving the data to a GPU can take longer than the calculation.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from warnings import warn
 
-from df_analyze.runtime.hardware import DeviceIntent
+from df_analyze.runtime.hardware import (
+    DeviceIntent,
+    RuntimeComponent,
+    RuntimePolicy,
+)
 
 CUDA_WORK_THRESHOLD = 1_000_000
 
@@ -32,8 +41,13 @@ class ECBackendDecision:
         )
 
 
-def resolve_ec_backend(options, n_models: int, n_samples: int) -> ECBackendDecision:
-    runtime = getattr(options, "runtime", None)
+def resolve_ec_backend(
+    options,
+    n_models: int,
+    n_samples: int,
+    runtime: RuntimePolicy | None = None,
+) -> ECBackendDecision:
+    runtime = runtime or getattr(options, "runtime", None)
     intent = getattr(runtime, "intent", getattr(options, "device", DeviceIntent.CPU))
     if not isinstance(intent, DeviceIntent):
         try:
@@ -49,24 +63,26 @@ def resolve_ec_backend(options, n_models: int, n_samples: int) -> ECBackendDecis
     if intent is DeviceIntent.Auto and work_items < CUDA_WORK_THRESHOLD:
         return ECBackendDecision(requested, "numpy", "size_threshold", work_items)
 
-    capabilities = getattr(runtime, "capabilities", None)
-    cuda_available = False
-    if capabilities is not None:
-        try:
-            cuda_available = bool(capabilities.torch_cuda_available())
-        except (AttributeError, RuntimeError):
-            cuda_available = False
-
     if intent is DeviceIntent.CUDA:
-        if cuda_available:
-            return ECBackendDecision(requested, "torch_cuda", "device_cuda", work_items)
-        warn(
-            "CUDA was requested for error consistency, but PyTorch CUDA is not "
-            "available. Falling back to NumPy on CPU."
-        )
-        return ECBackendDecision(requested, "numpy", "cuda_unavailable", work_items)
+        if runtime is None:
+            raise RuntimeError(
+                "Strict CUDA error consistency requires a RuntimePolicy."
+            )
+        runtime.device_for(RuntimeComponent.ErrorConsistency)
+        return ECBackendDecision(requested, "torch_cuda", "device_cuda", work_items)
 
-    if cuda_available and work_items >= CUDA_WORK_THRESHOLD:
+    if runtime is None:
+        return ECBackendDecision(requested, "numpy", "cuda_unavailable", work_items)
+    decision = runtime.decision_for(RuntimeComponent.ErrorConsistency)
+    if decision.resolved == "cuda" and work_items >= CUDA_WORK_THRESHOLD:
         return ECBackendDecision(requested, "torch_cuda", "size_threshold", work_items)
-    reason = "cuda_unavailable" if not cuda_available else "size_threshold"
+    reason = (
+        decision.reason
+        if decision.reason.startswith("cuda_runtime_fallback:")
+        else (
+            "cuda_unavailable"
+            if decision.resolved != "cuda"
+            else "size_threshold"
+        )
+    )
     return ECBackendDecision(requested, "numpy", reason, work_items)

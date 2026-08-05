@@ -216,8 +216,9 @@ generally be a small integer value like 2, 4, or 8.
 """
 
 DEVICE_HELP = """
-Runtime device: auto, cpu, or cuda. Auto uses CUDA when the installed PyTorch
-can use it. CUDA falls back to CPU with a warning when unavailable.
+GPU policy: auto (recommended), cpu, or cuda. Auto uses CUDA when the installed
+PyTorch can use it and may retry a CUDA failure once on CPU. CPU disables GPU
+use. CUDA strictly requires a CUDA-capable PyTorch installation.
 """
 
 DEVICE_INSTALL_HELP = """

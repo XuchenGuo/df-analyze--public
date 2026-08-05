@@ -227,8 +227,10 @@ def _resolve_filter_counts(
     n_total: Optional[Union[int, float]],
 ) -> tuple[int, int]:
     """Resolve the documented two-of-three filter feature-count contract."""
-    available_cont = int(prepared.X_cont.shape[1])
-    available_cat = int(prepared.X_cat.shape[1])
+    available_cont = (
+        0 if prepared.X_cont is None else int(prepared.X_cont.shape[1])
+    )
+    available_cat = 0 if prepared.X_cat is None else int(prepared.X_cat.shape[1])
 
     if n_cont is not None and n_cat is not None:
         resolved_cont = n_cont_select_default(prepared, n_cont)

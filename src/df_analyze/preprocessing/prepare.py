@@ -6,7 +6,7 @@ import json
 import re
 import traceback
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Any, Literal, Optional, Tuple, Union, cast
@@ -57,6 +57,7 @@ from df_analyze.splitting import (
     ApproximateStratifiedGroupSplit,
     MultiTargetSplitInfo,
     regression_split_label,
+    validate_multitarget_regression_support,
     y_split_label,
     y_split_label_info,
 )
@@ -97,7 +98,10 @@ def usable_training_indices(
 ) -> ndarray:
     """Return training rows that remain after target cleaning."""
     target_cols = as_target_list(target)
-    targets = unify_nans(df.iloc[indices][target_cols].copy())
+    # Select the small target block before selecting rows.  Row-first indexing
+    # materializes every predictor column and is prohibitive for ultra-wide
+    # (for example CRUSH-scale) tables.
+    targets = unify_nans(df[target_cols].iloc[indices].copy())
     keep = ~targets.isna().any(axis=1)
 
     if is_classification and len(target_cols) == 1:
@@ -163,60 +167,141 @@ def raw_train_test_indices(
 
     y = targets.iloc[rows].reset_index(drop=True)
     split_audit: Optional[MultiTargetSplitInfo] = None
-    if grouper is None:
-        if is_classification:
-            if len(target_cols) > 1:
-                split_y, split_audit = y_split_label_info(y)
-            else:
-                split_y = y.iloc[:, 0].astype(str)
-            splitter = StratifiedShuffleSplit(
-                train_size=train_size, n_splits=1, random_state=seed
-            )
-            idx_train, idx_test = next(
-                splitter.split(split_y.to_frame(), split_y)
-            )
-        else:
-            splitter = ShuffleSplit(
-                train_size=train_size, n_splits=1, random_state=seed
-            )
-            idx_train, idx_test = next(splitter.split(y))
+    is_multitarget_classification = is_classification and len(target_cols) > 1
+    is_multitarget_regression = not is_classification and len(target_cols) > 1
+    is_multitarget = len(target_cols) > 1
+    if is_multitarget_classification:
+        split_y, split_audit = y_split_label_info(y)
+    elif is_classification:
+        split_y = y.iloc[:, 0].astype(str)
     else:
-        groups = df.iloc[rows][grouper].reset_index(drop=True)
-        splitter = ApproximateStratifiedGroupSplit(
-            train_size=train_size,
-            is_classification=is_classification,
-            grouped=True,
-            labels=None,
-            seed=seed,
-            warn_on_fallback=True,
-            allow_group_fallback=False,
-            warn_on_large_size_diff=True,
-            df_analyze_phase="Initial holdout splitting",
-        )
-        if is_classification and len(target_cols) > 1:
-            split_y, split_audit = y_split_label_info(y)
-        elif is_classification:
-            split_y = y.iloc[:, 0].astype(str)
-        else:
-            split_y = regression_split_label(
+        split_y = (
+            y.iloc[:, 0]
+            if grouper is None
+            else regression_split_label(
                 y if len(target_cols) > 1 else y.iloc[:, 0]
             )
-        (idx_train, idx_test), _ = splitter.split(
-            split_y.to_frame(), split_y, groups
         )
 
-    if is_classification and len(target_cols) > 1:
-        local_groups = (
-            None
-            if grouper is None
-            else df.iloc[rows][grouper].reset_index(drop=True)
-        )
+    local_groups = (
+        None if grouper is None else df[grouper].iloc[rows].reset_index(drop=True)
+    )
+    if is_multitarget_classification:
+        impossible: list[str] = []
+        for target_col in target_cols:
+            if local_groups is None:
+                counts = y[target_col].astype(str).value_counts()
+            else:
+                counts = (
+                    DataFrame(
+                        {
+                            "level": y[target_col].astype(str),
+                            "group": local_groups,
+                        }
+                    )
+                    .groupby("level", dropna=False)["group"]
+                    .nunique(dropna=False)
+                )
+            for level, count in counts.items():
+                if int(count) < 2:
+                    unit = "rows" if local_groups is None else "distinct groups"
+                    impossible.append(
+                        f"'{target_col}' level {level!r} has {int(count)} {unit}"
+                    )
+        if impossible:
+            raise ValueError(
+                "Could not create training and holdout partitions containing every "
+                "multi-target classification level: "
+                f"{'; '.join(impossible)}. Each level needs at least two "
+                f"{'rows' if local_groups is None else 'distinct groups'}."
+            )
+
+    attempts = 128 if is_multitarget else 1
+    base_seed = SEED if seed is None else int(seed)
+    moved = 0
+    missing_holdout: list[str] = []
+    regression_failure = ""
+    for attempt in range(attempts):
+        attempt_seed = (base_seed + attempt) % (2**32 - 1)
+        if grouper is None:
+            if is_classification:
+                splitter = StratifiedShuffleSplit(
+                    train_size=train_size,
+                    n_splits=1,
+                    random_state=attempt_seed,
+                )
+                idx_train, idx_test = next(
+                    splitter.split(split_y.to_frame(), split_y)
+                )
+            else:
+                splitter = ShuffleSplit(
+                    train_size=train_size,
+                    n_splits=1,
+                    random_state=attempt_seed,
+                )
+                idx_train, idx_test = next(splitter.split(y))
+        else:
+            splitter = ApproximateStratifiedGroupSplit(
+                train_size=train_size,
+                is_classification=is_classification,
+                grouped=True,
+                labels=None,
+                shuffle=is_multitarget,
+                seed=attempt_seed,
+                warn_on_fallback=attempt == 0,
+                allow_group_fallback=False,
+                warn_on_large_size_diff=attempt == 0,
+                df_analyze_phase="Initial holdout splitting",
+            )
+            (idx_train, idx_test), _ = splitter.split(
+                split_y.to_frame(), split_y, local_groups
+            )
+
+        if is_multitarget_regression:
+            try:
+                validate_multitarget_regression_support(
+                    y.iloc[idx_train], phase="generated training partition"
+                )
+                validate_multitarget_regression_support(
+                    y.iloc[idx_test], phase="generated holdout partition"
+                )
+            except ValueError as error:
+                regression_failure = str(error)
+                continue
+            break
+        if not is_multitarget_classification:
+            break
         idx_train, idx_test, moved = _ensure_target_levels_in_training(
             y,
             idx_train,
             idx_test,
             local_groups,
         )
+        missing_holdout = []
+        for target_col in target_cols:
+            all_levels = set(y[target_col].astype(str))
+            test_levels = set(y.iloc[idx_test][target_col].astype(str))
+            omitted = sorted(all_levels - test_levels)
+            if omitted:
+                missing_holdout.append(f"'{target_col}' levels {omitted}")
+        if not missing_holdout:
+            break
+    else:
+        if is_multitarget_regression:
+            raise ValueError(
+                "Could not create an internal multi-target regression holdout in "
+                "which every target varies in both training and holdout after 128 "
+                f"deterministic split attempts. Last failure: {regression_failure} "
+                "Increase the holdout size or revise the grouping design."
+            )
+        raise ValueError(
+            "Could not create an internal holdout containing every multi-target "
+            "classification level after 128 deterministic split attempts. Missing "
+            f"from the last holdout: {'; '.join(missing_holdout)}. Increase the "
+            "holdout size or revise the grouping design."
+        )
+
+    if is_multitarget_classification:
         if moved > 0:
             message = (
                 f"Moved {moved} holdout rows to training so every multi-target "
@@ -250,6 +335,7 @@ class MultiTargetAudit:
     missing_by_target: dict[str, int]
     class_counts_by_target: dict[str, dict[str, int]]
     low_support_labels_by_target: dict[str, dict[str, int]]
+    missing_patterns: dict[str, int] = field(default_factory=dict)
 
     @property
     def n_missing_target_rows(self) -> int:
@@ -272,6 +358,19 @@ class MultiTargetAudit:
             }
         )
         sections.extend(["## Missing Targets\n\n", missing.to_markdown(index=False)])
+        if self.missing_patterns:
+            patterns = DataFrame(
+                [
+                    {"missing target combination": pattern, "rows": count}
+                    for pattern, count in self.missing_patterns.items()
+                ]
+            )
+            sections.extend(
+                [
+                    "\n\n## Missing-Target Patterns\n\n",
+                    patterns.to_markdown(index=False),
+                ]
+            )
 
         if self.is_classification:
             rows = []
@@ -307,6 +406,10 @@ class PreparationInfo:
     runtimes: dict[str, float]
     multitarget_audit: Optional[MultiTargetAudit] = None
     split_audit: Optional[MultiTargetSplitInfo] = None
+    source_train_shape: Optional[Tuple[int, int]] = None
+    source_test_shapes: list[Tuple[int, int]] = field(default_factory=list)
+    final_train_shape: Optional[Tuple[int, int]] = None
+    final_test_shape: Optional[Tuple[int, int]] = None
 
     def to_markdown(self) -> str:
         sections = []
@@ -321,8 +424,35 @@ class PreparationInfo:
 
         sections.append("# Data Preparation Summary\n\n")
         sections.append(f"Task:                   {task}\n")
-        sections.append(f"Data original shape:    {orig_shape}\n")
-        sections.append(f"Data final shape:       {final_shape}\n")
+        if self.source_train_shape is None:
+            sections.append(f"Data original shape:    {orig_shape}\n")
+            sections.append(f"Data final shape:       {final_shape}\n")
+        else:
+            train_in = self.source_train_shape
+            train_out = self.final_train_shape or fs
+            sections.append(
+                f"{'Training input shape:':<28}"
+                f"{train_in[0]} samples × {train_in[1]} features\n"
+            )
+            sections.append(
+                f"{'Training final shape:':<28}"
+                f"{train_out[0]} samples × {train_out[1]} features\n"
+            )
+            for idx, test_shape in enumerate(self.source_test_shapes):
+                label = (
+                    "External test input shape:"
+                    if len(self.source_test_shapes) == 1
+                    else f"External test {idx + 1} input shape:"
+                )
+                sections.append(
+                    f"{label:<28}{test_shape[0]} samples × {test_shape[1]} features\n"
+                )
+            if self.final_test_shape is not None:
+                sections.append(
+                    f"{'External test final shape:':<28}"
+                    f"{self.final_test_shape[0]} samples × "
+                    f"{self.final_test_shape[1]} features\n"
+                )
         if self.target_info is not None:
             sections.append(f"Target feature:         {self.target_info.name}\n")
         sections.append("\n")
@@ -380,6 +510,10 @@ def _build_multitarget_audit(
     missing = raw_targets.isna()
     counts_by_target: dict[str, dict[str, int]] = {}
     low_support_by_target: dict[str, dict[str, int]] = {}
+    missing_patterns: dict[str, int] = {}
+    for _, row in missing.loc[missing.any(axis=1)].iterrows():
+        pattern = ", ".join(str(col) for col in missing.columns if bool(row[col]))
+        missing_patterns[pattern] = missing_patterns.get(pattern, 0) + 1
 
     if is_classification:
         for col in y.columns:
@@ -404,6 +538,7 @@ def _build_multitarget_audit(
         missing_by_target={str(col): int(missing[col].sum()) for col in raw_targets},
         class_counts_by_target=counts_by_target,
         low_support_labels_by_target=low_support_by_target,
+        missing_patterns=missing_patterns,
     )
 
 
@@ -640,8 +775,7 @@ class PreparedData:
                 (
                     raw
                     for raw in raw_cols
-                    if processed == f"{raw}_NAN"
-                    or processed.startswith(f"{raw}_NAN_")
+                    if processed == f"{raw}_NAN" or processed.startswith(f"{raw}_NAN_")
                 ),
                 None,
             )
@@ -737,7 +871,29 @@ class PreparedData:
     ) -> tuple[PreparedData, PreparedData]:
         y = self.y.copy()
         split_audit: Optional[MultiTargetSplitInfo] = None
-        if self.groups is None:
+        is_multitarget = isinstance(y, DataFrame) and y.shape[1] > 1
+        if is_multitarget:
+            split_frame = y.copy()
+            group_col = None
+            if self.groups is not None:
+                group_col = "__df_analyze_split_group__"
+                while group_col in split_frame.columns:
+                    group_col = f"_{group_col}"
+                split_frame[group_col] = self.groups.to_numpy()
+            test_size: Union[int, float]
+            if isinstance(train_size, (int, np.integer)):
+                test_size = len(y) - int(train_size)
+            else:
+                test_size = 1.0 - float(train_size)
+            idx_train, idx_test, split_audit = raw_train_test_indices(
+                split_frame,
+                list(y.columns),
+                group_col,
+                self.is_classification,
+                test_size,
+                seed,
+            )
+        elif self.groups is None:
             if self.is_classification:
                 ss = StratifiedShuffleSplit(
                     train_size=train_size, n_splits=1, random_state=seed
@@ -772,6 +928,14 @@ class PreparedData:
                 (idx_train, idx_test), group_fail = ss.split(
                     split_y.to_frame(), split_y, self.groups
                 )
+
+        if isinstance(y, DataFrame) and not self.is_classification:
+            validate_multitarget_regression_support(
+                y.iloc[idx_train], phase="generated training partition"
+            )
+            validate_multitarget_regression_support(
+                y.iloc[idx_test], phase="generated holdout partition"
+            )
 
         prep_train = self.subsample(idx_train)
         prep_train.phase = "train"
@@ -1147,9 +1311,7 @@ class PreparedData:
         files = PrepFiles()
         X = pd.read_parquet(root / files.X_raw)
         tabpfn_path = root / files.X_tabpfn_raw
-        X_tabpfn = (
-            pd.read_parquet(tabpfn_path) if tabpfn_path.exists() else X.copy()
-        )
+        X_tabpfn = pd.read_parquet(tabpfn_path) if tabpfn_path.exists() else X.copy()
         X_cont = pd.read_parquet(root / files.X_cont_raw)
         X_cat = pd.read_parquet(root / files.X_cat_raw)
         y_raw = pd.read_parquet(root / files.y_raw)
@@ -1355,9 +1517,7 @@ def prepare_data(
         nans=NanHandling.Median,
         fit_indices=fit_indices,
     )
-    X_cont = normalize_continuous(
-        X_cont, robust=True, fit_indices=fit_indices
-    )
+    X_cont = normalize_continuous(X_cont, robust=True, fit_indices=fit_indices)
     df[X_cont.columns] = X_cont
 
     df = timer(deflate_categoricals)(df, grouper, results, _warn=_warn)

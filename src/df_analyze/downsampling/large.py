@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from copy import deepcopy
 from time import perf_counter
 from typing import Any, Optional
+from warnings import warn
 
 import numpy as np
 import pandas as pd
@@ -11,6 +11,7 @@ from pandas import DataFrame, Series
 from sklearn.preprocessing import LabelEncoder
 
 from df_analyze._constants import (
+    DOWNSAMPLE_DENSE_PEAK_FACTOR,
     DOWNSAMPLE_MAX_CHUNK_BYTES,
     DOWNSAMPLE_MAX_DENSE_BYTES,
 )
@@ -44,7 +45,7 @@ def _selection_targets(
 ) -> Series | DataFrame:
     encoded = {}
     for target in targets:
-        values = frame.iloc[rows][target].reset_index(drop=True)
+        values = frame[target].iloc[rows].reset_index(drop=True)
         if is_classification:
             if values.nunique(dropna=False) <= 1:
                 suffix = (
@@ -136,12 +137,17 @@ def large_table_prepared_splits(
     if missing:
         raise KeyError(f"Target columns not found: {missing}")
     original_rows = len(frame)
-    frame = unify_nans(frame)
     groups = None
     if options.grouper is not None:
         if options.grouper not in frame.columns:
             raise KeyError(f"Grouping column not found: {options.grouper}")
-        groups = frame[options.grouper].reset_index(drop=True)
+        # Never call DataFrame.map over the complete ultra-wide table.  Only
+        # normalize the metadata column needed before group-aware splitting;
+        # target cleaning is likewise column-first in usable_training_indices.
+        cleaned_groups = unify_nans(frame[[options.grouper]].copy())
+        frame = frame.copy(deep=False)
+        frame[options.grouper] = cleaned_groups[options.grouper].to_numpy()
+        groups = cleaned_groups[options.grouper].reset_index(drop=True)
     excluded = set(targets) | set(options.drops)
     if options.grouper is not None:
         excluded.add(options.grouper)
@@ -179,9 +185,7 @@ def large_table_prepared_splits(
             raise ValueError("External large-feature input did not provide a test split.")
         method = getattr(options, "tests_method", ValidationMethod.List)
         if method is ValidationMethod.List:
-            split_indices = [
-                (partitions[0], test, None) for test in partitions[1:]
-            ]
+            split_indices = [(partitions[0], test, None) for test in partitions[1:]]
         elif method is ValidationMethod.LODO:
             split_indices = []
             for train_idx, train in enumerate(partitions):
@@ -195,6 +199,17 @@ def large_table_prepared_splits(
         tuple[int, ...], tuple[NDArray[np.int_], FeatureDownsampleResult]
     ] = {}
     feature_names = X.columns.astype(str).tolist()
+    protected_requested = set(getattr(options, "downsample_protected_features", []))
+    protected_lookup = {
+        name: idx for idx, name in enumerate(feature_names) if name in protected_requested
+    }
+    missing_protected = sorted(protected_requested - protected_lookup.keys())
+    if missing_protected:
+        raise KeyError(
+            "Protected large-table features were not found among predictors: "
+            f"{missing_protected}"
+        )
+    protected_indices = sorted(protected_lookup.values())
     for train_rows, test_rows, split_audit in split_indices:
         fit_rows = usable_training_indices(
             frame,
@@ -202,9 +217,7 @@ def large_table_prepared_splits(
             options.is_classification,
             np.asarray(train_rows, dtype=int),
         )
-        y_train = _selection_targets(
-            frame, targets, options.is_classification, fit_rows
-        )
+        y_train = _selection_targets(frame, targets, options.is_classification, fit_rows)
         groups_train = (
             None if groups is None else groups.iloc[fit_rows].reset_index(drop=True)
         )
@@ -224,52 +237,118 @@ def large_table_prepared_splits(
             options.downsample_screening_fraction,
             options.is_classification,
             groups_train,
+            options.seed,
         )
         cache_key = tuple(np.asarray(fit_rows, dtype=int).tolist())
         cached = selection_cache.get(cache_key)
         if cached is None:
-            selected, result = select_indexed_columns(
-                X,
-                fit_rows,
-                y_train,
-                options.is_classification,
-                effective,
-                options.n_feat_downsample,
-                options.downsample_chunk_size,
-                screening,
-                feature_names,
-                options.downsample_variance_threshold,
-                options.downsample_save_scores,
-                input_format="table-large",
+            selection_request = (
+                options.feat_downsample if fallback_note is None else effective
             )
+            try:
+                selected, result = select_indexed_columns(
+                    X,
+                    fit_rows,
+                    y_train,
+                    options.is_classification,
+                    selection_request,
+                    options.n_feat_downsample,
+                    options.downsample_chunk_size,
+                    screening,
+                    feature_names,
+                    options.downsample_variance_threshold,
+                    options.downsample_save_scores,
+                    input_format="table-large",
+                    seed=options.seed,
+                    large_feature_mode=True,
+                    protected_indices=protected_indices,
+                )
+            except ValueError as error:
+                if (
+                    options.feat_downsample is not FeatureDownsampleMethod.Auto
+                    or screening is None
+                    or "usable downsampling scores" not in str(error)
+                ):
+                    raise
+                fallback_note = (
+                    f"Auto feature downsampling fell back from {effective.value} to "
+                    "normalized-variance because supervised scoring produced no "
+                    f"usable feature scores: {error}"
+                )
+                warn(fallback_note, stacklevel=2)
+                screening = None
+                tuning = np.arange(len(y_train), dtype=int)
+                selected, result = select_indexed_columns(
+                    X,
+                    fit_rows,
+                    y_train,
+                    options.is_classification,
+                    FeatureDownsampleMethod.NormalizedVariance,
+                    options.n_feat_downsample,
+                    options.downsample_chunk_size,
+                    None,
+                    feature_names,
+                    options.downsample_variance_threshold,
+                    options.downsample_save_scores,
+                    input_format="table-large",
+                    seed=options.seed,
+                    large_feature_mode=True,
+                    protected_indices=protected_indices,
+                )
             result.requested_method = options.feat_downsample.value
+            if (
+                options.feat_downsample is FeatureDownsampleMethod.Auto
+                and result.auto_reason is None
+            ):
+                result.auto_reason = fallback_note
             if fallback_note is not None:
                 result.notes.append(fallback_note)
             result.tuning_rows = tuning.tolist()
             result.tuning_samples = len(tuning)
-            selection_cache[cache_key] = (selected.copy(), deepcopy(result))
+            selection_cache[cache_key] = (
+                selected.copy(),
+                result.clone_for_reuse(),
+            )
         else:
-            selected, result = cached[0].copy(), deepcopy(cached[1])
+            selected, result = (
+                cached[0].copy(),
+                cached[1].clone_for_reuse(),
+            )
             result.fit_seconds = 0.0
             result.notes.append("Reused feature scores from the same training partition.")
-        dense_bytes = (len(fit_rows) + len(test_rows)) * len(selected) * 8
-        if dense_bytes > DOWNSAMPLE_MAX_DENSE_BYTES:
-            gib = dense_bytes / 1024**3
+        if result.resolved_method == FeatureDownsampleMethod.None_.value:
+            result.notes.append(
+                "The requested feature limit did not reduce the large table; all "
+                "source predictors were materialized for normal preprocessing."
+            )
+        train_rows = np.asarray(train_rows, dtype=int)
+        test_rows = np.asarray(test_rows, dtype=int)
+        dense_bytes = (len(train_rows) + len(test_rows)) * len(selected) * 8
+        peak_bytes = dense_bytes * DOWNSAMPLE_DENSE_PEAK_FACTOR
+        if peak_bytes > DOWNSAMPLE_MAX_DENSE_BYTES:
+            gib = peak_bytes / 1024**3
             raise MemoryError(
-                f"Selected train/test matrices require about {gib:.2f} GiB. "
-                "Reduce --n-feat-downsample."
+                "Selected train/test matrices are estimated to require about "
+                f"{gib:.2f} GiB of peak dense working memory. Reduce "
+                "--n-feat-downsample."
             )
         started = perf_counter()
         selected_names = [feature_names[idx] for idx in selected]
-        selected_frame = X.iloc[:, selected].copy()
+        used_rows = np.concatenate([train_rows, test_rows])
+        local_train = np.arange(len(train_rows), dtype=int)
+        local_test = np.arange(len(train_rows), len(used_rows), dtype=int)
+        fit_local = np.flatnonzero(np.isin(train_rows, fit_rows))
+        selected_frame = X.iloc[used_rows, selected].copy().reset_index(drop=True)
         selected_frame.columns = selected_names
         if options.grouper is not None:
-            selected_frame[options.grouper] = frame[options.grouper].to_numpy()
+            selected_frame[options.grouper] = (
+                frame[options.grouper].iloc[used_rows].to_numpy()
+            )
         for target in targets:
-            selected_frame[target] = frame[target].to_numpy()
+            selected_frame[target] = frame[target].iloc[used_rows].to_numpy()
 
         _, inspection = inspect_data(
-            selected_frame.iloc[fit_rows].reset_index(drop=True),
+            selected_frame.iloc[fit_local].reset_index(drop=True),
             target_spec,
             options.grouper,
             [],
@@ -284,8 +363,8 @@ def large_table_prepared_splits(
             options.grouper,
             inspection,
             options.is_classification,
-            np.asarray(train_rows, dtype=int),
-            [np.asarray(test_rows, dtype=int)],
+            local_train,
+            [local_test],
             ValidationMethod.List,
         )
         prepared_train, prepared_test = next(
@@ -293,9 +372,11 @@ def large_table_prepared_splits(
         )
         result.transform_seconds = perf_counter() - started
         final_names = prepared_train.X.columns.astype(str).tolist()
-        index_by_name = dict(zip(feature_names, range(len(feature_names))))
+        # The final names are a tiny selected subset; never build a million-key
+        # reverse map for the complete source table.
+        index_by_name = dict(zip(selected_names, selected))
         result.selected_features = final_names
-        result.selected_indices = [index_by_name[name] for name in final_names]
+        result.selected_indices = [int(index_by_name[name]) for name in final_names]
         result.n_features_out = len(final_names)
         if len(final_names) < len(selected_names):
             result.notes.append(
@@ -304,14 +385,10 @@ def large_table_prepared_splits(
         if prepared_train.info is not None:
             prepared_train.info.original_shape = (original_rows, original_features)
             prepared_train.info.split_audit = split_audit
-            prepared_train.info.runtimes["feature downsampling"] = (
-                result.fit_seconds + result.transform_seconds
-            )
+            prepared_train.info.runtimes["feature downsampling"] = result.total_seconds
         if prepared_test.info is not None:
             prepared_test.info.original_shape = (original_rows, original_features)
             prepared_test.info.split_audit = split_audit
-            prepared_test.info.runtimes["feature downsampling"] = (
-                result.fit_seconds + result.transform_seconds
-            )
+            prepared_test.info.runtimes["feature downsampling"] = result.total_seconds
         outputs.append((prepared_train, prepared_test, result))
     return outputs

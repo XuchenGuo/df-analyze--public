@@ -550,7 +550,12 @@ def encode_targets(
     labels_map: dict[str, dict[int, str]] = {}
     y_encoded = DataFrame(index=y_df_raw.index)
     for col in target_cols:
-        series = unify_nans(y_df_raw[col]).astype(str)
+        series = unify_nans(y_df_raw[col])
+        # Preserve numeric ordering. Converting numeric labels to strings makes
+        # LabelEncoder order them lexicographically (for example 10 before 2),
+        # which can silently reverse the binary positive class.
+        if not pd.api.types.is_numeric_dtype(series.dtype):
+            series = series.astype(str)
         series_train = series if ix_train is None else series.iloc[ix_train]
         unqs, cnts = np.unique(series_train, return_counts=True)
         if len(unqs) <= 1:
@@ -580,7 +585,7 @@ def encode_targets(
             ) from error
         classes = enc.classes_.tolist()
         ints = np.asarray(enc.transform(classes)).tolist()
-        labels_map[col] = {i: cls for i, cls in zip(ints, classes)}
+        labels_map[col] = {i: str(cls) for i, cls in zip(ints, classes)}
         y_encoded[col] = encoded
 
     return df, y_encoded, labels_map, ix_train, ix_tests

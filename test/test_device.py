@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import warnings
 from types import SimpleNamespace
 
+import jsonpickle
 import numpy as np
 import pandas as pd
 import pytest
@@ -10,16 +10,23 @@ from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from torch.nn import Dropout, Identity
 
 from df_analyze import _main
+from df_analyze import hypertune as hypertune_module
+from df_analyze.analysis.adaptive_error import oof as adaptive_error_oof
+from df_analyze.analysis.adaptive_error import test_stage as adaptive_error_test_stage
+from df_analyze.analysis.adaptive_error.oof import build_oof_for_result
 from df_analyze.cli import cli
 from df_analyze.cli.cli import ProgramOptions, make_parser
 from df_analyze.embedding import download as embedding_download
 from df_analyze.embedding import embed
 from df_analyze.embedding.cli import EmbeddingModality
 from df_analyze.enumerables import (
+    ClassifierScorer,
     DfAnalyzeClassifier,
+    FeatureSelection,
     WrapperSelection,
     WrapperSelectionModel,
 )
+from df_analyze.hypertune import EvaluationResults, evaluate_tuned
 from df_analyze.models.catboost import CatBoostClassifier
 from df_analyze.models.gandalf import GandalfEstimator, _dropout_layer
 from df_analyze.models.kan import KANEstimator
@@ -29,7 +36,9 @@ from df_analyze.models.knn import (
     TorchKNNRegressor,
 )
 from df_analyze.models.mlp import MLPEstimator
+from df_analyze.models.tabpfn import TabPFNClassifierV3
 from df_analyze.models.xgboost import XGBoostClassifier
+from df_analyze.preprocessing.prepare import PreparedData
 from df_analyze.runtime import hardware
 from df_analyze.runtime.hardware import (
     DeviceIntent,
@@ -37,6 +46,9 @@ from df_analyze.runtime.hardware import (
     RuntimeComponent,
     RuntimePolicy,
 )
+from df_analyze.selection import models as selection_models
+from df_analyze.selection.models import ModelSelected
+from df_analyze.selection.stepwise import get_dfanalyze_score
 
 
 def runtime(
@@ -94,6 +106,28 @@ def test_runtime_routes_each_backend_independently() -> None:
 
 
 @pytest.mark.fast
+def test_knn_workload_uses_actual_query_rows() -> None:
+    below = runtime(torch_cuda=True).with_workload(
+        10_000,
+        100,
+        n_queries=10,
+    )
+    at_threshold = runtime(torch_cuda=True).with_workload(
+        10_000,
+        100,
+        n_queries=20,
+    )
+
+    below_decision = below.decision_for(RuntimeComponent.KNN)
+    threshold_decision = at_threshold.decision_for(RuntimeComponent.KNN)
+    assert below_decision.resolved == "cpu"
+    assert below_decision.work_items == 10_000_000
+    assert below_decision.n_queries == 10
+    assert threshold_decision.resolved == "cuda"
+    assert threshold_decision.work_items == 20_000_000
+
+
+@pytest.mark.fast
 def test_cpu_policy_does_not_probe_backends(monkeypatch: pytest.MonkeyPatch) -> None:
     def unexpected():
         raise AssertionError("CPU policy must not probe accelerator backends")
@@ -117,18 +151,98 @@ def test_runtime_fallback_state_is_per_run() -> None:
 
 
 @pytest.mark.fast
-def test_explicit_cuda_warns_once_per_backend() -> None:
-    hardware._warn_cuda_fallback.cache_clear()
+def test_runtime_fallback_is_isolated_per_model_task() -> None:
+    base = runtime(DeviceIntent.Auto, xgboost_cuda=True)
+    first = base.for_task(5_000, 100)
+    second = base.for_task(5_000, 100)
+    first.record_cpu_fallback(RuntimeComponent.XGBoost, "cuda_runtime_fallback:test")
+
+    assert first.device_for(RuntimeComponent.XGBoost) == "cpu"
+    assert second.device_for(RuntimeComponent.XGBoost) == "cuda"
+
+
+@pytest.mark.fast
+def test_explicit_cuda_is_strict_only_for_supported_components() -> None:
     policy = runtime(DeviceIntent.CUDA)
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        assert policy.device_for(RuntimeComponent.MLP) == "cpu"
-        assert policy.device_for(RuntimeComponent.KAN) == "cpu"
-        assert policy.device_for(RuntimeComponent.KNN) == "cpu"
+    with pytest.raises(hardware.CudaConfigurationError, match="PyTorch CUDA"):
+        policy.device_for(RuntimeComponent.MLP)
+    assert policy.decision_for(RuntimeComponent.MLP).resolved == "unavailable"
+    assert policy.device_for(RuntimeComponent.LightGBM) == "cpu"
+    assert policy.device_for(RuntimeComponent.Sklearn) == "cpu"
 
-    assert len(caught) == 1
-    assert "torch backend" in str(caught[0].message)
+
+@pytest.mark.fast
+def test_cuda_validation_allows_mixed_models_but_rejects_missing_backend() -> None:
+    components = {
+        "xgb": RuntimeComponent.XGBoost,
+        "svm": RuntimeComponent.Sklearn,
+        "preprocessing": RuntimeComponent.Preprocessing,
+    }
+    available = runtime(DeviceIntent.CUDA, xgboost_cuda=True)
+    hardware.validate_cuda_request(available, components)
+    plan = hardware.format_device_plan(available, components)
+    assert "CUDA: xgb" in plan
+    assert "CPU:  svm, preprocessing" in plan
+
+    unavailable = runtime(DeviceIntent.CUDA)
+    with pytest.raises(
+        hardware.CudaConfigurationError,
+        match="XGBoost CUDA is unavailable",
+    ):
+        hardware.validate_cuda_request(unavailable, components)
+
+
+@pytest.mark.fast
+def test_cuda_validation_rejects_cpu_only_selection() -> None:
+    components = {
+        "svm": RuntimeComponent.Sklearn,
+        "preprocessing": RuntimeComponent.Preprocessing,
+    }
+    with pytest.raises(
+        hardware.CudaConfigurationError,
+        match="none of the selected models",
+    ):
+        hardware.validate_cuda_request(runtime(DeviceIntent.CUDA), components)
+
+
+@pytest.mark.fast
+def test_cuda_device_plan_reports_visibility_without_wrong_physical_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,3")
+    hardware.cuda_device_name.cache_clear()
+    try:
+        plan = hardware.format_device_plan(
+            runtime(DeviceIntent.CUDA, xgboost_cuda=True),
+            {"xgb": RuntimeComponent.XGBoost},
+        )
+    finally:
+        hardware.cuda_device_name.cache_clear()
+
+    assert "CUDA_VISIBLE_DEVICES=2,3 (backend device index 0)" in plan
+
+
+@pytest.mark.fast
+def test_error_consistency_is_a_cuda_capable_planned_component() -> None:
+    options = SimpleNamespace(
+        is_classification=True,
+        classifiers=(DfAnalyzeClassifier.SVM,),
+        regressors=(),
+        wrapper_select=None,
+        wrapper_model=WrapperSelectionModel.Linear,
+        error_consistency=True,
+        runtime=runtime(DeviceIntent.CUDA, torch_cuda=True),
+    )
+
+    components = _main._runtime_components(options)
+    hardware.validate_cuda_request(options.runtime, components)
+
+    assert (
+        components["error-consistency"]
+        is RuntimeComponent.ErrorConsistency
+    )
+    assert _main._resolved_devices(options)["error-consistency"] == "cuda"
 
 
 @pytest.mark.fast
@@ -167,6 +281,47 @@ def test_model_adapters_receive_runtime_policy() -> None:
 
 
 @pytest.mark.fast
+def test_mlp_and_kan_runtime_device_cannot_be_overridden_by_model_args() -> None:
+    cpu_policy = runtime(DeviceIntent.CPU)
+    cuda_policy = runtime(DeviceIntent.CUDA, torch_cuda=True)
+
+    mlp_cpu = MLPEstimator(num_classes=2, model_args={"device": "cuda"}).set_runtime(
+        cpu_policy
+    )
+    kan_cpu = KANEstimator(num_classes=2, model_args={"device": "cuda"}).set_runtime(
+        cpu_policy
+    )
+    mlp_cuda = MLPEstimator(num_classes=2, model_args={"device": "cpu"}).set_runtime(
+        cuda_policy
+    )
+
+    assert mlp_cpu._runtime_model_args(mlp_cpu.model_args)["device"] == "cpu"
+    assert kan_cpu._runtime_model_args(kan_cpu.model_args)["device"] == "cpu"
+    assert mlp_cuda._runtime_model_args(mlp_cuda.model_args)["device"] == "cuda"
+
+
+@pytest.mark.fast
+def test_strict_cuda_feature_selection_failure_is_not_swallowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_cuda(**_kwargs):
+        raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(selection_models, "wrap_select_features", fail_cuda)
+    options = SimpleNamespace(
+        feat_select=(FeatureSelection.Wrapper,),
+        wrapper_select=object(),
+        runtime=runtime(DeviceIntent.CUDA, torch_cuda=True),
+    )
+
+    with pytest.raises(RuntimeError, match="CUDA out of memory"):
+        selection_models.model_select_features(
+            prep_train=SimpleNamespace(),
+            options=options,
+        )
+
+
+@pytest.mark.fast
 def test_auto_keeps_small_traditional_workloads_on_cpu() -> None:
     policy = runtime(
         torch_cuda=True, catboost_cuda=True, xgboost_cuda=True
@@ -178,7 +333,7 @@ def test_auto_keeps_small_traditional_workloads_on_cpu() -> None:
     decision = policy.decision_for(RuntimeComponent.CatBoost)
     assert decision.reason == "auto_workload_below_threshold"
     assert decision.work_items == 8_000
-    assert decision.threshold == 500_000
+    assert decision.threshold == 1_000_000
 
 
 @pytest.mark.fast
@@ -205,7 +360,7 @@ def test_auto_small_traditional_workloads_do_not_probe_cuda(
 def test_auto_uses_cuda_for_large_traditional_workloads() -> None:
     policy = runtime(
         torch_cuda=True, catboost_cuda=True, xgboost_cuda=True
-    ).with_workload(5_000, 100)
+    ).with_workload(10_000, 100)
 
     assert policy.device_for(RuntimeComponent.KNN) == "cuda"
     assert policy.device_for(RuntimeComponent.CatBoost) == "cuda"
@@ -213,12 +368,14 @@ def test_auto_uses_cuda_for_large_traditional_workloads() -> None:
     decision = policy.decision_for(RuntimeComponent.CatBoost)
     assert decision.reason == "auto_workload_at_or_above_threshold"
     assert decision.work_metric == "matrix_elements"
-    assert decision.work_items == 500_000
-    assert decision.threshold == 500_000
+    assert decision.work_items == 1_000_000
+    assert decision.threshold == 1_000_000
 
-    below = runtime(catboost_cuda=True, xgboost_cuda=True).with_workload(4_999, 100)
+    below = runtime(catboost_cuda=True, xgboost_cuda=True).with_workload(9_999, 100)
     assert below.device_for(RuntimeComponent.CatBoost) == "cpu"
-    assert below.device_for(RuntimeComponent.XGBoost) == "cpu"
+    assert below.device_for(RuntimeComponent.XGBoost) == "cuda"
+    xgb_below = runtime(xgboost_cuda=True).with_workload(1_999, 100)
+    assert xgb_below.device_for(RuntimeComponent.XGBoost) == "cpu"
 
 
 @pytest.mark.fast
@@ -243,6 +400,154 @@ def test_auto_keeps_compute_heavy_torch_backends_accelerator_preferred() -> None
     assert policy.decision_for(RuntimeComponent.MLP).reason == (
         "auto_accelerator_preferred"
     )
+
+
+@pytest.mark.fast
+def test_wrapper_knn_uses_largest_actual_fold_workload() -> None:
+    class FakeWrapperKNN:
+        shortname = "knn"
+        runtime_component = RuntimeComponent.KNN
+        seen = []
+
+        def set_runtime(self, policy):
+            self.runtime = policy
+            return self
+
+        def cv_score(self, X, y, groups, metric, test=False, splits=None):
+            self.seen.append(
+                (
+                    self.runtime.decision_for(RuntimeComponent.KNN),
+                    len(splits),
+                    X.shape,
+                )
+            )
+            return 0.75
+
+    n_rows = 1_000
+    X = pd.DataFrame(
+        np.zeros((n_rows, 101)),
+        columns=[f"f{idx}" for idx in range(101)],
+    )
+    y = pd.Series([0, 1] * (n_rows // 2))
+    indices = np.arange(n_rows)
+    splits = []
+    for fold in range(5):
+        query = indices[fold * 200 : (fold + 1) * 200]
+        train = np.setdiff1d(indices, query)
+        splits.append((train, query))
+
+    outcome = get_dfanalyze_score(
+        model_cls=FakeWrapperKNN,
+        X=X,
+        y=y,
+        g=None,
+        metric=ClassifierScorer.Accuracy,
+        selected=set(),
+        candidate="f0",
+        is_forward=False,
+        test=False,
+        runtime=runtime(DeviceIntent.Auto, torch_cuda=True),
+        splits=splits,
+    )
+
+    decision, n_splits, shape = FakeWrapperKNN.seen[-1]
+    assert outcome.score == pytest.approx(0.75)
+    assert n_splits == 5
+    assert shape == (1_000, 100)
+    assert decision.resolved == "cpu"
+    assert decision.n_samples == 800
+    assert decision.n_queries == 200
+    assert decision.work_items == 16_000_000
+    assert outcome.audit[-1]["stage"] == "completed"
+    assert outcome.audit[-1]["n_samples"] == 800
+
+
+@pytest.mark.fast
+def test_cpu_knn_wrapper_avoids_nested_parallelism(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_n_jobs = []
+
+    def fake_cv_score(self, X, y, groups, metric, test=False, splits=None):
+        seen_n_jobs.append(self.model_args["n_jobs"])
+        return 0.5
+
+    monkeypatch.setattr(KNNClassifier, "cv_score", fake_cv_score)
+    X = pd.DataFrame({"first": np.arange(10), "second": np.arange(10)})
+    y = pd.Series([0, 1] * 5)
+    splits = [
+        (np.arange(2, 10), np.arange(0, 2)),
+        (np.r_[0:2, 4:10], np.arange(2, 4)),
+    ]
+
+    get_dfanalyze_score(
+        model_cls=KNNClassifier,
+        X=X,
+        y=y,
+        g=None,
+        metric=ClassifierScorer.Accuracy,
+        selected=set(),
+        candidate="first",
+        is_forward=True,
+        test=False,
+        runtime=runtime(DeviceIntent.Auto, torch_cuda=True),
+        splits=splits,
+    )
+
+    assert seen_n_jobs == [1]
+
+
+@pytest.mark.fast
+def test_catboost_and_xgboost_tuning_fits_are_single_threaded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeEstimator:
+        def predict(self, X):
+            return np.zeros(len(X), dtype=int)
+
+    class FakeTrial:
+        def report(self, value, step):
+            return
+
+        def should_prune(self):
+            return False
+
+        def set_user_attr(self, name, value):
+            return
+
+    X = pd.DataFrame({"first": np.arange(20), "second": np.arange(20)})
+    y = pd.Series([0, 1] * 10, name="target")
+
+    catboost = CatBoostClassifier().set_runtime(runtime(DeviceIntent.CPU))
+    monkeypatch.setattr(catboost, "_assert_available", lambda: None)
+    monkeypatch.setattr(catboost, "optuna_args", lambda trial: {})
+    cat_args = []
+    monkeypatch.setattr(
+        catboost,
+        "_fit_target_models",
+        lambda X, y, kwargs: (cat_args.append(dict(kwargs)) or FakeEstimator()),
+    )
+    catboost._tuning_thread_count = 1
+    catboost.optuna_objective(
+        X, y, None, ClassifierScorer.Accuracy
+    )(FakeTrial())
+
+    xgboost = XGBoostClassifier().set_runtime(runtime(DeviceIntent.CPU))
+    monkeypatch.setattr(xgboost, "_assert_available", lambda: None)
+    monkeypatch.setattr(xgboost, "optuna_args", lambda trial: {})
+    xgb_args = []
+    monkeypatch.setattr(
+        xgboost,
+        "_fit_models",
+        lambda X, y, args: (xgb_args.append(dict(args)) or FakeEstimator()),
+    )
+    xgboost.optuna_objective(
+        X, y, None, ClassifierScorer.Accuracy
+    )(FakeTrial())
+
+    assert cat_args and all(args["thread_count"] == 1 for args in cat_args)
+    assert xgb_args and all(args["n_jobs"] == 1 for args in xgb_args)
+    assert xgboost.default_args["n_jobs"] == -1
 
 
 @pytest.mark.fast
@@ -272,6 +577,502 @@ def test_program_options_runtime_includes_recorded_workload(
 
 
 @pytest.mark.fast
+def test_model_device_uses_actual_selected_input_and_retries_cuda_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeXGB:
+        shortname = "fake-xgb"
+        longname = "Fake XGBoost"
+        runtime_component = RuntimeComponent.XGBoost
+
+        def __init__(self) -> None:
+            self.per_target_tuning_scores = {}
+            self.tuned_model = None
+            self.model = None
+
+        def set_runtime(self, policy):
+            self.runtime = policy
+            return self
+
+    n_rows = 3_000
+    columns = [f"f{i}" for i in range(100)]
+    train = PreparedData(
+        X=pd.DataFrame(np.zeros((n_rows, len(columns))), columns=columns),
+        y=pd.Series(np.arange(n_rows) % 2, name="target"),
+        groups=None,
+        is_classification=True,
+        validate=False,
+    )
+    test = PreparedData(
+        X=pd.DataFrame(np.zeros((10, len(columns))), columns=columns),
+        y=pd.Series(np.arange(10) % 2, name="target"),
+        groups=None,
+        is_classification=True,
+        validate=False,
+    )
+    calls: list[tuple[tuple[int, int], str]] = []
+
+    def fake_run(model, X_train, **_):
+        device = model.runtime.device_for(RuntimeComponent.XGBoost)
+        calls.append((X_train.shape, device))
+        if len(calls) == 1:
+            raise RuntimeError("CUDA out of memory")
+        study = SimpleNamespace(best_params={}, best_value=1.0)
+        scores = pd.DataFrame(
+            {
+                "metric": ["accuracy"],
+                "trainset": [1.0],
+                "holdout": [1.0],
+                "5-fold": [1.0],
+            }
+        )
+        evaluation = (
+            scores,
+            pd.Series(dtype=float),
+            pd.Series(dtype=float),
+            None,
+            None,
+            None,
+        )
+        model.tuned_model = SimpleNamespace(fitted=True)
+        return study, evaluation
+
+    monkeypatch.setattr(
+        hypertune_module, "_tune_and_evaluate_model", fake_run
+    )
+    monkeypatch.setattr(
+        hypertune_module, "release_accelerator_memory", lambda: None
+    )
+    options = SimpleNamespace(
+        models=[FakeXGB],
+        htune_cls_metric=ClassifierScorer.Accuracy,
+        htune_reg_metric=None,
+        htune_trials=1,
+        runtime=runtime(DeviceIntent.Auto, xgboost_cuda=True),
+        seed=42,
+        _runtime_model_audit=[],
+    )
+
+    with pytest.warns(UserWarning, match="Retrying this model on CPU once"):
+        evaluated = evaluate_tuned(
+            prepared=train,
+            prep_train=train,
+            prep_test=test,
+            assoc_filtered=SimpleNamespace(selected=["f0"]),
+            pred_filtered=None,
+            model_selected=ModelSelected(
+                embed_selected=None, wrap_selected=None
+            ),
+            options=options,
+        )
+
+    assert len(evaluated.results) == 2
+    assert calls == [
+        ((3_000, 100), "cuda"),
+        ((3_000, 100), "cpu"),
+        ((3_000, 1), "cpu"),
+    ]
+    assoc_start = next(
+        record
+        for record in options._runtime_model_audit
+        if record["selection"] == "assoc" and record["stage"] == "started"
+    )
+    assert assoc_start["n_features"] == 1
+    assert assoc_start["reason"] == "auto_workload_below_threshold"
+    assert all(
+        result.model.tuned_model is not None for result in evaluated.results
+    )
+
+
+@pytest.mark.fast
+def test_accelerator_model_snapshot_survives_release_and_reload(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native_xgboost = pytest.importorskip("xgboost").XGBClassifier
+    n_rows = 2_000
+    columns = [f"f{i}" for i in range(100)]
+    train = PreparedData(
+        X=pd.DataFrame(np.zeros((n_rows, len(columns))), columns=columns),
+        y=pd.Series(np.arange(n_rows) % 2, name="target"),
+        groups=None,
+        is_classification=True,
+        validate=False,
+    )
+    test = PreparedData(
+        X=pd.DataFrame(np.zeros((10, len(columns))), columns=columns),
+        y=pd.Series(np.arange(10) % 2, name="target"),
+        groups=None,
+        is_classification=True,
+        validate=False,
+    )
+
+    def fake_run(model, X_train, prep_train, **_):
+        fitted = native_xgboost(
+            n_estimators=1,
+            max_depth=1,
+            tree_method="hist",
+            device="cpu",
+            n_jobs=1,
+            verbosity=0,
+        )
+        fitted.fit(X_train.iloc[:40], prep_train.y.iloc[:40])
+        model.tuned_model = fitted
+        study = SimpleNamespace(best_params={}, best_value=1.0)
+        scores = pd.DataFrame(
+            {
+                "metric": ["accuracy"],
+                "trainset": [1.0],
+                "holdout": [1.0],
+                "5-fold": [1.0],
+            }
+        )
+        return (
+            study,
+            (
+                scores,
+                pd.Series(np.zeros(len(X_train)), index=X_train.index),
+                pd.Series(np.zeros(len(test.X)), index=test.X.index),
+                None,
+                None,
+                None,
+            ),
+        )
+
+    monkeypatch.setattr(
+        hypertune_module, "_tune_and_evaluate_model", fake_run
+    )
+    monkeypatch.setattr(
+        hypertune_module, "release_accelerator_memory", lambda: None
+    )
+    options = SimpleNamespace(
+        models=[XGBoostClassifier],
+        htune_cls_metric=ClassifierScorer.Accuracy,
+        htune_reg_metric=None,
+        htune_trials=1,
+        runtime=runtime(DeviceIntent.Auto, xgboost_cuda=True),
+        seed=42,
+        _runtime_model_audit=[],
+    )
+
+    evaluated = evaluate_tuned(
+        prepared=train,
+        prep_train=train,
+        prep_test=test,
+        assoc_filtered=None,
+        pred_filtered=None,
+        model_selected=ModelSelected(
+            embed_selected=None, wrap_selected=None
+        ),
+        options=options,
+    )
+    result = evaluated.results[0]
+
+    assert result.model.tuned_model is None
+    assert result._model_snapshot is not None
+    evaluated.save(tmp_path, fold_idx=None)
+    loaded = EvaluationResults.load(tmp_path)
+    restored = loaded.results[0]
+    assert restored._model_snapshot is None
+    assert restored.model.tuned_model is not None
+    predictions = restored.model.tuned_model.predict(train.X.iloc[:3])
+    assert predictions.shape == (3,)
+
+
+@pytest.mark.fast
+def test_accelerator_release_clears_trainer_references(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleanup_calls: list[bool] = []
+    model = SimpleNamespace(
+        shortname="fake-gandalf",
+        runtime=runtime(DeviceIntent.Auto, torch_cuda=True).for_task(100, 10),
+        model=object(),
+        tuned_model=object(),
+        trainer=object(),
+        tuned_trainer=object(),
+        _cleanup_after_fold=lambda: cleanup_calls.append(True),
+    )
+    monkeypatch.setattr(
+        hypertune_module, "release_accelerator_memory", lambda: None
+    )
+
+    hypertune_module._release_fitted_model_state(
+        model, RuntimeComponent.Gandalf, force=True
+    )
+
+    assert model.model is None
+    assert model.tuned_model is None
+    assert model.trainer is None
+    assert model.tuned_trainer is None
+    assert cleanup_calls == [True]
+
+
+@pytest.mark.fast
+def test_strict_cuda_xgboost_snapshot_restores_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    X = pd.DataFrame(
+        np.arange(80, dtype=float).reshape(40, 2), columns=["first", "second"]
+    )
+    y = pd.Series(np.arange(40) % 2, name="target")
+    model = XGBoostClassifier(
+        model_args={"n_estimators": 2, "max_depth": 1, "n_jobs": 1}
+    )
+    model.set_runtime(runtime(DeviceIntent.CPU))
+    model.fit(X, y)
+    expected = np.asarray(model.predict(X))
+    model.set_runtime(
+        runtime(DeviceIntent.CUDA, xgboost_cuda=True).for_task(
+            len(X), X.shape[1]
+        )
+    )
+    payload = jsonpickle.encode(model, unpicklable=True)
+    monkeypatch.setattr(hardware, "_xgboost_cuda_available", lambda: False)
+
+    restored = jsonpickle.decode(payload)
+
+    assert restored.runtime.intent is DeviceIntent.CPU
+    np.testing.assert_array_equal(restored.predict(X), expected)
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize(
+    ("model_cls", "kwargs"),
+    [
+        (KANEstimator, {"num_classes": 2}),
+        (TabPFNClassifierV3, {}),
+    ],
+)
+def test_strict_cuda_torch_snapshot_restores_with_cpu_runtime(
+    model_cls,
+    kwargs,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = model_cls(**kwargs)
+    model.set_runtime(runtime(DeviceIntent.CUDA, torch_cuda=True))
+    payload = jsonpickle.encode(model, unpicklable=True)
+    monkeypatch.setattr(hardware, "_torch_capabilities", lambda: (False, False))
+
+    restored = jsonpickle.decode(payload)
+
+    assert restored.runtime.intent is DeviceIntent.CPU
+    assert restored.runtime.device_for(restored.runtime_component) == "cpu"
+
+
+@pytest.mark.fast
+def test_adaptive_error_oof_restarts_complete_task_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeOOFModel:
+        runtime_component = RuntimeComponent.MLP
+        calls: list[str] = []
+
+        def __init__(self) -> None:
+            self.tuned_model = None
+            self.model = None
+
+        def set_runtime(self, policy):
+            self.runtime = policy
+            return self
+
+        def refit_tuned(self, X, y, g=None, tuned_args=None) -> None:
+            device = self.runtime.device_for(RuntimeComponent.MLP)
+            self.calls.append(device)
+            if device == "cuda" and self.calls.count("cuda") == 1:
+                raise RuntimeError("CUDA out of memory")
+            self.tuned_model = self
+
+        def tuned_predict(self, X):
+            return np.zeros(len(X), dtype=int)
+
+        def predict_proba(self, X):
+            return np.tile(np.asarray([[0.75, 0.25]]), (len(X), 1))
+
+        def _cleanup_after_fold(self) -> None:
+            return
+
+    monkeypatch.setattr(
+        hypertune_module, "release_accelerator_memory", lambda: None
+    )
+    monkeypatch.setattr(
+        "df_analyze.analysis.adaptive_error.oof.release_accelerator_memory",
+        lambda: None,
+    )
+    X = pd.DataFrame(
+        {"f0": np.arange(40, dtype=float), "f1": np.arange(40, dtype=float)}
+    )
+    y = pd.Series([0, 1] * 20, name="target")
+    source = SimpleNamespace(
+        runtime=runtime(DeviceIntent.Auto, torch_cuda=True),
+        model_args=None,
+    )
+    result = SimpleNamespace(
+        model_cls=FakeOOFModel,
+        model=source,
+        params={},
+        selection="filter",
+    )
+    options = SimpleNamespace(
+        _runtime_model_audit=[],
+        _runtime_current_fold=2,
+    )
+
+    with pytest.warns(UserWarning, match="Restarting this complete"):
+        oof, probabilities = build_oof_for_result(
+            result,
+            X,
+            y,
+            groups=None,
+            n_folds=2,
+            options=options,
+        )
+
+    assert FakeOOFModel.calls == ["cuda", "cpu", "cpu"]
+    assert len(oof) == len(X)
+    assert probabilities.shape == (len(X), 2)
+    assert [
+        (record["attempt"], record["stage"], record["resolved"])
+        for record in options._runtime_model_audit
+    ] == [(1, "failed", "cuda"), (2, "completed", "cpu")]
+
+
+@pytest.mark.fast
+def test_adaptive_error_knn_uses_actual_oof_fold_workload_and_audit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeKNN:
+        shortname = "knn"
+        runtime_component = RuntimeComponent.KNN
+
+    seen = []
+
+    def fit_fold(result, X_tr, y_tr, g_tr, X_val, policy):
+        seen.append(policy.decision_for(RuntimeComponent.KNN))
+        return {
+            "y_pred": np.zeros(len(X_val), dtype=int),
+            "proba": np.tile(np.asarray([[0.75, 0.25]]), (len(X_val), 1)),
+            "conf": np.full(len(X_val), 0.5),
+            "knn_vote": None,
+            "knn_dist_weighted": None,
+            "knn_min_dist": None,
+            "tree_vote_agreement": None,
+            "tree_leaf_support": None,
+        }
+
+    monkeypatch.setattr(adaptive_error_oof, "_fit_oof_fold", fit_fold)
+    n_rows = 1_000
+    X = pd.DataFrame(np.zeros((n_rows, 100)))
+    y = pd.Series([0, 1] * (n_rows // 2), name="target")
+    options = SimpleNamespace(_runtime_model_audit=[], _runtime_current_fold=3)
+    result = SimpleNamespace(
+        model_cls=FakeKNN,
+        model=SimpleNamespace(
+            shortname="knn",
+            runtime=runtime(DeviceIntent.Auto, torch_cuda=True),
+        ),
+        params={},
+        selection="filter",
+    )
+
+    oof, probabilities = build_oof_for_result(
+        result,
+        X,
+        y,
+        groups=None,
+        n_folds=5,
+        options=options,
+    )
+
+    assert len(oof) == n_rows
+    assert probabilities.shape == (n_rows, 2)
+    assert seen and all(decision.resolved == "cpu" for decision in seen)
+    assert all(decision.n_samples == 800 for decision in seen)
+    assert all(decision.n_queries == 200 for decision in seen)
+    record = options._runtime_model_audit[-1]
+    assert record["fold"] == 3
+    assert record["stage"] == "completed"
+    assert record["resolved"] == "cpu"
+    assert record["n_samples"] == 800
+    assert record["n_queries"] == 200
+    assert record["work_items"] == 16_000_000
+
+
+@pytest.mark.fast
+def test_adaptive_error_holdout_restarts_complete_task_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeHoldoutModel:
+        shortname = "fake-holdout"
+        runtime_component = RuntimeComponent.MLP
+
+        def __init__(self) -> None:
+            self.runtime = runtime(DeviceIntent.Auto, torch_cuda=True)
+            self.model = object()
+            self.tuned_model = object()
+            self.devices: list[str] = []
+
+        def set_runtime(self, policy):
+            self.runtime = policy
+            return self
+
+        def _cleanup_after_fold(self) -> None:
+            return
+
+    model = FakeHoldoutModel()
+    result = SimpleNamespace(
+        model=model,
+        model_cls=FakeHoldoutModel,
+        params={},
+        selection="filter",
+    )
+    sentinel = object()
+
+    def attempt(**_kwargs):
+        device = model.runtime.device_for(RuntimeComponent.MLP)
+        model.devices.append(device)
+        if device == "cuda":
+            raise RuntimeError("CUDA out of memory during predict_proba")
+        return sentinel
+
+    monkeypatch.setattr(
+        adaptive_error_test_stage,
+        "_evaluate_test_stage_attempt",
+        attempt,
+    )
+    monkeypatch.setattr(
+        adaptive_error_test_stage,
+        "release_accelerator_memory",
+        lambda: None,
+    )
+    X_train = pd.DataFrame(np.zeros((20, 3)))
+    X_test = pd.DataFrame(np.zeros((5, 3)))
+
+    with pytest.warns(UserWarning, match="Restarting this complete"):
+        evaluated = adaptive_error_test_stage._evaluate_test_stage(
+            result=result,
+            X_train=X_train,
+            X_test=X_test,
+            y_train=pd.Series([0, 1] * 10),
+            y_test=pd.Series([0, 1, 0, 1, 0]),
+            labels_map=None,
+            aer=None,
+            calibrator=None,
+            selected_conf_metric="proba_margin",
+            selected_conf_params={},
+            options=SimpleNamespace(),
+            no_preds=True,
+            m_preds=None,
+            m_tables=None,
+            m_plots=None,
+            m_meta=None,
+        )
+
+    assert evaluated is sentinel
+    assert model.devices == ["cuda", "cpu"]
+
+
+@pytest.mark.fast
 def test_device_decisions_are_auditable() -> None:
     options = SimpleNamespace(
         is_classification=True,
@@ -285,7 +1086,7 @@ def test_device_decisions_are_auditable() -> None:
     assert decision["resolved"] == "cpu"
     assert decision["reason"] == "auto_workload_below_threshold"
     assert decision["work_items"] == 3_200_000
-    assert decision["threshold"] == 5_000_000
+    assert decision["threshold"] == 20_000_000
 
 
 @pytest.mark.fast
@@ -423,7 +1224,7 @@ def test_main_allows_one_predictive_model_to_succeed(monkeypatch) -> None:
 
 
 @pytest.mark.fast
-def test_knn_oom_fallback_updates_runtime_decision() -> None:
+def test_knn_oom_requests_complete_model_retry() -> None:
     base = runtime(DeviceIntent.CUDA, torch_cuda=True)
     policy = base.with_workload(5_000, 100)
     model = TorchKNNClassifier(
@@ -437,14 +1238,13 @@ def test_knn_oom_fallback_updates_runtime_decision() -> None:
     model._X_cpu = np.asarray([[0.0], [1.0]], dtype=np.float32)
     model._y_cpu = np.asarray([[0], [1]])
 
-    with pytest.warns(UserWarning, match="continuing with sklearn KNN on CPU"):
+    with pytest.raises(RuntimeError, match="complete model task"):
         model._activate_cpu("training data did not fit in GPU memory")
 
     decision = base.with_workload(5_000, 100).decision_for(RuntimeComponent.KNN)
-    assert decision.resolved == "cpu"
-    assert decision.reason == "cuda_out_of_memory"
-    assert model._cpu_model.p == 1
-    assert model._cpu_model.algorithm == "brute"
+    assert decision.resolved == "cuda"
+    assert decision.reason == "explicit_cuda_available"
+    assert model._cpu_model is None
     assert base.with_workload(5_001, 100).device_for(RuntimeComponent.KNN) == "cuda"
 
 
@@ -691,6 +1491,67 @@ def test_resolved_devices_only_lists_selected_models() -> None:
     assert resolved["catboost"] == "cuda"
     assert resolved["knn"] == "cuda"
     assert "embedding" not in resolved
+
+
+@pytest.mark.fast
+def test_xgboost_uses_one_canonical_audit_key() -> None:
+    options = SimpleNamespace(
+        is_classification=True,
+        classifiers=(DfAnalyzeClassifier.XGBoost,),
+        regressors=(),
+        runtime=runtime(DeviceIntent.CUDA, xgboost_cuda=True),
+        _runtime_model_audit=[
+            {
+                "model": "xgb",
+                "selection": "none",
+                "stage": "completed",
+                "resolved": "cuda",
+                "requested": "cuda",
+                "reason": "explicit_cuda_available",
+                "n_samples": 100,
+                "n_features": 10,
+                "n_queries": 25,
+            }
+        ],
+    )
+
+    assert _main._resolved_devices(options)["xgboost"] == "cuda"
+    assert "xgb" not in _main._resolved_devices(options)
+    assert _main._device_decisions(options)["xgboost"]["n_queries"] == 25
+
+
+@pytest.mark.fast
+def test_actual_device_audit_reports_mixed_model_tasks() -> None:
+    options = SimpleNamespace(
+        is_classification=True,
+        classifiers=(DfAnalyzeClassifier.XGBoost,),
+        regressors=(),
+        runtime=runtime(DeviceIntent.Auto, xgboost_cuda=True),
+        _runtime_model_audit=[
+            {
+                "model": "xgb",
+                "selection": "none",
+                "stage": "completed",
+                "resolved": "cuda",
+                "requested": "auto",
+                "reason": "auto_workload_at_or_above_threshold",
+            },
+            {
+                "model": "xgb",
+                "selection": "filter",
+                "stage": "completed",
+                "resolved": "cpu",
+                "requested": "auto",
+                "reason": "auto_workload_below_threshold",
+            },
+        ],
+    )
+
+    assert _main._resolved_devices(options)["xgboost"] == "mixed"
+    decision = _main._device_decisions(options)["xgboost"]
+    assert decision["resolved"] == "mixed"
+    assert decision["devices"] == ["cpu", "cuda"]
+    assert decision["tasks"] == 2
 
 
 @pytest.mark.fast

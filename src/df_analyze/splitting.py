@@ -252,6 +252,62 @@ def validate_multitarget_cv_support(
         )
 
 
+def validate_multitarget_holdout_coverage(
+    y_train: DataFrame,
+    y_holdout: DataFrame,
+    *,
+    external: bool,
+) -> None:
+    """Ensure performance reporting discloses targets absent from a holdout."""
+
+    missing: list[str] = []
+    for target in y_train.columns:
+        train_levels = set(y_train[target].astype(str))
+        holdout_levels = set(y_holdout[target].astype(str))
+        omitted = sorted(train_levels - holdout_levels)
+        if omitted:
+            missing.append(f"'{target}' is missing level(s) {omitted}")
+    if not missing:
+        return
+
+    message = (
+        "The holdout partition does not represent every multi-target "
+        f"classification level seen in training: {'; '.join(missing)}. Metrics "
+        "for the omitted levels cannot be estimated."
+    )
+    if external:
+        warn(
+            f"{message} This holdout was supplied externally, so evaluation will "
+            "continue and the omission must be considered when interpreting results."
+        )
+        return
+    raise ValueError(
+        f"{message} Change the split seed/size or grouping design; an internally "
+        "generated holdout must cover every training level."
+    )
+
+
+def validate_multitarget_regression_support(
+    y: DataFrame,
+    phase: str,
+) -> None:
+    """Reject regression partitions that cannot identify every target."""
+
+    failures: list[str] = []
+    for target in y.columns:
+        values = np.asarray(y[target], dtype=float)
+        if not np.isfinite(values).all():
+            failures.append(f"'{target}' contains non-finite values")
+        elif np.unique(values).size < 2:
+            failures.append(f"'{target}' is constant")
+    if failures:
+        raise ValueError(
+            f"Multi-target regression cannot use the {phase}: "
+            f"{'; '.join(failures)}. Every target must vary within each outer "
+            "training and holdout partition."
+        )
+
+
 def validate_multitarget_model_cv_support(
     y: DataFrame,
     model_classes: Iterable[type],
@@ -355,22 +411,23 @@ class OmniKFold:
                 f"but no grouping data was provided. {self.phase_info}"
             )
         if multitarget_y is not None:
-            if not self.is_cls:
-                raise ValueError(
-                    "Multi-target fold-support validation is only defined for "
-                    "classification."
-                )
             if len(multitarget_y) != len(y_train):
                 raise ValueError(
                     "Multi-target fold-support data must align with the split proxy. "
                     f"Got {len(multitarget_y)} target rows and {len(y_train)} proxy rows."
                 )
             multitarget_y = multitarget_y.reset_index(drop=True)
-            validate_multitarget_cv_support(
-                multitarget_y,
-                n_splits=self.n_splits,
-                phase=self.df_analyze_phase or "internal cross-validation",
-            )
+            if self.is_cls:
+                validate_multitarget_cv_support(
+                    multitarget_y,
+                    n_splits=self.n_splits,
+                    phase=self.df_analyze_phase or "internal cross-validation",
+                )
+            else:
+                validate_multitarget_regression_support(
+                    multitarget_y,
+                    phase=self.df_analyze_phase or "internal cross-validation",
+                )
 
         unstratified = bool(y_train.attrs.get(_UNSTRATIFIED_SPLIT_ATTR, False))
         y_cnts = np.unique(y_train.apply(str), return_counts=True)[1]
@@ -701,6 +758,18 @@ class OmniKFold:
         failures: list[str] = []
         for fold, (ix_tr, ix_t) in enumerate(splits):
             for target in y.columns:
+                if not self.is_cls:
+                    train = np.asarray(y[target].iloc[ix_tr], dtype=float)
+                    validation = np.asarray(y[target].iloc[ix_t], dtype=float)
+                    if np.unique(train).size < 2:
+                        failures.append(
+                            f"fold {fold}, target '{target}': training target is constant"
+                        )
+                    if np.unique(validation).size < 2:
+                        failures.append(
+                            f"fold {fold}, target '{target}': validation target is constant"
+                        )
+                    continue
                 values = y[target].astype(str)
                 levels = values.unique()
                 train_counts = (
@@ -723,6 +792,17 @@ class OmniKFold:
         return failures
 
     def _multitarget_informative_error(self, y: DataFrame) -> RuntimeError:
+        grouped = " group-disjoint" if self.grouped else ""
+        if not self.is_cls:
+            return RuntimeError(
+                f"Could not create{grouped} {self.n_splits}-fold cross-validation "
+                "partitions in which every multi-target regression target varies "
+                "within every training and validation fold. "
+                f"{self.phase_info}\n\n"
+                "Distinct values per target:\n\n"
+                f"{y.nunique(dropna=False).rename('Distinct Values').to_markdown()}"
+            )
+
         counts = []
         for target in y.columns:
             for level, count in y[target].astype(str).value_counts().items():
@@ -733,7 +813,6 @@ class OmniKFold:
                         "Count": int(count),
                     }
                 )
-        grouped = " group-disjoint" if self.grouped else ""
         return RuntimeError(
             f"Could not create{grouped} {self.n_splits}-fold cross-validation "
             "partitions with every level of every multi-target classification "

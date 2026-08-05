@@ -20,7 +20,7 @@ from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 
 from df_analyze.enumerables import Scorer
 from df_analyze.models.base import DfAnalyzeModel
-from df_analyze.runtime.hardware import RuntimeComponent, RuntimePolicy
+from df_analyze.runtime.hardware import DeviceIntent, RuntimeComponent, RuntimePolicy
 
 
 def _float_array(X: Any) -> np.ndarray:
@@ -133,6 +133,13 @@ class _TorchKNN:
             return
         if self._X_cpu is None or self._y_cpu is None:
             raise RuntimeError("KNN training data is unavailable for CPU fallback.")
+        if self.runtime is not None and self.runtime.intent in {
+            DeviceIntent.Auto,
+            DeviceIntent.CUDA,
+        }:
+            raise RuntimeError(
+                f"CUDA KNN {reason}. The complete model task must be retried on CPU."
+            )
         warn(f"CUDA KNN {reason}; continuing with sklearn KNN on CPU.")
         if self.runtime is not None:
             self.runtime.record_cpu_fallback(
@@ -420,6 +427,7 @@ class TorchKNNRegressor(_TorchKNN):
 
 
 class KNNEstimator(DfAnalyzeModel):
+    runtime_component = RuntimeComponent.KNN
     shortname = "knn"
     longname = "K-Neighbours Estimator"
     timeout_s = 30 * 60  # 30 minutes is enough given the grid

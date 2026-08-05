@@ -203,6 +203,7 @@ def get_T0(
 
 
 class MLPEstimator(DfAnalyzeModel):
+    runtime_component = RuntimeComponent.MLP
     shortname = "mlp"
     longname = "Multilayer Perceptron"
     timeout_s = 3600
@@ -226,12 +227,18 @@ class MLPEstimator(DfAnalyzeModel):
             max_epochs=50,
             batch_size=BATCH_SIZE,
             # iterator_train__num_workers=1,  # for some reason causes huge slow
-            device=self.runtime.device_for(RuntimeComponent.MLP),
+            device=self.runtime.device_for(self.runtime_component),
             verbose=0,
         )
 
     def _configure_runtime(self) -> None:
-        self.fixed_args["device"] = self.runtime.device_for(RuntimeComponent.MLP)
+        self.fixed_args["device"] = self.runtime.device_for(self.runtime_component)
+
+    def _runtime_model_args(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Make the runtime policy authoritative over user/model arguments."""
+        resolved = dict(args)
+        resolved["device"] = self.runtime.device_for(self.runtime_component)
+        return resolved
 
     def _cleanup_after_fold(self) -> None:
         cleanup_torch_accelerator(self.runtime, RuntimeComponent.MLP)
@@ -362,7 +369,9 @@ class MLPEstimator(DfAnalyzeModel):
         if isinstance(y_train, DataFrame):
             y_train = y_train.iloc[:, 0]
         if self.model is None:
-            kwargs = {**self.fixed_args, **self.default_args, **self.model_args}
+            kwargs = self._runtime_model_args(
+                {**self.fixed_args, **self.default_args, **self.model_args}
+            )
             self.model = self.model_cls(**kwargs)
         X, y = self._to_torch(X_train, y_train)
         try:
@@ -391,12 +400,14 @@ class MLPEstimator(DfAnalyzeModel):
         if isinstance(y, DataFrame):
             y = y.iloc[:, 0]
         tuned_args = tuned_args or {}
-        kwargs = {
-            **self.fixed_args,
-            **self.default_args,
-            **self.model_args,
-            **self._to_model_args(tuned_args, X),
-        }
+        kwargs = self._runtime_model_args(
+            {
+                **self.fixed_args,
+                **self.default_args,
+                **self.model_args,
+                **self._to_model_args(tuned_args, X),
+            }
+        )
         self.tuned_model = self.model_cls(**kwargs)
         Xt, yt = self._to_torch(X, y)
         self.tuned_model.fit(Xt, yt)  # type: ignore
@@ -493,7 +504,7 @@ class MLPEstimator(DfAnalyzeModel):
                     y_split,
                     g_train,
                     multitarget_y=(
-                        y_train if self.is_classifier else None
+                        y_train
                     ),
                 )[0]
                 opt_args = self.optuna_args(trial)
@@ -506,6 +517,9 @@ class MLPEstimator(DfAnalyzeModel):
                         **model.model_args,
                         **model_args,
                     }
+                    enforce_runtime = getattr(model, "_runtime_model_args", None)
+                    if callable(enforce_runtime):
+                        full_args = enforce_runtime(full_args)
                     target_args.append(
                         (model, target, X_target, y_target, full_args)
                     )
@@ -561,12 +575,14 @@ class MLPEstimator(DfAnalyzeModel):
             )
             opt_args = self.optuna_args(trial)
             model_args = self._to_model_args(opt_args, X_train)
-            full_args = {
-                **self.fixed_args,
-                **self.default_args,
-                **self.model_args,
-                **model_args,
-            }
+            full_args = self._runtime_model_args(
+                {
+                    **self.fixed_args,
+                    **self.default_args,
+                    **self.model_args,
+                    **model_args,
+                }
+            )
             scores = []
             for step, (idx_train, idx_test) in enumerate(
                 kf.split(X_train, y_train, g_train)[0]

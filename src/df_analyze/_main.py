@@ -48,7 +48,13 @@ from df_analyze.preprocessing.prepare import (
     usable_training_indices,
 )
 from df_analyze.preprocessing.targets import as_target_list
-from df_analyze.runtime.hardware import RuntimeComponent
+from df_analyze.runtime.hardware import (
+    DeviceIntent,
+    RuntimeComponent,
+    format_device_plan,
+    is_cuda_runtime_error,
+    validate_cuda_request,
+)
 from df_analyze.selection.filter import FilterSelected, filter_select_features
 from df_analyze.selection.models import model_select_features
 from df_analyze.selection.multitarget import (
@@ -57,8 +63,10 @@ from df_analyze.selection.multitarget import (
 )
 from df_analyze.splitting import (
     resolve_final_cv_folds,
-    validate_multitarget_model_cv_support,
     validate_multitarget_cv_support,
+    validate_multitarget_holdout_coverage,
+    validate_multitarget_model_cv_support,
+    validate_multitarget_regression_support,
 )
 
 RESULTS_DIR = Path(__file__).parent / "results"
@@ -147,42 +155,188 @@ def _runtime_components(options: ProgramOptions) -> dict[str, RuntimeComponent]:
         "mlp": ("mlp", RuntimeComponent.MLP),
         "kan": ("kan", RuntimeComponent.KAN),
         "gandalf": ("gandalf", RuntimeComponent.Gandalf),
-        "lgbm": ("lightgbm", RuntimeComponent.LightGBM),
-        "rf": ("lightgbm", RuntimeComponent.LightGBM),
-        "dummy": ("sklearn", RuntimeComponent.Sklearn),
-        "lr": ("sklearn", RuntimeComponent.Sklearn),
-        "sgd": ("sklearn", RuntimeComponent.Sklearn),
-        "svm": ("sklearn", RuntimeComponent.Sklearn),
-        "elastic": ("sklearn", RuntimeComponent.Sklearn),
-        "dtree": ("sklearn", RuntimeComponent.Sklearn),
-        "et": ("sklearn", RuntimeComponent.Sklearn),
+        "lgbm": ("lgbm", RuntimeComponent.LightGBM),
+        "rf": ("rf", RuntimeComponent.LightGBM),
+        "dummy": ("dummy", RuntimeComponent.Sklearn),
+        "lr": ("lr", RuntimeComponent.Sklearn),
+        "sgd": ("sgd", RuntimeComponent.Sklearn),
+        "svm": ("svm", RuntimeComponent.Sklearn),
+        "elastic": ("elastic", RuntimeComponent.Sklearn),
+        "dtree": ("dtree", RuntimeComponent.Sklearn),
+        "et": ("et", RuntimeComponent.Sklearn),
     }
     sources = options.classifiers if options.is_classification else options.regressors
     for source in sources:
-        entry = model_components.get(getattr(source, "value", str(source)))
-        if entry is not None:
-            name, component = entry
-            components[name] = component
+        name = getattr(source, "value", str(source))
+        model_component = model_components.get(name)
+        if model_component is not None:
+            component_name, component = model_component
+            components[component_name] = component
     wrapper = getattr(options, "wrapper_select", None)
     wrapper_model = getattr(options, "wrapper_model", None)
     if wrapper is not None and getattr(wrapper_model, "value", wrapper_model) == "knn":
         components["knn"] = RuntimeComponent.KNN
+    if bool(getattr(options, "error_consistency", False)):
+        components["error-consistency"] = RuntimeComponent.ErrorConsistency
     return components
 
 
-def _resolved_devices(options: ProgramOptions) -> dict[str, str]:
+def _canonical_device_name(name: object) -> str:
+    value = str(name)
+    return {"xgb": "xgboost"}.get(value, value)
+
+
+def _runtime_records(
+    options: ProgramOptions,
+    fold_idx: Optional[int] = None,
+) -> list[dict[str, object]]:
+    records = list(getattr(options, "_runtime_model_audit", []))
+    if fold_idx is None:
+        return records
+    return [record for record in records if record.get("fold") == fold_idx]
+
+
+def _planned_devices(options: ProgramOptions) -> dict[str, str]:
     return {
-        name: options.runtime.device_for(component)
+        name: options.runtime.decision_for(component).resolved
         for name, component in _runtime_components(options).items()
     }
 
 
-def _device_decisions(options: ProgramOptions) -> dict[str, dict[str, object]]:
+def _planned_device_decisions(
+    options: ProgramOptions,
+) -> dict[str, dict[str, object]]:
+    return {
+        name: options.runtime.decision_for(component).to_dict()
+        for name, component in _runtime_components(options).items()
+    }
+
+
+def _resolved_devices(
+    options: ProgramOptions,
+    fold_idx: Optional[int] = None,
+) -> dict[str, str]:
+    resolved = _planned_devices(options)
+    records = _runtime_records(options, fold_idx)
+    model_names = {
+        _canonical_device_name(record.get("model", ""))
+        for record in records
+        if record.get("model")
+    }
+    for model_name in model_names:
+        completed = [
+            str(record.get("resolved"))
+            for record in records
+            if _canonical_device_name(record.get("model", "")) == model_name
+            and record.get("stage") == "completed"
+        ]
+        if completed:
+            devices = sorted(set(completed))
+            resolved[model_name] = (
+                devices[0] if len(devices) == 1 else "mixed"
+            )
+        else:
+            resolved[model_name] = "failed"
+    ec_backends = [
+        backend
+        for backend in getattr(options, "_ec_backends", [])
+        if fold_idx is None or backend.get("fold") == fold_idx
+    ]
+    if ec_backends:
+        devices = {
+            (
+                "cuda"
+                if backend.get("ec_backend_resolved") == "torch_cuda"
+                else "cpu"
+            )
+            for backend in ec_backends
+        }
+        resolved["error-consistency"] = (
+            next(iter(devices)) if len(devices) == 1 else "mixed"
+        )
+    return resolved
+
+
+def _device_decisions(
+    options: ProgramOptions,
+    fold_idx: Optional[int] = None,
+) -> dict[str, dict[str, object]]:
     runtime = options.runtime
-    return {
-        name: runtime.decision_for(component).to_dict()
-        for name, component in _runtime_components(options).items()
+    decisions = _planned_device_decisions(options)
+    records = _runtime_records(options, fold_idx)
+    model_names = {
+        _canonical_device_name(record.get("model", ""))
+        for record in records
+        if record.get("model")
     }
+    audit_fields = {
+        "requested",
+        "resolved",
+        "reason",
+        "n_samples",
+        "n_features",
+        "n_queries",
+        "work_metric",
+        "work_items",
+        "threshold",
+    }
+    for model_name in model_names:
+        completed = [
+            record
+            for record in records
+            if _canonical_device_name(record.get("model", "")) == model_name
+            and record.get("stage") == "completed"
+        ]
+        if not completed:
+            decisions[model_name] = {
+                "requested": runtime.intent.value,
+                "resolved": "failed",
+                "reason": "all_model_tasks_failed",
+            }
+            continue
+        devices = sorted(
+            {str(record.get("resolved")) for record in completed}
+        )
+        if len(completed) == 1:
+            decisions[model_name] = {
+                key: value
+                for key, value in completed[-1].items()
+                if key in audit_fields
+            }
+        else:
+            decisions[model_name] = {
+                "requested": runtime.intent.value,
+                "resolved": (
+                    devices[0] if len(devices) == 1 else "mixed"
+                ),
+                "reason": "multiple_model_tasks",
+                "devices": devices,
+                "tasks": len(completed),
+            }
+    ec_backends = [
+        backend
+        for backend in getattr(options, "_ec_backends", [])
+        if fold_idx is None or backend.get("fold") == fold_idx
+    ]
+    if ec_backends:
+        devices = sorted(
+            {
+                (
+                    "cuda"
+                    if backend.get("ec_backend_resolved") == "torch_cuda"
+                    else "cpu"
+                )
+                for backend in ec_backends
+            }
+        )
+        decisions["error-consistency"] = {
+            "requested": runtime.intent.value,
+            "resolved": devices[0] if len(devices) == 1 else "mixed",
+            "reason": "error_consistency_runtime_backends",
+            "devices": devices,
+            "tasks": len(ec_backends),
+        }
+    return decisions
 
 
 def _runtime_snapshot(
@@ -190,16 +344,22 @@ def _runtime_snapshot(
 ) -> dict[str, object]:
     return {
         "fold": fold_idx,
-        "resolved_devices": _resolved_devices(options),
-        "device_decisions": _device_decisions(options),
+        "planned_devices": _planned_devices(options),
+        "resolved_devices": _resolved_devices(options, fold_idx),
+        "planned_device_decisions": _planned_device_decisions(options),
+        "device_decisions": _device_decisions(options, fold_idx),
     }
 
 
 def _record_ec_backends(options: ProgramOptions, result) -> None:
     recorded = getattr(options, "_ec_backends", [])
     for backend in result.metadata.get("ec_backends", []):
-        if backend not in recorded:
-            recorded.append(backend)
+        entry = {
+            **backend,
+            "fold": getattr(options, "_runtime_current_fold", None),
+        }
+        if entry not in recorded:
+            recorded.append(entry)
     options._ec_backends = recorded
     for skipped in result.metadata.get("skipped_configurations", []):
         _record_partial_failure(
@@ -242,7 +402,9 @@ def _write_run_timing(
     payload = {
         "total_seconds": round(perf_counter() - started_s, 6),
         "device_requested": getattr(device, "value", str(device)),
+        "planned_devices": _planned_devices(options),
         "resolved_devices": _resolved_devices(options),
+        "planned_device_decisions": _planned_device_decisions(options),
         "device_decisions": _device_decisions(options),
         "started_at": started_at.isoformat(timespec="seconds"),
         "ended_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -250,6 +412,7 @@ def _write_run_timing(
         "command_argv": getattr(options, "cli_argv", list(sys.argv)),
         "status": status,
         "runtime_folds": getattr(options, "_runtime_fold_audit", []),
+        "runtime_models": getattr(options, "_runtime_model_audit", []),
         "model_failures": getattr(options, "_model_failures", []),
         "partial_failures": getattr(options, "_partial_failures", []),
         "error_consistency": {
@@ -309,10 +472,15 @@ def _run(options: ProgramOptions) -> None:
     # sys.exit(0)
     is_cls = options.is_classification
     options._runtime_fold_audit = []
+    options._runtime_model_audit = []
     options._ec_backends = []
     options._model_failures = []
     options._model_successes = []
     options._partial_failures = []
+    components = _runtime_components(options)
+    validate_cuda_request(options.runtime, components)
+    print(format_device_plan(options.runtime, components))
+    print()
     prog_dirs = options.program_dirs
     targets = as_target_list(options.targets)
     target_spec: Union[str, list[str]] = targets[0] if len(targets) == 1 else targets
@@ -470,14 +638,27 @@ def _run(options: ProgramOptions) -> None:
             )
         if is_cls and isinstance(prep_train.y, DataFrame):
             validate_multitarget_model_cv_support(prep_train.y, options.models)
+            validate_multitarget_holdout_coverage(
+                prep_train.y,
+                prep_test.y,
+                external=has_external_tests,
+            )
             validate_multitarget_cv_support(
                 prep_test.y,
                 n_splits=final_cv_folds,
                 phase="final holdout cross-validation",
             )
+        elif isinstance(prep_train.y, DataFrame):
+            validate_multitarget_regression_support(
+                prep_train.y, phase="outer training partition"
+            )
+            validate_multitarget_regression_support(
+                prep_test.y, phase="outer holdout partition"
+            )
         # prep_train, prep_test = prepared.split()
         if not has_external_tests:
             fold_idx = None
+        options._runtime_current_fold = fold_idx
         if pre_downsampled and prep_train.info is not None:
             prog_dirs.save_prep_report(prep_train.to_markdown(), fold_idx)
 
@@ -741,6 +922,11 @@ def _run(options: ProgramOptions) -> None:
                             )
                         )
                     except RuntimeError as error:
+                        if (
+                            options.runtime.intent is DeviceIntent.CUDA
+                            and is_cuda_runtime_error(error)
+                        ):
+                            raise
                         skipped_targets.append(
                             {
                                 "scope": "target",

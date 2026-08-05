@@ -1,3 +1,11 @@
+"""Orchestrate repeated K-fold refits against one external holdout.
+
+For every repetition the training partition is reshuffled, K models are fitted
+on K-1 folds, and every model predicts the unchanged external holdout. The
+runner records partitions and seeds, isolates fold failures, checkpoints
+completed repetitions, and restores global random state after analysis.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -15,6 +23,13 @@ import pandas as pd
 from pandas import DataFrame, Series
 
 from df_analyze.analysis.error_consistency.backend import resolve_ec_backend
+from df_analyze.analysis.error_consistency.checkpoint import (
+    configuration_fingerprint,
+    load_completed_result,
+    load_partial_checkpoint,
+    mark_checkpoint_complete,
+    save_partial_checkpoint,
+)
 from df_analyze.analysis.error_consistency.classification import (
     compute_classification_ec,
 )
@@ -26,6 +41,9 @@ from df_analyze.analysis.error_consistency.diagnostics import (
     classification_sample_diagnostics,
     regression_sample_diagnostics,
 )
+from df_analyze.analysis.error_consistency.provenance import (
+    build_reproducibility_manifest,
+)
 from df_analyze.analysis.error_consistency.regression import (
     compute_regression_ec,
     default_regression_methods,
@@ -34,10 +52,35 @@ from df_analyze.analysis.error_consistency.writer import (
     write_model_outputs,
     write_root_outputs,
 )
+from df_analyze.runtime.hardware import (
+    CUDA_BACKENDS,
+    DeviceIntent,
+    RuntimeComponent,
+    RuntimePolicy,
+    clear_fitted_model_state,
+    device_reason_text,
+    get_runtime,
+    is_cuda_runtime_error,
+    release_accelerator_memory,
+)
 from df_analyze.splitting import OmniKFold
 
 MODEL_SEED_MODES = {"vary", "fixed"}
 MODEL_SEED_ARGUMENTS = ("random_state", "random_seed", "seed")
+TRIAL_FAILURE_COLUMNS = [
+    "target",
+    "model",
+    "selection",
+    "embed_selector",
+    "trial_id",
+    "repetition",
+    "fold",
+    "split_seed",
+    "model_seed",
+    "error_type",
+    "reason",
+    "traceback",
+]
 
 
 def _safe_name(value: object) -> str:
@@ -74,19 +117,21 @@ def detail_output_dir(base_dir: Path, identity: dict[str, str]) -> Path:
 
 
 @contextmanager
-def _preserve_random_state():
+def _preserve_random_state(*, use_torch: bool, use_cuda: bool):
     python_state = random.getstate()
     numpy_state = np.random.get_state()
-    try:
-        import torch
-    except ImportError:
-        torch = None
+    torch = None
+    if use_torch:
+        try:
+            import torch
+        except ImportError:
+            torch = None
     torch_state = None
     cuda_states = None
     if torch is not None:
         try:
             torch_state = torch.random.get_rng_state()
-            if torch.cuda.is_available():
+            if use_cuda and torch.cuda.is_available():
                 cuda_states = torch.cuda.get_rng_state_all()
         except RuntimeError:
             torch_state = None
@@ -139,14 +184,21 @@ def _seed_trial_model(model, tuned_args, model_seed: int) -> tuple[dict, str]:
     seed = _normalize_seed(model_seed)
     random.seed(seed)
     np.random.seed(seed)
-    try:
-        import torch
+    component = getattr(model, "runtime_component", RuntimeComponent.Sklearn)
+    if CUDA_BACKENDS.get(component) == "torch":
+        try:
+            import torch
 
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-    except (ImportError, RuntimeError):
-        pass
+            torch.manual_seed(seed)
+            runtime = getattr(model, "runtime", None)
+            use_cuda = (
+                runtime is not None
+                and runtime.decision_for(component).resolved == "cuda"
+            )
+            if use_cuda and torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+        except (ImportError, RuntimeError):
+            pass
 
     trial_args = dict(tuned_args or {})
     full_args = {
@@ -172,17 +224,11 @@ def _seed_trial_model(model, tuned_args, model_seed: int) -> tuple[dict, str]:
     selected_seed_argument = next(
         iter(existing),
         next(
-            (
-                key
-                for key in MODEL_SEED_ARGUMENTS
-                if key in signature_seed_arguments
-            ),
+            (key for key in MODEL_SEED_ARGUMENTS if key in signature_seed_arguments),
             None,
         ),
     )
-    explicit = (
-        {selected_seed_argument} if selected_seed_argument is not None else set()
-    )
+    explicit = {selected_seed_argument} if selected_seed_argument is not None else set()
     if getattr(model, "shortname", None) == "kan":
         explicit.add("module__seed")
     for key in explicit:
@@ -212,7 +258,12 @@ def _validate_repetition_partition(
             )
 
 
-def _init_model(result, y_train: Series, is_classification: bool):
+def _init_model(
+    result,
+    y_train: Series,
+    is_classification: bool,
+    runtime: RuntimePolicy | None = None,
+):
     from df_analyze.models.base import classification_output_dim
 
     parameters = inspect.signature(result.model_cls).parameters
@@ -225,7 +276,7 @@ def _init_model(result, y_train: Series, is_classification: bool):
     if "model_args" in parameters and model_args:
         kwargs["model_args"] = model_args
     model = result.model_cls(**kwargs)
-    runtime = getattr(result.model, "runtime", None)
+    runtime = runtime or getattr(result.model, "runtime", None)
     if runtime is not None:
         model.set_runtime(runtime)
     return model
@@ -358,9 +409,36 @@ def _enrich_pairwise_trials(
         )
 
 
-def _pair_scope_summary(computation: ECMetricComputation) -> dict[str, float | int]:
+def _pair_scope_summary(
+    computation: ECMetricComputation, trial_design: DataFrame
+) -> dict[str, float | int]:
     pairwise = computation.pairwise
     result: dict[str, float | int] = {}
+    if pairwise.empty or "pair_scope" not in pairwise:
+        successful = trial_design.dropna(subset=["model_index"]).copy()
+        if successful.empty:
+            scoped = DataFrame()
+        else:
+            successful["model_index"] = successful["model_index"].astype(int)
+            successful = successful.sort_values("model_index")
+            repetitions = successful["repetition"].to_numpy()
+            pair_i, pair_j = np.triu_indices(len(successful), k=1)
+            values = np.asarray(computation.matrix)[pair_i, pair_j]
+            finite = np.isfinite(values)
+            scoped = DataFrame(
+                {
+                    "pair_mean": values[finite],
+                    "repetition_i": repetitions[pair_i[finite]],
+                    "repetition_j": repetitions[pair_j[finite]],
+                }
+            )
+            scoped["same_repetition"] = scoped["repetition_i"] == scoped["repetition_j"]
+            scoped["pair_scope"] = np.where(
+                scoped["same_repetition"],
+                "within_repetition",
+                "between_repetition",
+            )
+        pairwise = scoped
     if pairwise.empty or "pair_scope" not in pairwise:
         for scope in ("within_repetition", "between_repetition"):
             result[f"ec_{scope}_mean"] = np.nan
@@ -402,6 +480,92 @@ def _run_one_result(
     options,
     base_dir: Path,
 ) -> ErrorConsistencyResult:
+    X_train = prep_train.model_matrix(result.model_cls, result.selected_cols)
+    X_test = prep_test.model_matrix(result.model_cls, result.selected_cols)
+    base_runtime = getattr(options, "runtime", None)
+    if base_runtime is None:
+        base_runtime = get_runtime(
+            getattr(options, "device", DeviceIntent.CPU)
+        )
+    model_runtime = base_runtime.for_task(
+        len(X_train),
+        X_train.shape[1],
+        n_queries=len(X_test),
+    )
+    component = getattr(
+        result.model_cls, "runtime_component", RuntimeComponent.Sklearn
+    )
+    decision = model_runtime.decision_for(component)
+    print(
+        "[device] Error consistency refits "
+        f"{getattr(result.model, 'shortname', result.model_cls.__name__)} / "
+        f"{result.selection}: {decision.resolved.upper()} "
+        f"({len(X_train)} rows x {X_train.shape[1]} features; "
+        f"{device_reason_text(decision)})"
+    )
+    try:
+        return _run_one_result_attempt(
+            prep_train,
+            prep_test,
+            eval_results,
+            result,
+            options,
+            base_dir,
+            model_runtime=model_runtime,
+            allow_resume=True,
+        )
+    except Exception as error:
+        cuda_failure = (
+            decision.resolved == "cuda" and is_cuda_runtime_error(error)
+        )
+        if (
+            model_runtime.intent is DeviceIntent.Auto
+            and cuda_failure
+        ):
+            reason = f"cuda_runtime_fallback:{type(error).__name__}"
+            model_runtime.record_cpu_fallback(component, reason)
+            model_runtime.record_cpu_fallback(
+                RuntimeComponent.ErrorConsistency, reason
+            )
+            release_accelerator_memory()
+            warn(
+                "Error consistency encountered a CUDA runtime failure while "
+                f"refitting {getattr(result.model, 'shortname', 'a model')}. "
+                "Restarting this complete model/selection configuration on CPU "
+                "once."
+            )
+            return _run_one_result_attempt(
+                prep_train,
+                prep_test,
+                eval_results,
+                result,
+                options,
+                base_dir,
+                model_runtime=model_runtime,
+                allow_resume=False,
+            )
+        if (
+            model_runtime.intent is DeviceIntent.CUDA
+            and cuda_failure
+        ):
+            raise RuntimeError(
+                "Error consistency failed while refitting a CUDA-capable model "
+                "under strict --device cuda. CPU fallback is disabled."
+            ) from error
+        raise
+
+
+def _run_one_result_attempt(
+    prep_train,
+    prep_test,
+    eval_results,
+    result,
+    options,
+    base_dir: Path,
+    *,
+    model_runtime: RuntimePolicy,
+    allow_resume: bool,
+) -> ErrorConsistencyResult:
     if not np.isfinite(float(result.score)):
         raise RuntimeError("The tuned configuration did not produce a finite score.")
     if not isinstance(prep_train.y, Series) or not isinstance(prep_test.y, Series):
@@ -420,13 +584,88 @@ def _run_one_result(
             f"Error-consistency folds ({n_folds}) exceed training rows ({len(X_train)})."
         )
 
-    predictions = []
-    design_rows = []
-    assignment_rows = []
-    score_rows = []
+    output_detail = str(getattr(options, "ec_output_detail", "full")).lower()
+    detail_dir = detail_output_dir(base_dir, identity)
     tuned_args = getattr(result.model, "tuned_args", None) or result.params
+    fingerprint, fingerprint_payload = configuration_fingerprint(
+        identity=identity,
+        options=options,
+        X_train=X_train,
+        y_train=y_train,
+        X_holdout=X_test,
+        y_holdout=y_test,
+        is_classification=eval_results.is_classification,
+        model_class=result.model_cls,
+        tuned_parameters=tuned_args,
+    )
+    resume = allow_resume and bool(getattr(options, "ec_resume", False))
+    if resume:
+        completed_result = load_completed_result(detail_dir, fingerprint=fingerprint)
+        if completed_result is not None:
+            return completed_result
+        partial = load_partial_checkpoint(detail_dir, fingerprint=fingerprint)
+    else:
+        partial = None
+
+    if partial is None:
+        predictions: list[np.ndarray] = []
+        design_rows: list[dict] = []
+        assignment_rows: list[dict] = []
+        score_rows: list[dict] = []
+        failure_rows: list[dict] = []
+        start_repetition = 0
+    else:
+        predictions = [row.copy() for row in np.asarray(partial.predictions)]
+        design_rows = partial.trial_design.to_dict("records")
+        assignment_rows = partial.fold_assignments.to_dict("records")
+        score_rows = partial.trial_scores.to_dict("records")
+        failure_rows = partial.trial_failures.to_dict("records")
+        start_repetition = int(partial.completed_repetitions)
+        if start_repetition > repetitions:
+            raise RuntimeError(
+                "EC checkpoint contains more repetitions than the requested run."
+            )
+
+    n_requested_models = n_folds * repetitions
+    n_requested_pairs = n_requested_models * (n_requested_models - 1) // 2
+    n_methods = (
+        1
+        if eval_results.is_classification
+        else len(getattr(options, "ec_methods", None) or default_regression_methods())
+    )
+    if n_requested_models >= 100:
+        warn(
+            "This EC configuration requires "
+            f"{n_requested_models} additional model refits before pairwise EC "
+            "calculation. --ec-output-detail summary reduces retained artifacts "
+            "but does not reduce refit time. Start with fewer repetitions when "
+            "estimating runtime."
+        )
+    if n_requested_pairs >= 100_000 and output_detail == "full":
+        warn(
+            "This EC run requests "
+            f"{n_requested_models} models and {n_requested_pairs:,} model pairs "
+            f"for each of {n_methods} method(s). Consider "
+            "--ec-output-detail summary or pairwise if full sample-level output "
+            "is not required."
+        )
+
     model_seed_mode = str(getattr(options, "ec_model_seed_mode", "vary")).lower()
-    for repetition in range(repetitions):
+    checkpoint_every = int(getattr(options, "ec_checkpoint_every", 5))
+    if partial is None:
+        save_partial_checkpoint(
+            detail_dir,
+            fingerprint=fingerprint,
+            fingerprint_payload=fingerprint_payload,
+            completed_repetitions=0,
+            predictions=np.empty((0, len(y_test))),
+            trial_design=DataFrame(),
+            fold_assignments=DataFrame(),
+            trial_scores=DataFrame(),
+            trial_failures=DataFrame(columns=TRIAL_FAILURE_COLUMNS),
+        )
+
+    for repetition in range(start_repetition, repetitions):
         repetition_seed = _normalize_seed(int(options.seed) + repetition)
         splitter = OmniKFold(
             n_splits=n_folds,
@@ -447,18 +686,34 @@ def _run_one_result(
         _validate_repetition_partition(splits, len(X_train))
         partition_signature = _partition_signature(splits)
         for fold, (idx_train, idx_validation) in enumerate(splits):
-            model_index = len(predictions)
-            model = _init_model(result, y_train, eval_results.is_classification)
+            trial_id = repetition * n_folds + fold
+            candidate_model_index = len(predictions)
             model_seed = _trial_model_seed(
                 int(options.seed), repetition, fold, model_seed_mode
-            )
-            trial_tuned_args, seeded_parameters = _seed_trial_model(
-                model, tuned_args, model_seed
             )
             X_fold = X_train.iloc[idx_train]
             y_fold = y_train.iloc[idx_train]
             g_fold = None if groups is None else groups.iloc[idx_train]
+            group_overlap = np.nan
+            if groups is not None:
+                train_groups = set(groups.iloc[idx_train].astype(str))
+                validation_groups = set(groups.iloc[idx_validation].astype(str))
+                group_overlap = len(train_groups.intersection(validation_groups))
+
+            model = None
+            success = False
+            seeded_parameters = "not_initialized"
+            failure_reason = ""
             try:
+                model = _init_model(
+                    result,
+                    y_train,
+                    eval_results.is_classification,
+                    runtime=model_runtime,
+                )
+                trial_tuned_args, seeded_parameters = _seed_trial_model(
+                    model, tuned_args, model_seed
+                )
                 model.refit_tuned(X_fold, y_fold, g=g_fold, tuned_args=trial_tuned_args)
                 pred = _prediction_vector(
                     model.tuned_predict(X_test), X_test.index, len(X_test)
@@ -471,13 +726,15 @@ def _run_one_result(
                         "Regression EC received non-finite holdout predictions."
                     )
                 predictions.append(pred)
+                success = True
                 for metric, score in _score_trial(
                     model, X_test, y_test, pred, result.metric
                 ).items():
                     score_rows.append(
                         {
                             **identity,
-                            "model_index": model_index,
+                            "trial_id": trial_id,
+                            "model_index": candidate_model_index,
                             "repetition": repetition,
                             "fold": fold,
                             "model_seed": model_seed,
@@ -485,20 +742,55 @@ def _run_one_result(
                             "score": score,
                         }
                     )
+            except Exception as error:
+                if (
+                    model_runtime.decision_for(
+                        getattr(
+                            result.model_cls,
+                            "runtime_component",
+                            RuntimeComponent.Sklearn,
+                        )
+                    ).resolved
+                    == "cuda"
+                    and is_cuda_runtime_error(error)
+                ):
+                    raise
+                failure_reason = str(error)
+                failure_rows.append(
+                    {
+                        **identity,
+                        "trial_id": trial_id,
+                        "repetition": repetition,
+                        "fold": fold,
+                        "split_seed": repetition_seed,
+                        "model_seed": model_seed,
+                        "error_type": type(error).__name__,
+                        "reason": failure_reason,
+                        "traceback": traceback.format_exc(),
+                    }
+                )
+                warn(
+                    "Error-consistency trial failed and was recorded: "
+                    f"{identity['model']}/{identity['selection']} repetition "
+                    f"{repetition}, fold {fold}: {error}"
+                )
             finally:
-                model.tuned_model = None
-                model.model = None
-                model._cleanup_after_fold()
-                del model
+                if model is not None:
+                    try:
+                        clear_fitted_model_state(model)
+                        model._cleanup_after_fold()
+                    except Exception as cleanup_error:
+                        warn(
+                            "EC fold cleanup failed after trial completion: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                    del model
 
-            group_overlap = np.nan
-            if groups is not None:
-                train_groups = set(groups.iloc[idx_train].astype(str))
-                validation_groups = set(groups.iloc[idx_validation].astype(str))
-                group_overlap = len(train_groups.intersection(validation_groups))
+            model_index = candidate_model_index if success else np.nan
             design_rows.append(
                 {
                     **identity,
+                    "trial_id": trial_id,
                     "model_index": model_index,
                     "repetition": repetition,
                     "fold": fold,
@@ -512,12 +804,15 @@ def _run_one_result(
                     "n_validation": len(idx_validation),
                     "split_fallback": split_fallback,
                     "group_overlap": group_overlap,
+                    "status": "success" if success else "failed",
+                    "failure_reason": failure_reason,
                 }
             )
             for train_position in np.asarray(idx_validation, dtype=int):
                 assignment_rows.append(
                     {
                         **identity,
+                        "trial_id": trial_id,
                         "repetition": repetition,
                         "fold": fold,
                         "model_index": model_index,
@@ -525,16 +820,43 @@ def _run_one_result(
                         "partition_signature": partition_signature,
                         "train_position": int(train_position),
                         "row_id": X_train.index[train_position],
+                        "trial_status": "success" if success else "failed",
                         "group": (
                             np.nan if groups is None else groups.iloc[train_position]
                         ),
                     }
                 )
 
+        completed_repetitions = repetition + 1
+        if (
+            completed_repetitions % checkpoint_every == 0
+            or completed_repetitions == repetitions
+        ):
+            save_partial_checkpoint(
+                detail_dir,
+                fingerprint=fingerprint,
+                fingerprint_payload=fingerprint_payload,
+                completed_repetitions=completed_repetitions,
+                predictions=(
+                    np.vstack(predictions) if predictions else np.empty((0, len(y_test)))
+                ),
+                trial_design=DataFrame(design_rows),
+                fold_assignments=DataFrame(assignment_rows),
+                trial_scores=DataFrame(score_rows),
+                trial_failures=DataFrame(failure_rows, columns=TRIAL_FAILURE_COLUMNS),
+            )
+
+    if len(predictions) < 2:
+        raise RuntimeError(
+            "Error consistency requires at least two successful refit trials; "
+            f"{len(predictions)} succeeded and {len(failure_rows)} failed."
+        )
+
     prediction_matrix = np.vstack(predictions)
     trial_design = DataFrame(design_rows)
     fold_assignments = DataFrame(assignment_rows)
     trial_scores = DataFrame(score_rows)
+    trial_failures = DataFrame(failure_rows, columns=TRIAL_FAILURE_COLUMNS)
     n_unique_partitions = int(trial_design["partition_signature"].nunique())
     if n_unique_partitions < repetitions:
         warn(
@@ -543,7 +865,18 @@ def _run_one_result(
             f"{repetitions} repetitions. This can occur when the number of "
             "possible partitions is small."
         )
-    backend = resolve_ec_backend(options, prediction_matrix.shape[0], len(y_test))
+    backend = resolve_ec_backend(
+        options,
+        prediction_matrix.shape[0],
+        len(y_test),
+        runtime=model_runtime,
+    )
+    backend_device = "CUDA" if backend.resolved == "torch_cuda" else "CPU"
+    print(
+        "[device] Error consistency pairwise calculation "
+        f"{identity['model']} / {identity['selection']}: {backend_device} "
+        f"({backend.reason})"
+    )
     if eval_results.is_classification:
         computations = [
             compute_classification_ec(
@@ -551,11 +884,16 @@ def _run_one_result(
                 y_test.to_numpy(),
                 empty_unions=options.ec_empty_unions,
                 backend=backend,
+                output_detail=output_detail,
             )
         ]
         error_matrix = prediction_matrix != y_test.to_numpy()[None, :]
-        diagnostics = classification_sample_diagnostics(
-            error_matrix, row_ids=X_test.index, groups=prep_test.groups
+        diagnostics = (
+            classification_sample_diagnostics(
+                error_matrix, row_ids=X_test.index, groups=prep_test.groups
+            )
+            if output_detail == "full"
+            else {}
         )
         residual_or_error = error_matrix
         problem_type = "classification"
@@ -567,12 +905,17 @@ def _run_one_result(
             epsilon=float(options.ec_epsilon),
             backend=backend,
             row_ids=X_test.index,
+            output_detail=output_detail,
         )
         residual_or_error = (
             prediction_matrix.astype(float) - y_test.to_numpy(dtype=float)[None, :]
         )
-        diagnostics = regression_sample_diagnostics(
-            residual_or_error, row_ids=X_test.index, groups=prep_test.groups
+        diagnostics = (
+            regression_sample_diagnostics(
+                residual_or_error, row_ids=X_test.index, groups=prep_test.groups
+            )
+            if output_detail == "full"
+            else {}
         )
         problem_type = "regression"
 
@@ -583,6 +926,8 @@ def _run_one_result(
             **identity,
             "problem_type": problem_type,
             "n_ec_models": prediction_matrix.shape[0],
+            "n_requested_ec_models": n_requested_models,
+            "n_failed_trials": len(trial_failures),
             "n_folds": n_folds,
             "n_repetitions": repetitions,
             "n_unique_partitions": n_unique_partitions,
@@ -591,7 +936,7 @@ def _run_one_result(
             "model_seed_mode": model_seed_mode,
         }
         row.update(computation.summary())
-        row.update(_pair_scope_summary(computation))
+        row.update(_pair_scope_summary(computation, trial_design))
         summary_rows.append(row)
 
     performance = _performance_summary(trial_scores, eval_results.df, result, identity)
@@ -601,19 +946,16 @@ def _run_one_result(
     if save_predictions:
         columns = [f"model_{idx:03d}" for idx in range(prediction_matrix.shape[0])]
         prediction_df = DataFrame(prediction_matrix.T, columns=columns)
+        prediction_df.insert(0, "y_true", y_test.to_numpy())
+        prediction_df.insert(0, "holdout_position", np.arange(len(y_test)))
         prediction_df.insert(0, "row_id", X_test.index)
         residual_df = DataFrame(residual_or_error.T, columns=columns)
+        residual_df.insert(0, "y_true", y_test.to_numpy())
+        residual_df.insert(0, "holdout_position", np.arange(len(y_test)))
         residual_df.insert(0, "row_id", X_test.index)
-    write_model_outputs(
-        detail_output_dir(base_dir, identity),
-        computations,
-        trial_design,
-        fold_assignments,
-        trial_scores,
-        diagnostics,
-        predictions=prediction_df,
-        residuals_or_errors=residual_df,
-    )
+        if prep_test.groups is not None:
+            prediction_df.insert(3, "group", prep_test.groups.to_numpy())
+            residual_df.insert(3, "group", prep_test.groups.to_numpy())
 
     methods = [computation.info.name for computation in computations]
     requested_backend = backend.as_metadata()
@@ -625,18 +967,49 @@ def _run_one_result(
         }
         if actual not in actual_backends:
             actual_backends.append(actual)
+    result_metadata = {
+        "target": identity["target"],
+        "ec_methods": methods,
+        "ec_backends": actual_backends,
+        "model_seed_mode": model_seed_mode,
+        "holdout_role": str(getattr(options, "ec_holdout_role", "validation")).lower(),
+        "output_detail": output_detail,
+        "checkpoint_fingerprint": fingerprint,
+        "resumed_from_partial_checkpoint": partial is not None,
+        "n_requested_models": n_requested_models,
+        "n_successful_trials": len(predictions),
+        "n_failed_trials": len(trial_failures),
+    }
+    result_summary = DataFrame(summary_rows)
+    write_model_outputs(
+        detail_dir,
+        computations,
+        trial_design,
+        fold_assignments,
+        trial_scores,
+        diagnostics,
+        predictions=prediction_df,
+        residuals_or_errors=residual_df,
+        output_detail=output_detail,
+        summary=result_summary,
+        performance=performance,
+        trial_failures=trial_failures,
+        metadata=result_metadata,
+    )
+    mark_checkpoint_complete(
+        detail_dir,
+        fingerprint=fingerprint,
+        fingerprint_payload=fingerprint_payload,
+        completed_repetitions=repetitions,
+    )
     return ErrorConsistencyResult(
-        summary=DataFrame(summary_rows),
+        summary=result_summary,
         performance=performance,
         trial_scores=trial_scores,
         trial_design=trial_design,
         fold_assignments=fold_assignments,
-        metadata={
-            "target": identity["target"],
-            "ec_methods": methods,
-            "ec_backends": actual_backends,
-            "model_seed_mode": model_seed_mode,
-        },
+        trial_failures=trial_failures,
+        metadata=result_metadata,
     )
 
 
@@ -675,48 +1048,77 @@ def combine_error_consistency_results(
             selected = getattr(options, "ec_methods", None)
             methods = default_regression_methods() if selected is None else list(selected)
     is_classification = "classification_iou" in methods
+    holdout_role = str(getattr(options, "ec_holdout_role", "validation")).lower()
+    n_resumed_complete = sum(
+        bool(result.metadata.get("resumed_from_complete_checkpoint", False))
+        for result in results
+    )
+    n_resumed_partial = sum(
+        bool(result.metadata.get("resumed_from_partial_checkpoint", False))
+        for result in results
+    )
 
+    trial_failures = combine("trial_failures")
+    if trial_failures.empty:
+        trial_failures = DataFrame(columns=TRIAL_FAILURE_COLUMNS)
+    metadata = {
+        "n_configurations": len(results),
+        "targets": targets,
+        "ec_methods": methods,
+        "ec_backends": backends,
+        "skipped_configurations": all_skipped,
+        "n_folds": getattr(options, "ec_folds", None),
+        "n_repetitions": getattr(options, "ec_repetitions", None),
+        "model_seed_mode": getattr(options, "ec_model_seed_mode", "vary"),
+        "holdout_role": holdout_role,
+        "selection_outputs_enabled": holdout_role == "validation",
+        "ec_profile": getattr(options, "ec_profile", "none"),
+        "ec_profile_scope": getattr(options, "ec_profile_scope", "df-analyze defaults"),
+        "ec_profile_overrides": getattr(options, "ec_profile_overrides", {}),
+        "ec_output_detail": getattr(options, "ec_output_detail", "full"),
+        "ec_resume": bool(getattr(options, "ec_resume", False)),
+        "ec_checkpoint_every": getattr(options, "ec_checkpoint_every", 5),
+        "n_resumed_complete_configurations": n_resumed_complete,
+        "n_resumed_partial_configurations": n_resumed_partial,
+        "ec_recurrence_threshold": getattr(options, "ec_recurrence_threshold", 0.5),
+        "skipped_targets": [
+            item for item in all_skipped if item.get("scope") == "target"
+        ],
+        "scientific_scope": (
+            "EC compares repeated K-fold fits on one shared external holdout. "
+            "Preprocessing, feature selection, and tuning stay fixed. A final-test "
+            "holdout must not be used for model selection."
+        ),
+        "randomness_scope": (
+            "Split seeds change by repetition. Model seeds change by repetition "
+            "and fold when model_seed_mode='vary', and stay fixed when it is 'fixed'."
+        ),
+        "dispersion_note": (
+            "EC standard deviations describe variation in this run. They are not "
+            "standard errors or confidence intervals."
+        ),
+        "method_evidence_scope": (
+            "Classification EC follows Equation 1 of Levman et al. (2023), "
+            "doi:10.3390/diagnostics13071315."
+            if is_classification
+            else "Regression EC methods compare residuals across repeated fits. "
+            "They are descriptive measures, not confidence intervals or tests."
+        ),
+    }
+    if options is not None:
+        metadata["reproducibility_manifest"] = build_reproducibility_manifest(
+            options,
+            metadata=metadata,
+            trial_failures=len(trial_failures),
+        )
     return ErrorConsistencyResult(
         summary=combine("summary"),
         performance=combine("performance"),
         trial_scores=combine("trial_scores"),
         trial_design=combine("trial_design"),
         fold_assignments=combine("fold_assignments"),
-        metadata={
-            "n_configurations": len(results),
-            "targets": targets,
-            "ec_methods": methods,
-            "ec_backends": backends,
-            "skipped_configurations": all_skipped,
-            "n_folds": getattr(options, "ec_folds", None),
-            "n_repetitions": getattr(options, "ec_repetitions", None),
-            "model_seed_mode": getattr(options, "ec_model_seed_mode", "vary"),
-            "ec_recurrence_threshold": getattr(options, "ec_recurrence_threshold", 0.5),
-            "skipped_targets": [
-                item for item in all_skipped if item.get("scope") == "target"
-            ],
-            "scientific_scope": (
-                "Post-selection refit stability on a common external holdout; "
-                "preprocessing, feature selection, and tuning are fixed before EC."
-            ),
-            "randomness_scope": (
-                "Split seeds vary by repetition. Model RNG seeds vary deterministically "
-                "by repetition/fold when model_seed_mode='vary', and remain fixed when "
-                "model_seed_mode='fixed'."
-            ),
-            "dispersion_note": (
-                "EC standard deviations are descriptive dispersions, not standard "
-                "errors or confidence intervals."
-            ),
-            "method_evidence_scope": (
-                "Classification error IoU follows Equation 1 of Levman et al. "
-                "(2023), doi:10.3390/diagnostics13071315."
-                if is_classification
-                else "Regression residual-consistency methods are experimental "
-                "descriptive diagnostics and are not established inferential "
-                "statistics."
-            ),
-        },
+        trial_failures=trial_failures,
+        metadata=metadata,
     )
 
 
@@ -738,6 +1140,14 @@ def _run_error_consistency_analysis(
             "An output directory is required for error consistency analysis."
         )
     base_dir.mkdir(parents=True, exist_ok=True)
+    holdout_role = str(getattr(options, "ec_holdout_role", "validation")).lower()
+    if holdout_role == "test":
+        warn(
+            "Error consistency is using a holdout declared as final test data. "
+            "EC values will be reported, but model-ranking and EC/performance "
+            "correlation outputs are disabled. Use --ec-holdout-role validation "
+            "only with a separate validation or audit holdout."
+        )
 
     outputs = []
     skipped = []
@@ -755,6 +1165,13 @@ def _run_error_consistency_analysis(
                 )
             )
         except Exception as error:
+            runtime = getattr(options, "runtime", None)
+            if (
+                runtime is not None
+                and runtime.intent is DeviceIntent.CUDA
+                and is_cuda_runtime_error(error)
+            ):
+                raise
             skipped.append({**identity, "reason": str(error)})
             warn(
                 "Skipping error-consistency configuration "
@@ -783,7 +1200,43 @@ def run_error_consistency_analysis(
     base_dir: Optional[Path] = None,
     write_root: bool = True,
 ) -> ErrorConsistencyResult:
-    with _preserve_random_state():
+    results = getattr(eval_results, "results", [])
+    torch_components = [
+        getattr(result.model_cls, "runtime_component", RuntimeComponent.Sklearn)
+        for result in results
+    ]
+    use_torch = any(
+        CUDA_BACKENDS.get(component) == "torch"
+        for component in torch_components
+    )
+    runtime = getattr(options, "runtime", None)
+    intent = getattr(runtime, "intent", getattr(options, "device", DeviceIntent.CPU))
+    if not isinstance(intent, DeviceIntent):
+        intent = DeviceIntent.from_arg(intent)
+    use_cuda = False
+    if use_torch:
+        base_runtime = runtime or get_runtime(intent)
+        for result, component in zip(results, torch_components):
+            if CUDA_BACKENDS.get(component) != "torch":
+                continue
+            X_train = prep_train.model_matrix(
+                result.model_cls, result.selected_cols
+            )
+            X_test = prep_test.model_matrix(
+                result.model_cls, result.selected_cols
+            )
+            task_runtime = base_runtime.for_task(
+                len(X_train),
+                X_train.shape[1],
+                n_queries=len(X_test),
+            )
+            if task_runtime.decision_for(component).resolved == "cuda":
+                use_cuda = True
+                break
+    with _preserve_random_state(
+        use_torch=use_torch,
+        use_cuda=use_cuda,
+    ):
         return _run_error_consistency_analysis(
             prep_train=prep_train,
             prep_test=prep_test,

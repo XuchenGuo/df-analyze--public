@@ -18,7 +18,9 @@ from sklearn.random_projection import SparseRandomProjection
 from df_analyze._constants import (
     DIRECT_DOWNSAMPLE_MAX_FEATURES,
     DOWNSAMPLE_CHUNK_SIZE_DEFAULT,
+    DOWNSAMPLE_DENSE_PEAK_FACTOR,
     DOWNSAMPLE_MAX_CHUNK_BYTES,
+    DOWNSAMPLE_MAX_DENSE_BYTES,
     DOWNSAMPLE_SCORE_LIMIT,
     LARGE_FEATURE_THRESHOLD,
     N_FEAT_DOWNSAMPLE_DEFAULT,
@@ -36,6 +38,11 @@ from df_analyze.downsampling.chunked import (
     chunked_variance_scores,
 )
 from df_analyze.downsampling.containers import FeatureDownsampleResult
+from df_analyze.downsampling.ranking import (
+    descending_rank_percentiles,
+    fractional_top_k_votes,
+    top_k_indices,
+)
 from df_analyze.downsampling.screening import (
     resolve_screening_split,
 )
@@ -47,6 +54,7 @@ INDEXED_SAFE_METHODS = {
     FeatureDownsampleMethod.Auto,
     FeatureDownsampleMethod.Random,
     FeatureDownsampleMethod.Variance,
+    FeatureDownsampleMethod.NormalizedVariance,
     FeatureDownsampleMethod.FTest,
     FeatureDownsampleMethod.RankEnsemble,
     FeatureDownsampleMethod.SelectorEnsemble,
@@ -81,26 +89,24 @@ def _target_columns(y: Series | DataFrame) -> list[Series]:
 
 
 def _rank_indices(
-    scores: NDArray[np.float64], n_select: int, threshold: Optional[float] = None
+    scores: NDArray[np.float64],
+    n_select: int,
+    threshold: Optional[float] = None,
+    *,
+    seed: int = SEED,
+    tie_keys: Optional[Sequence[str]] = None,
 ) -> NDArray[np.int_]:
-    scores = np.asarray(scores, dtype=np.float64)
-    usable = ~np.isnan(scores) & ~np.isneginf(scores)
-    if threshold is not None:
-        usable &= scores >= threshold
-    indices = np.flatnonzero(usable)
-    if len(indices) == 0:
-        return np.array([], dtype=int)
-    order = np.lexsort((indices, -scores[indices]))
-    return indices[order[:n_select]]
+    return top_k_indices(
+        scores,
+        n_select,
+        threshold,
+        seed=seed,
+        tie_keys=tie_keys,
+    )
 
 
 def _rank_score(scores: NDArray[np.float64]) -> NDArray[np.float64]:
-    ranked = _rank_indices(scores, len(scores))
-    if len(ranked) == 0:
-        return np.full(len(scores), np.nan, dtype=np.float64)
-    result = np.zeros(len(scores), dtype=np.float64)
-    result[ranked] = (len(ranked) - np.arange(len(ranked))) / max(1, len(ranked))
-    return result
+    return descending_rank_percentiles(scores)
 
 
 def _effective_chunk_size(X: Any, requested: int) -> int:
@@ -112,6 +118,10 @@ def _effective_chunk_size(X: Any, requested: int) -> int:
         max_chunk_bytes=DOWNSAMPLE_MAX_CHUNK_BYTES,
         requested=requested,
     )
+
+
+def _direct_peak_bytes(n_rows: int, n_features: int) -> int:
+    return n_rows * n_features * 8 * DOWNSAMPLE_DENSE_PEAK_FACTOR
 
 
 def resolve_feature_downsample_method(
@@ -128,12 +138,15 @@ def resolve_feature_downsample_method(
     if method is not FeatureDownsampleMethod.Auto:
         return method
     if y is None or n_samples < 2:
-        return FeatureDownsampleMethod.Variance
+        return FeatureDownsampleMethod.NormalizedVariance
     targets = _target_columns(y)
     if any(target.nunique(dropna=True) < 2 for target in targets):
-        return FeatureDownsampleMethod.Variance
+        return FeatureDownsampleMethod.NormalizedVariance
     if n_features >= LARGE_FEATURE_THRESHOLD or n_features / max(n_samples, 1) >= 1_000:
-        return FeatureDownsampleMethod.RankEnsemble
+        # At extreme p/n, a single-sample ranking is especially unstable.
+        # Repeated supervised subsampling is a more defensible automatic choice
+        # than giving an arbitrary equal vote to an untargeted variance rank.
+        return FeatureDownsampleMethod.StableRank
     return FeatureDownsampleMethod.FTest
 
 
@@ -151,18 +164,19 @@ def _auto_reason(
             "auto resolved to none because the requested feature count is greater "
             "than or equal to the input feature count."
         )
-    if resolved is FeatureDownsampleMethod.Variance:
+    if resolved is FeatureDownsampleMethod.NormalizedVariance:
         return (
-            "auto resolved to variance because no target was available or the "
-            "target could not support valid supervised screening."
+            "auto resolved to normalized-variance because no target was available "
+            "or the target could not support valid supervised screening."
         )
-    if resolved is FeatureDownsampleMethod.RankEnsemble:
+    if resolved is FeatureDownsampleMethod.StableRank:
         ratio = n_features / max(n_samples, 1)
         return (
-            "auto resolved to rank-ensemble because the feature space is large "
-            f"relative to the sample size (p/n={ratio:0.1f}); combining "
-            "range-normalized variance and F-test ranks is more robust than "
-            "relying on raw F scores alone."
+            "auto resolved to stable-rank because the feature space is large "
+            f"relative to the sample size (p/n={ratio:0.1f}); repeated "
+            "subsample F-test rankings reduce sensitivity to one screening "
+            "sample without mixing the supervised effect score with an "
+            "untargeted variance heuristic."
         )
     return (
         "auto resolved to f-test because an informative target was available and "
@@ -176,10 +190,17 @@ def _result_strategy(
     n_features: int,
     full_ensemble: bool = False,
     ensemble_members: Optional[Sequence[str]] = None,
+    large_feature_mode: bool = False,
 ) -> dict[str, Any]:
     aggregation = (
         "not_targeted"
-        if resolved in {FeatureDownsampleMethod.None_, FeatureDownsampleMethod.Random, FeatureDownsampleMethod.Variance}
+        if resolved
+        in {
+            FeatureDownsampleMethod.None_,
+            FeatureDownsampleMethod.Random,
+            FeatureDownsampleMethod.Variance,
+            FeatureDownsampleMethod.NormalizedVariance,
+        }
         else (
             "mean_rank_percentile_across_targets"
             if isinstance(y, DataFrame) and y.shape[1] > 1
@@ -188,7 +209,7 @@ def _result_strategy(
     )
     details: dict[str, Any] = {
         "score_aggregation": aggregation,
-        "large_feature_mode": n_features >= LARGE_FEATURE_THRESHOLD,
+        "large_feature_mode": large_feature_mode,
     }
     if resolved is FeatureDownsampleMethod.RankEnsemble:
         details.update(
@@ -196,7 +217,13 @@ def _result_strategy(
             ensemble_members=(
                 list(ensemble_members)
                 if ensemble_members is not None
-                else ["range-normalized-variance", "f-test", "mutual-info", "linear", "lgbm"]
+                else [
+                    "range-normalized-variance",
+                    "f-test",
+                    "mutual-info",
+                    "linear",
+                    "lgbm",
+                ]
                 if full_ensemble
                 else ["range-normalized-variance", "f-test"]
             ),
@@ -207,7 +234,13 @@ def _result_strategy(
             ensemble_members=(
                 list(ensemble_members)
                 if ensemble_members is not None
-                else ["range-normalized-variance", "f-test", "mutual-info", "linear", "lgbm"]
+                else [
+                    "range-normalized-variance",
+                    "f-test",
+                    "mutual-info",
+                    "linear",
+                    "lgbm",
+                ]
                 if full_ensemble
                 else ["range-normalized-variance", "f-test"]
             ),
@@ -215,7 +248,7 @@ def _result_strategy(
     elif resolved is FeatureDownsampleMethod.StableRank:
         details.update(
             strategy="selection_frequency_then_mean_rank",
-            ensemble_members=["f-test", "variance-fallback"],
+            ensemble_members=["f-test"],
             stability_repeats=(
                 STABLE_RANK_LARGE_REPEATS
                 if n_features >= LARGE_FEATURE_THRESHOLD
@@ -234,16 +267,23 @@ def _ensemble_scores(
     row_indices: Optional[NDArray[np.int_]],
     selector: bool,
     n_select: int,
+    seed: int,
+    allow_direct_members: bool,
 ) -> tuple[NDArray[np.float64], list[str]]:
-    variance = chunked_range_normalized_variance_scores(
-        X, chunk_size, row_indices
-    )
-    f_scores = chunked_f_test_scores(
-        X, y, is_classification, chunk_size, row_indices
-    )
+    variance = chunked_range_normalized_variance_scores(X, chunk_size, row_indices)
+    f_scores = chunked_f_test_scores(X, y, is_classification, chunk_size, row_indices)
     member_scores = [variance, f_scores]
     member_names = ["range-normalized-variance", "f-test"]
-    if isinstance(X, DataFrame) and X.shape[1] <= DIRECT_DOWNSAMPLE_MAX_FEATURES:
+    direct_rows = X.shape[0] if row_indices is None else len(row_indices)
+    direct_within_budget = (
+        _direct_peak_bytes(direct_rows, X.shape[1]) <= DOWNSAMPLE_MAX_DENSE_BYTES
+    )
+    if (
+        allow_direct_members
+        and isinstance(X, DataFrame)
+        and X.shape[1] <= DIRECT_DOWNSAMPLE_MAX_FEATURES
+        and direct_within_budget
+    ):
         X_direct = X if row_indices is None else X.iloc[row_indices]
         for method in (
             FeatureDownsampleMethod.MutualInfo,
@@ -252,7 +292,7 @@ def _ensemble_scores(
         ):
             try:
                 scores = _aggregate_direct_scores(
-                    X_direct, y, is_classification, method
+                    X_direct, y, is_classification, method, seed
                 )
                 member_scores.append(scores)
                 member_names.append(method.value)
@@ -262,13 +302,20 @@ def _ensemble_scores(
                     f"it could not produce scores: {error}"
                 )
     ranked_members = [_rank_score(scores) for scores in member_scores]
-    mean_rank = np.nanmean(np.vstack(ranked_members), axis=0)
+    ranked = np.vstack(ranked_members)
+    counts = np.sum(~np.isnan(ranked), axis=0)
+    mean_rank = np.divide(
+        np.nansum(ranked, axis=0),
+        counts,
+        out=np.full(ranked.shape[1], np.nan, dtype=np.float64),
+        where=counts > 0,
+    )
     if not selector:
         return mean_rank, member_names
     top = max(n_select, min(len(variance), n_select * 3))
     votes = np.zeros(len(variance), dtype=np.float64)
     for scores in member_scores:
-        votes[_rank_indices(scores, top)] += 1.0
+        votes += fractional_top_k_votes(scores, top)
     return votes + mean_rank / 10.0, member_names
 
 
@@ -279,9 +326,11 @@ def _stable_rank_scores(
     chunk_size: int,
     row_indices: NDArray[np.int_],
     n_select: int,
+    seed: int,
 ) -> NDArray[np.float64]:
-    rng = np.random.default_rng(SEED)
-    rank_sums = np.zeros(X.shape[1], dtype=np.float64)
+    rng = np.random.default_rng(seed)
+    rank_quality_sums = np.zeros(X.shape[1], dtype=np.float64)
+    rank_quality_counts = np.zeros(X.shape[1], dtype=np.int_)
     frequency = np.zeros(X.shape[1], dtype=np.float64)
     repeats = (
         STABLE_RANK_LARGE_REPEATS
@@ -303,19 +352,23 @@ def _stable_rank_scores(
         scores = chunked_f_test_scores(
             X, sampled_y, is_classification, chunk_size, sampled_rows
         )
-        ranked = _rank_indices(scores, len(scores))
-        if len(ranked) == 0:
+        rank_quality = descending_rank_percentiles(scores)
+        valid = ~np.isnan(rank_quality)
+        if not valid.any():
             continue
-        ranks = np.full(X.shape[1], X.shape[1] + 1.0, dtype=np.float64)
-        ranks[ranked] = np.arange(1, len(ranked) + 1, dtype=np.float64)
-        rank_sums += ranks
-        frequency[_rank_indices(scores, n_select)] += 1.0
+        rank_quality_sums[valid] += rank_quality[valid]
+        rank_quality_counts[valid] += 1
+        frequency += fractional_top_k_votes(scores, n_select)
         completed += 1
     if completed == 0:
         return np.full(X.shape[1], np.nan, dtype=np.float64)
-    mean_rank = rank_sums / completed
-    rank_quality = (X.shape[1] - mean_rank + 1.0) / max(X.shape[1], 1)
-    return frequency * (X.shape[1] + 1.0) + rank_quality
+    mean_quality = np.divide(
+        rank_quality_sums,
+        rank_quality_counts,
+        out=np.full(X.shape[1], np.nan, dtype=np.float64),
+        where=rank_quality_counts > 0,
+    )
+    return frequency * (X.shape[1] + 1.0) + mean_quality
 
 
 def _level_preserving_sample(
@@ -327,7 +380,16 @@ def _level_preserving_sample(
     for target in _target_columns(y):
         values = target.reset_index(drop=True)
         for positions in values.groupby(values, dropna=False).indices.values():
-            required.add(int(rng.choice(np.asarray(positions, dtype=int))))
+            available = np.asarray(positions, dtype=int)
+            required.update(
+                rng.choice(
+                    available,
+                    size=min(2, len(available)),
+                    replace=False,
+                )
+                .astype(int)
+                .tolist()
+            )
 
     sample_size = min(len(y), max(size, len(required)))
     remaining = np.setdiff1d(
@@ -351,10 +413,14 @@ def _indexed_scores(
     chunk_size: int,
     row_indices: Optional[NDArray[np.int_]],
     n_select: int,
+    seed: int,
+    allow_direct_ensemble_members: bool,
     ensemble_members: Optional[list[str]] = None,
 ) -> NDArray[np.float64]:
     if method is FeatureDownsampleMethod.Variance:
         return chunked_variance_scores(X, chunk_size, row_indices)
+    if method is FeatureDownsampleMethod.NormalizedVariance:
+        return chunked_range_normalized_variance_scores(X, chunk_size, row_indices)
     if method is FeatureDownsampleMethod.FTest:
         return chunked_f_test_scores(X, y, is_classification, chunk_size, row_indices)
     if method in {
@@ -369,6 +435,8 @@ def _indexed_scores(
             row_indices,
             selector=method is FeatureDownsampleMethod.SelectorEnsemble,
             n_select=n_select,
+            seed=seed,
+            allow_direct_members=allow_direct_ensemble_members,
         )
         if ensemble_members is not None:
             ensemble_members.extend(actual_members)
@@ -377,7 +445,7 @@ def _indexed_scores(
         if row_indices is None:
             row_indices = np.arange(X.shape[0], dtype=int)
         return _stable_rank_scores(
-            X, y, is_classification, chunk_size, row_indices, n_select
+            X, y, is_classification, chunk_size, row_indices, n_select, seed
         )
     raise ValueError(f"Method {method.value!r} cannot score indexed columns.")
 
@@ -386,11 +454,19 @@ def _score_details(
     scores: Optional[NDArray[np.float64]],
     feature_names: Sequence[str],
     save_all: bool,
+    seed: int,
 ) -> tuple[Optional[list[float]], Optional[list[int]], Optional[list[str]]]:
     if scores is None:
         return None, None, None
-    limit = len(scores) if save_all else min(DOWNSAMPLE_SCORE_LIMIT, len(scores))
-    ranked = _rank_indices(scores, limit)
+    # Keep only a bounded ranked summary here.  When requested, the complete
+    # NumPy-backed vector is attached to the result and streamed by the saver.
+    limit = min(DOWNSAMPLE_SCORE_LIMIT, len(scores))
+    ranked = _rank_indices(
+        scores,
+        limit,
+        seed=seed,
+        tie_keys=feature_names,
+    )
     return (
         [float(scores[idx]) for idx in ranked],
         ranked.astype(int).tolist(),
@@ -412,6 +488,9 @@ def select_indexed_columns(
     save_all_scores: bool = False,
     sparse_input: bool = False,
     input_format: str = "table",
+    seed: int = SEED,
+    large_feature_mode: bool = False,
+    protected_indices: Optional[Sequence[int]] = None,
 ) -> tuple[NDArray[np.int_], FeatureDownsampleResult]:
     n_features = int(X.shape[1])
     n_select = resolve_n_features(n_features_out, n_features)
@@ -424,7 +503,38 @@ def select_indexed_columns(
         is_classification,
         y_train,
     )
-    names = list(feature_names or [f"feature_{idx}" for idx in range(n_features)])
+    if feature_names is None:
+        names = (
+            X.columns.astype(str).tolist()
+            if isinstance(X, DataFrame)
+            else [f"feature_{idx}" for idx in range(n_features)]
+        )
+    else:
+        # Keep lazy feature-name sequences lazy.  Materializing one million
+        # generated SVMlight names costs substantially more memory than the
+        # numeric score vector itself.
+        names = feature_names
+    if len(names) != n_features:
+        raise ValueError("Feature names must match the input feature count.")
+    raw_protected = [] if protected_indices is None else protected_indices
+    protected = np.asarray(
+        sorted(set(int(idx) for idx in raw_protected)),
+        dtype=int,
+    )
+    if len(protected) > 0 and (int(protected[0]) < 0 or int(protected[-1]) >= n_features):
+        raise ValueError("Protected feature indices must refer to source columns.")
+    if len(protected) > n_select:
+        raise ValueError(
+            f"{len(protected):,} protected features exceed the requested output "
+            f"count of {n_select:,}. Increase --n-feat-downsample."
+        )
+    n_ranked_select = n_select - len(protected)
+    if (
+        resolved is FeatureDownsampleMethod.None_
+        and requested is FeatureDownsampleMethod.Variance
+        and variance_threshold is not None
+    ):
+        resolved = FeatureDownsampleMethod.Variance
     if resolved not in INDEXED_SAFE_METHODS:
         raise ValueError(
             f"Feature downsampling method {resolved.value!r} requires a materialized "
@@ -436,7 +546,15 @@ def select_indexed_columns(
     started = perf_counter()
     scores: Optional[NDArray[np.float64]] = None
     actual_ensemble_members: list[str] = []
+    notes: list[str] = []
     actual_chunk = _effective_chunk_size(X, chunk_size)
+    if actual_chunk < int(chunk_size):
+        budget_mib = DOWNSAMPLE_MAX_CHUNK_BYTES / 1024**2
+        notes.append(
+            f"Score chunk size was reduced from {int(chunk_size):,} to "
+            f"{actual_chunk:,} to stay within the {budget_mib:g} MiB "
+            "working-memory budget."
+        )
     fit_rows = train_indices
     y_fit = y_train
     if screening_positions is not None:
@@ -446,9 +564,44 @@ def select_indexed_columns(
     if resolved is FeatureDownsampleMethod.None_:
         selected = np.arange(n_features, dtype=int)
     elif resolved is FeatureDownsampleMethod.Random:
-        selected = np.sort(
-            np.random.default_rng(SEED).choice(n_features, n_select, replace=False)
+        variances = chunked_variance_scores(X, actual_chunk, train_indices)
+        eligible = np.flatnonzero(np.isfinite(variances) & (variances > 0.0))
+        if len(protected) > 0:
+            eligible = np.setdiff1d(eligible, protected, assume_unique=True)
+        if len(eligible) == 0:
+            if n_ranked_select > 0:
+                raise ValueError("No non-constant training features are available.")
+            random_selected = np.array([], dtype=int)
+        else:
+            n_random = min(n_ranked_select, len(eligible))
+            random_selected = np.sort(
+                np.random.default_rng(seed).choice(eligible, n_random, replace=False)
+            )
+        selected = np.concatenate([protected, random_selected])
+        if len(random_selected) < n_ranked_select:
+            notes.append(
+                "Random downsampling excluded constant or training-absent features, "
+                f"leaving {len(random_selected):,} usable non-protected features."
+            )
+    elif n_ranked_select == 0:
+        selected = protected.copy()
+        notes.append(
+            "The protected feature set filled the requested output count; no "
+            "additional source features were ranked."
         )
+        if save_all_scores:
+            scores = _indexed_scores(
+                resolved,
+                X,
+                y_fit,
+                is_classification,
+                actual_chunk,
+                fit_rows,
+                n_select,
+                seed,
+                not large_feature_mode,
+                actual_ensemble_members,
+            )
     else:
         scores = _indexed_scores(
             resolved,
@@ -458,22 +611,40 @@ def select_indexed_columns(
             actual_chunk,
             fit_rows,
             n_select,
+            seed,
+            not large_feature_mode,
             actual_ensemble_members,
         )
-        threshold = (
-            variance_threshold
-            if resolved is FeatureDownsampleMethod.Variance
-            else None
+        if resolved is FeatureDownsampleMethod.Variance:
+            threshold = (
+                variance_threshold
+                if variance_threshold is not None
+                else np.nextafter(0.0, np.inf)
+            )
+        elif resolved is FeatureDownsampleMethod.NormalizedVariance:
+            threshold = np.nextafter(0.0, np.inf)
+        else:
+            threshold = None
+        ranking_scores = scores
+        if len(protected) > 0:
+            ranking_scores = scores.copy()
+            ranking_scores[protected] = -np.inf
+        ranked_selected = _rank_indices(
+            ranking_scores,
+            n_ranked_select,
+            threshold,
+            seed=seed,
+            tie_keys=names,
         )
-        selected = _rank_indices(scores, n_select, threshold)
-        if len(selected) == 0:
+        if len(ranked_selected) == 0:
             raise ValueError(
                 "No features have usable downsampling scores or satisfy the requested "
                 "score threshold."
             )
+        selected = np.concatenate([protected, ranked_selected])
 
     score_values, score_indices, score_names = _score_details(
-        scores, names, save_all_scores
+        scores, names, save_all_scores, seed
     )
     result = FeatureDownsampleResult(
         requested_method=requested.value,
@@ -482,9 +653,15 @@ def select_indexed_columns(
         n_features_out=len(selected),
         selected_features=[str(names[idx]) for idx in selected],
         selected_indices=selected.astype(int).tolist(),
+        protected_features=[str(names[idx]) for idx in protected],
+        protected_indices=protected.astype(int).tolist(),
         scores=score_values,
         score_feature_indices=score_indices,
         score_feature_names=score_names,
+        full_score_values=scores if save_all_scores else None,
+        full_score_feature_names=names
+        if save_all_scores and scores is not None
+        else None,
         screening_rows=(
             [] if screening_positions is None else screening_positions.tolist()
         ),
@@ -498,6 +675,7 @@ def select_indexed_columns(
         sparse_input=sparse_input,
         input_format=input_format,
         fit_seconds=perf_counter() - started,
+        notes=notes,
         auto_reason=_auto_reason(
             requested, resolved, len(train_indices), n_features, n_select
         ),
@@ -506,8 +684,7 @@ def select_indexed_columns(
             y_train,
             n_features,
             full_ensemble=(
-                isinstance(X, DataFrame)
-                and n_features <= DIRECT_DOWNSAMPLE_MAX_FEATURES
+                isinstance(X, DataFrame) and n_features <= DIRECT_DOWNSAMPLE_MAX_FEATURES
             ),
             ensemble_members=(
                 actual_ensemble_members
@@ -518,6 +695,7 @@ def select_indexed_columns(
                 }
                 else None
             ),
+            large_feature_mode=large_feature_mode,
         ),
     )
     return selected, result
@@ -528,17 +706,18 @@ def _aggregate_direct_scores(
     y: Series | DataFrame,
     is_classification: bool,
     method: FeatureDownsampleMethod,
+    seed: int = SEED,
 ) -> NDArray[np.float64]:
     target_scores: list[NDArray[np.float64]] = []
     for target in _target_columns(y):
         if method is FeatureDownsampleMethod.MutualInfo:
             scorer = mutual_info_classif if is_classification else mutual_info_regression
-            values = scorer(X, target, random_state=SEED)
+            values = scorer(X, target, random_state=seed)
         elif method is FeatureDownsampleMethod.Linear:
             if is_classification:
-                model = SGDClassifier(loss="log_loss", random_state=SEED, max_iter=2000)
+                model = SGDClassifier(loss="log_loss", random_state=seed, max_iter=2000)
             else:
-                model = SGDRegressor(random_state=SEED, max_iter=2000)
+                model = SGDRegressor(random_state=seed, max_iter=2000)
             model.fit(X, target)
             coef = np.asarray(model.coef_)
             values = np.max(np.abs(coef), axis=0) if coef.ndim > 1 else np.abs(coef)
@@ -546,7 +725,7 @@ def _aggregate_direct_scores(
             model_cls = LGBMClassifier if is_classification else LGBMRegressor
             model = model_cls(
                 n_estimators=50,
-                random_state=SEED,
+                random_state=seed,
                 n_jobs=1,
                 verbosity=-1,
                 force_col_wise=True,
@@ -570,6 +749,7 @@ def _downsample_frame(
     screening_positions: Optional[NDArray[np.int_]],
     variance_threshold: Optional[float],
     save_all_scores: bool,
+    seed: int,
 ) -> tuple[DataFrame, DataFrame, FeatureDownsampleResult]:
     n_features = X_train.shape[1]
     n_select = resolve_n_features(n_features_out, n_features)
@@ -587,6 +767,20 @@ def _downsample_frame(
             f"Feature downsampling method {resolved.value!r} is limited to "
             f"{DIRECT_DOWNSAMPLE_MAX_FEATURES:,} materialized features."
         )
+    fit_rows_count = (
+        len(X_train) if screening_positions is None else len(screening_positions)
+    )
+    if (
+        resolved in DIRECT_METHODS
+        and _direct_peak_bytes(fit_rows_count, n_features) > DOWNSAMPLE_MAX_DENSE_BYTES
+    ):
+        gib = _direct_peak_bytes(fit_rows_count, n_features) / 1024**3
+        raise MemoryError(
+            f"Method {resolved.value!r} is estimated to require about {gib:.2f} "
+            "GiB of peak dense fitting memory. Reduce the input size or use an "
+            "indexed, column-chunked method such as normalized-variance, f-test, "
+            "rank-ensemble, selector-ensemble, or stable-rank."
+        )
 
     fit_started = perf_counter()
     X_fit = X_train if screening_positions is None else X_train.iloc[screening_positions]
@@ -601,11 +795,11 @@ def _downsample_frame(
     if projection:
         components = projection_n_components(n_features_out, len(X_fit), n_features)
         if resolved is FeatureDownsampleMethod.SVD:
-            transformer = TruncatedSVD(n_components=components, random_state=SEED)
+            transformer = TruncatedSVD(n_components=components, random_state=seed)
             prefix = "svd"
         else:
             transformer = SparseRandomProjection(
-                n_components=components, random_state=SEED, dense_output=True
+                n_components=components, random_state=seed, dense_output=True
             )
             prefix = "sparse_rp"
         transformer.fit(X_fit)
@@ -635,6 +829,7 @@ def _downsample_frame(
                 names,
                 variance_threshold,
                 save_all_scores,
+                seed=seed,
             )
             partial.tuning_rows = []
             transform_started = perf_counter()
@@ -642,8 +837,13 @@ def _downsample_frame(
             test_out = X_test.iloc[:, selected].copy()
             partial.transform_seconds = perf_counter() - transform_started
             return train_out, test_out, partial
-        scores = _aggregate_direct_scores(X_fit, y_fit, is_classification, resolved)
-        selected = _rank_indices(scores, n_select)
+        scores = _aggregate_direct_scores(X_fit, y_fit, is_classification, resolved, seed)
+        selected = _rank_indices(
+            scores,
+            n_select,
+            seed=seed,
+            tie_keys=names,
+        )
         if len(selected) == 0:
             raise ValueError("No features have usable downsampling scores.")
         fit_seconds = perf_counter() - fit_started
@@ -655,7 +855,7 @@ def _downsample_frame(
 
     transform_seconds = perf_counter() - transform_started
     score_values, score_indices, score_names = _score_details(
-        scores, names, save_all_scores
+        scores, names, save_all_scores, seed
     )
     result = FeatureDownsampleResult(
         requested_method=requested.value,
@@ -667,12 +867,14 @@ def _downsample_frame(
         scores=score_values,
         score_feature_indices=score_indices,
         score_feature_names=score_names,
+        full_score_values=scores if save_all_scores else None,
+        full_score_feature_names=names
+        if save_all_scores and scores is not None
+        else None,
         projection=projection,
         fit_seconds=fit_seconds,
         transform_seconds=transform_seconds,
-        auto_reason=_auto_reason(
-            requested, resolved, len(X_train), n_features, n_select
-        ),
+        auto_reason=_auto_reason(requested, resolved, len(X_train), n_features, n_select),
         **_result_strategy(resolved, y_train, n_features),
     )
     return train_out, test_out, result
@@ -684,9 +886,8 @@ def downsample_split(
     options: Any,
 ) -> tuple[PreparedData, PreparedData, FeatureDownsampleResult]:
     requested = _method(getattr(options, "feat_downsample", None))
-    n_features_out = getattr(
-        options, "n_feat_downsample", N_FEAT_DOWNSAMPLE_DEFAULT
-    )
+    n_features_out = getattr(options, "n_feat_downsample", N_FEAT_DOWNSAMPLE_DEFAULT)
+    seed = int(getattr(options, "seed", SEED))
     resolved = resolve_feature_downsample_method(
         requested,
         len(train.X),
@@ -702,20 +903,52 @@ def downsample_split(
         getattr(options, "downsample_screening_fraction", 0.25),
         train.is_classification,
         train.groups,
+        seed,
     )
 
-    X_train, X_test, result = _downsample_frame(
-        train.X,
-        test.X,
-        train.y,
-        train.is_classification,
-        effective,
-        n_features_out,
-        getattr(options, "downsample_chunk_size", DOWNSAMPLE_CHUNK_SIZE_DEFAULT),
-        screening_rows,
-        getattr(options, "downsample_variance_threshold", None),
-        getattr(options, "downsample_save_scores", False),
-    )
+    selection_request = requested if fallback_note is None else effective
+    try:
+        X_train, X_test, result = _downsample_frame(
+            train.X,
+            test.X,
+            train.y,
+            train.is_classification,
+            selection_request,
+            n_features_out,
+            getattr(options, "downsample_chunk_size", DOWNSAMPLE_CHUNK_SIZE_DEFAULT),
+            screening_rows,
+            getattr(options, "downsample_variance_threshold", None),
+            getattr(options, "downsample_save_scores", False),
+            seed,
+        )
+    except ValueError as error:
+        if (
+            requested is not FeatureDownsampleMethod.Auto
+            or screening_rows is None
+            or "usable downsampling scores" not in str(error)
+        ):
+            raise
+        fallback_note = (
+            f"Auto feature downsampling fell back from {effective.value} to "
+            "normalized-variance because supervised scoring produced no usable "
+            f"feature scores: {error}"
+        )
+        warn(fallback_note, stacklevel=2)
+        screening_rows = None
+        tuning_rows = np.arange(len(train.y), dtype=int)
+        X_train, X_test, result = _downsample_frame(
+            train.X,
+            test.X,
+            train.y,
+            train.is_classification,
+            FeatureDownsampleMethod.NormalizedVariance,
+            n_features_out,
+            getattr(options, "downsample_chunk_size", DOWNSAMPLE_CHUNK_SIZE_DEFAULT),
+            None,
+            getattr(options, "downsample_variance_threshold", None),
+            getattr(options, "downsample_save_scores", False),
+            seed,
+        )
     result.requested_method = requested.value
     if requested is FeatureDownsampleMethod.Auto and result.auto_reason is None:
         result.auto_reason = _auto_reason(

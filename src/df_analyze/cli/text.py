@@ -70,6 +70,9 @@ For more details, see the README at https://github.com/stfxecutables/df-analyze.
 DF_FILETYPES = """
 Currently only tables saved as either `.parquet`, `.xlsx`, `.json` or `.csv` are
 supported, but a file exported by Pandas `DataFrame.to_*` method is preferred.
+SVMlight text input is also supported with `--input-format svmlight`; auto mode
+recognizes common sparse suffixes and files with nonstandard names by a bounded
+SVMlight content check, including gzip, bzip2, and xz compression.
 
 If your data is saved as a Pandas `DataFrame`, it must have shape
 `(n_samples, n_features)` or `(n_samples, n_features + 1)`. The name of the
@@ -91,7 +94,7 @@ The training dataframe to analyze. Cannot be used with `--df` argument.
 
 DF_TESTS_HELP_STR = f"""
 The dataframes to use for testing. How these are used depends on the
---test-sets-method option. Cannot be used with `--df` argument.
+--df-tests-method option. Cannot be used with `--df` argument.
 {DF_FILETYPES}
 
 """
@@ -154,7 +157,11 @@ classification.
 """
 
 TARGETS_HELP_STR = """
-Comma-separated target columns for multi-target runs.
+Comma-separated target columns for a multi-target run, for example
+`--targets outcome_a,outcome_b`. All targets in one run must use the same
+`--mode`: categorical targets with `classify`, or numeric targets with
+`regress`. Rows missing any target are removed. This option takes precedence
+over `--target`; single-target usage is unchanged.
 
 """
 
@@ -223,10 +230,11 @@ If "classify", do classification. If "regress", do regression.
 """
 
 DEVICE_HELP = """
-Runtime device for supported models: auto, cpu, or cuda. Auto uses workload-aware
-thresholds for KNN, CatBoost, and XGBoost so small jobs stay on CPU; compute-heavy
-neural and embedding backends prefer an available accelerator. CUDA is a request
-rather than a strict mode; an unavailable backend falls back to CPU with a warning.
+GPU policy: auto (recommended), cpu, or cuda. CPU keeps all work on CPU. Auto uses
+CUDA only for supported tasks when available and beneficial, and retries a failed
+CUDA model or analysis configuration once on CPU. CUDA strictly requires CUDA for
+every selected CUDA-capable component; components without one continue normally
+on CPU.
 GANDALF may use MPS in auto mode on supported Apple systems.
 """
 
@@ -236,21 +244,13 @@ Managed setup is available from a source checkout with pyproject.toml and
 uv.lock.
 """
 
-CLASSIFIER_CHOICES = (
-    DfAnalyzeClassifier.choices()
-)
+CLASSIFIER_CHOICES = DfAnalyzeClassifier.choices()
 
-CLASSIFIER_DEFAULTS = (
-    DfAnalyzeClassifier.defaults()
-)
+CLASSIFIER_DEFAULTS = DfAnalyzeClassifier.defaults()
 
-REGRESSOR_CHOICES = (
-    DfAnalyzeRegressor.choices()
-)
+REGRESSOR_CHOICES = DfAnalyzeRegressor.choices()
 
-REGRESSOR_DEFAULTS = (
-    DfAnalyzeRegressor.defaults()
-)
+REGRESSOR_DEFAULTS = DfAnalyzeRegressor.defaults()
 
 
 CLS_HELP_STR = f"""
@@ -389,6 +389,7 @@ is to prevent double-dipping / circular analysis that can result in
 FEAT_DOWNSAMPLE_HELP = """
 Reduce a very wide feature matrix before the usual df-analyze feature selection.
 `auto` chooses a scalable supervised method; `none` keeps the existing behavior.
+`variance` uses raw sample variance; `normalized-variance` is scale invariant.
 The projection methods (`svd` and `sparse-rp`) create new component features.
 """
 
@@ -897,9 +898,19 @@ Leave unset to keep all selected features.
 """
 
 ERROR_CONSISTENCY_HELP = """
-Enable error consistency analysis after tuning. Each tuned configuration is
-refit over repeated K-fold splits of the training data, and every fold model is
-evaluated on the same external holdout set.
+Run error consistency after feature selection and tuning. The training folds
+change, but every fitted model predicts the same external holdout. Do not use a
+final-test holdout to select a model.
+
+"""
+
+EC_PROFILE_HELP = """
+Use settings from an EC reference experiment. `classification-paper` uses an
+80/20 holdout, 5 folds, 10 repetitions, and fixed model seeds.
+`regression-paper` uses an 80/20 holdout, 5 folds, 50 repetitions, fixed model
+seeds, and the seven reference methods. Explicit CLI or spreadsheet values
+override the matching profile setting. Profiles do not reproduce the original
+datasets, preprocessing, models, or result tables.
 
 """
 
@@ -909,56 +920,77 @@ Number of folds in each error-consistency repetition.
 """
 
 EC_REPETITIONS_HELP = """
-Number of repeated K-fold partitions used for error consistency. Each tuned
-configuration produces --ec-folds * --ec-repetitions holdout predictions.
-The default is 5 repetitions. EC remains a descriptive stability diagnostic;
-increase repetitions for a more stable descriptive estimate, subject to runtime.
+Number of shuffled K-fold repetitions. Each configuration is fitted
+--ec-folds * --ec-repetitions times. The default is 5.
 
 """
 
 EC_MODEL_SEED_MODE_HELP = """
-Control fitted-model randomness across error-consistency folds. `vary` (the
-default) uses a reproducible, distinct model seed for every repetition/fold and
-therefore measures split plus algorithmic instability. `fixed` reuses the base
-seed for every refit to isolate sensitivity to the training subset as far as the
-estimator permits.
+Choose whether the fitted-model seed changes across folds. `vary` (the default)
+measures changes from both training rows and model randomness. `fixed` reuses
+the base seed for every fit.
 
 """
 
 EC_METHODS_HELP = """
-Regression EC metrics to compute. These are seven experimental descriptive
-residual-consistency diagnostics, not confidence intervals or hypothesis tests:
+Regression EC methods to calculate. The default is all seven methods:
 ratio, ratio_diff, ratio_sign, ratio_diff_sign_magnitude,
 intersection_union_sample, intersection_union_all, and
-intersection_union_distance. The legacy ratio_diff_sign spelling remains
-accepted and remains the compatibility name in existing serialized outputs.
-The ratio_diff_sign_magnitude primary summary uses magnitude to prevent signed
-cancellation; signed means remain available as auxiliary direction diagnostics.
+intersection_union_distance. `ratio_diff_sign_reference` is an optional signed
+compatibility method and is not ranked. See docs/error_consistency.md for the
+formulas.
+
+"""
+
+EC_HOLDOUT_ROLE_HELP = """
+Describe how the shared holdout is used. `test` (the default) calculates EC but
+disables model ranking and EC/performance correlations. `validation` enables
+those outputs for a separate validation or audit holdout. This option does not
+change the split.
 
 """
 
 EC_SAVE_PREDICTIONS_HELP = """
-Save the prediction and residual/error matrices used to calculate EC.
+Save the prediction and residual/error matrices used to calculate EC, including
+holdout positions and true target values.
+
+"""
+
+EC_OUTPUT_DETAIL_HELP = """
+Choose how much EC output to keep. `summary` writes the main tables and audit
+files; `pairwise` adds model-pair tables and plots; `full` adds sample-level
+diagnostics. --ec-save-predictions adds prediction and residual/error matrices
+at any level. The default is `full`.
+
+"""
+
+EC_RESUME_HELP = """
+Continue EC from a matching checkpoint, or reuse a completed result. The
+prepared training data, holdout data, and EC settings must match.
+
+"""
+
+EC_CHECKPOINT_EVERY_HELP = """
+Save an EC checkpoint after this many completed repetitions. The default is 5.
 
 """
 
 EC_EMPTY_UNIONS_HELP = """
-Value used for classification model pairs where neither model makes a holdout
-error. Choices are 0, 1, nan, drop, error, and warn. The default, warn, emits
-one warning and records mathematically undefined empty-union comparisons as NaN.
+Handle classification pairs where neither model makes a holdout error. Choices
+are 0, 1, nan, drop, error, and warn. The default, warn, issues one warning and
+stores the undefined comparison as NaN.
 
 """
 
 EC_EPSILON_HELP = """
-Non-negative stabilization constant for regression ratio denominators. The
-default, 0, follows the published formulas exactly.
+Non-negative value added to regression ratio denominators near zero. The
+default is 0.
 
 """
 
 EC_RECURRENCE_THRESHOLD_HELP = """
-Error-rate threshold used to label high recurrence in the joint adaptive-error
-and error-consistency report. This is a configurable heuristic, not a universal
-scientific cutoff. The default is 0.5.
+Error-rate threshold used to label high recurrence in the combined
+adaptive-error/EC report. The default is 0.5; it is not a universal cutoff.
 
 """
 
