@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import Optional
-from warnings import warn
 
 import numpy as np
 from numpy.typing import NDArray
@@ -17,12 +16,6 @@ from df_analyze.enumerables import FeatureDownsampleMethod
 
 SUPERVISED_DOWNSAMPLERS = {
     FeatureDownsampleMethod.FTest,
-    FeatureDownsampleMethod.MutualInfo,
-    FeatureDownsampleMethod.Linear,
-    FeatureDownsampleMethod.LGBM,
-    FeatureDownsampleMethod.RankEnsemble,
-    FeatureDownsampleMethod.SelectorEnsemble,
-    FeatureDownsampleMethod.StableRank,
 }
 
 
@@ -31,7 +24,7 @@ def _stratification_target(y: Series | DataFrame) -> Optional[Series]:
         return y
     if y.shape[1] == 1:
         return y.iloc[:, 0]
-    combined = y.astype(str).agg("\x1f".join, axis=1)
+    combined = Series(y.astype(str).agg("\x1f".join, axis=1), index=y.index)
     counts = combined.value_counts()
     if len(counts) > 1 and counts.min() >= 2:
         return combined
@@ -94,15 +87,12 @@ def screening_tuning_indices(
                 "Group-disjoint feature screening requires at least two distinct "
                 "training groups."
             )
-        splitter = GroupShuffleSplit(
-            n_splits=100, train_size=fraction, random_state=seed
-        )
+        splitter = GroupShuffleSplit(n_splits=100, train_size=fraction, random_state=seed)
         candidates = []
         for screening, tuning in splitter.split(indices, groups=groups.to_numpy()):
-            if (
-                _supports_supervised_scoring(y, screening, is_classification)
-                and _supports_supervised_scoring(y, tuning, is_classification)
-            ):
+            if _supports_supervised_scoring(
+                y, screening, is_classification
+            ) and _supports_supervised_scoring(y, tuning, is_classification):
                 candidates.append(
                     (
                         abs(len(screening) - screen_size),
@@ -132,18 +122,16 @@ def screening_tuning_indices(
                 n_splits=20, train_size=screen_size, random_state=seed
             )
             for screening, tuning in splitter.split(indices, target):
-                if (
-                    _supports_supervised_scoring(y, screening, is_classification)
-                    and _supports_supervised_scoring(y, tuning, is_classification)
-                ):
+                if _supports_supervised_scoring(
+                    y, screening, is_classification
+                ) and _supports_supervised_scoring(y, tuning, is_classification):
                     return np.sort(screening), np.sort(tuning)
 
     splitter = ShuffleSplit(n_splits=100, train_size=screen_size, random_state=seed)
     for screening, tuning in splitter.split(indices):
-        if (
-            _supports_supervised_scoring(y, screening, is_classification)
-            and _supports_supervised_scoring(y, tuning, is_classification)
-        ):
+        if _supports_supervised_scoring(
+            y, screening, is_classification
+        ) and _supports_supervised_scoring(y, tuning, is_classification):
             return np.sort(screening), np.sort(tuning)
     raise ValueError(
         "Could not create disjoint screening and tuning subsets that both have "
@@ -172,27 +160,11 @@ def resolve_screening_split(
     tuning = np.arange(len(y), dtype=int)
     if not method_needs_screening(resolved):
         return resolved, None, tuning, None
-    try:
-        screening, tuning = screening_tuning_indices(
-            y,
-            fraction,
-            is_classification,
-            groups,
-            seed,
-        )
-        return resolved, screening, tuning, None
-    except ValueError as error:
-        if requested is not FeatureDownsampleMethod.Auto:
-            raise
-        note = (
-            f"Auto feature downsampling fell back from {resolved.value} to "
-            "normalized-variance because disjoint screening and tuning subsets "
-            f"were not feasible: {error}"
-        )
-        warn(note, stacklevel=2)
-        return (
-            FeatureDownsampleMethod.NormalizedVariance,
-            None,
-            np.arange(len(y), dtype=int),
-            note,
-        )
+    screening, tuning = screening_tuning_indices(
+        y,
+        fraction,
+        is_classification,
+        groups,
+        seed,
+    )
+    return resolved, screening, tuning, None

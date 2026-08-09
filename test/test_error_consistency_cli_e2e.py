@@ -127,9 +127,7 @@ def test_error_consistency_full_cli(
         assert not ranking.empty
 
     if mode == "classify":
-        leave_one_model_out = pd.read_csv(
-            next(ec_root.rglob("leave_one_model_out.csv"))
-        )
+        leave_one_model_out = pd.read_csv(next(ec_root.rglob("leave_one_model_out.csv")))
         assert leave_one_model_out["model_removed"].tolist() == [0, 1, 2, 3]
     else:
         assert "ratio_diff_sign_magnitude" in set(summary["ec_method"])

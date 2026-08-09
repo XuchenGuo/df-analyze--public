@@ -42,7 +42,6 @@ class ECMetricInfo:
     samplewise_defined: bool
     scientific_status: str = "experimental_descriptive_diagnostic"
     reference_url: str | None = None
-    legacy_equation_label: str | None = None
     ranking_supported: bool = True
 
 
@@ -77,7 +76,6 @@ class ECMetricComputation:
             "range_min": self.info.range_min,
             "range_max": self.info.range_max,
             "paper_equation": self.info.paper_equation,
-            "legacy_equation_label": self.info.legacy_equation_label,
             "samplewise_defined": self.info.samplewise_defined,
             "scientific_status": self.info.scientific_status,
             "reference_url": self.info.reference_url,

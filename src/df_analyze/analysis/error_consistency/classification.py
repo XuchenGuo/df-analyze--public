@@ -19,7 +19,6 @@ from df_analyze.analysis.error_consistency.containers import (
     ECMetricComputation,
     ECMetricInfo,
 )
-from df_analyze.runtime.hardware import DeviceIntent
 
 CLASSIFICATION_EC_INFO = ECMetricInfo(
     name="classification_iou",
@@ -123,22 +122,7 @@ def compute_classification_ec(
     errors = preds != truth[None, :]
     pairs = list(combinations(range(preds.shape[0]), 2))
     use_cuda = backend is not None and backend.resolved == "torch_cuda"
-    try:
-        intersections, unions = _pair_counts(errors, pairs, use_cuda)
-    except Exception as error:
-        if not use_cuda:
-            raise
-        if backend is not None and backend.requested == DeviceIntent.CUDA.value:
-            raise RuntimeError(
-                "Classification error consistency failed on CUDA while "
-                "--device cuda is strict."
-            ) from error
-        warn(
-            "Could not compute classification EC on CUDA; falling back to numpy. "
-            f"Details: {error}"
-        )
-        backend = backend.fallback(f"torch_cuda_error:{type(error).__name__}")
-        intersections, unions = _pair_counts(errors, pairs, False)
+    intersections, unions = _pair_counts(errors, pairs, use_cuda)
     if policy == "warn" and np.any(unions == 0):
         warn(
             "Classification EC encountered model pairs with empty error unions; "
@@ -214,20 +198,24 @@ def compute_classification_ec(
 
     leave_one_model_out = pd.DataFrame(
         leave_one_model_out_rows,
-        columns=[
-            "model_removed",
-            "n_models_retained",
-            "error_intersection",
-            "error_union",
-            "consistency",
-            "empty_union",
-            "included_in_summary",
-            "empty_union_policy",
-        ],
+        columns=pd.Index(
+            [
+                "model_removed",
+                "n_models_retained",
+                "error_intersection",
+                "error_union",
+                "consistency",
+                "empty_union",
+                "included_in_summary",
+                "empty_union_policy",
+            ],
+            dtype=str,
+        ),
     )
-    finite_loo = leave_one_model_out.get("consistency", pd.Series(dtype=float)).to_numpy(
-        dtype=float
-    )
+    consistency = leave_one_model_out.loc[:, "consistency"]
+    if not isinstance(consistency, pd.Series):
+        raise ValueError("Expected one consistency column.")
+    finite_loo = consistency.to_numpy(dtype=float)
     finite_loo = finite_loo[np.isfinite(finite_loo)]
     leave_one_model_out_mean = (
         float(np.mean(finite_loo)) if finite_loo.size > 0 else np.nan
@@ -249,10 +237,6 @@ def compute_classification_ec(
         "leave_one_model_out_sd": leave_one_model_out_sd,
         "n_leave_one_model_out": len(leave_one_model_out),
         "output_detail": detail,
-        # Keep the old keys, although this is leave-one-model-out rather than
-        # leave-one-sample-out cross-validation.
-        "leave_one_out_mean": leave_one_model_out_mean,
-        "leave_one_out_sd": leave_one_model_out_sd,
     }
     if backend is not None:
         extra.update(backend.as_metadata())

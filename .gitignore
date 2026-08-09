@@ -20,7 +20,6 @@ cmc_ata
 downloaded_models
 cuda_smoke/
 __GANDALF_INTERNAL_LOGS__/
-runtimes/*.txt
 
 secrets
 
@@ -46,10 +45,9 @@ poetry.lock
 **/*.xlsx
 **/*.zip
 
-
+# Keep documentation in Git.
 !docs/
 !docs/**/*.md
-
 
 # research scripts
 calibration.py

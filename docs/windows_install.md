@@ -198,8 +198,8 @@ running `df-analyze`. But you won't have to do any of the other install procedur
 
 ### TabPFN Authentication and Model Cache
 
-TabPFN downloads licensed model files the first time each selected checkpoint
-is used. First accept the corresponding license. Prior Labs recommends its
+TabPFN downloads the licensed v3 model files the first time they are used.
+First accept the corresponding license. Prior Labs recommends its
 browser login or an API key from its account page:
 
 ```powershell
@@ -224,11 +224,10 @@ weights for offline use, choose a cache directory in the PowerShell terminal
 where you will run `df-analyze`:
 
 ```powershell
-$env:TABPFN_MODEL_CACHE_DIR = "$PWD\.df-analyze-runtime\tabpfn-model-cache"
+$env:TABPFN_MODEL_CACHE_DIR = "$PWD\.cache\tabpfn-model-cache"
 ```
 
 Set this variable again in a new terminal, or add it to your Windows environment
 variables if you want to keep using the same directory. If the selected path is
-not writable, `df-analyze` reports an error before starting the download. When
-no path is set and TabPFN's default cache is not writable, `df-analyze` uses a
-temporary directory and prints its location.
+not writable, TabPFN reports the cache error. df-analyze does not create or
+switch to another cache directory.

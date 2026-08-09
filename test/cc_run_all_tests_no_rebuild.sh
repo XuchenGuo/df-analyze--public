@@ -45,10 +45,10 @@ echo "==========================================================================
     test/test_lgbm_defaults.py \
     test/test_multitarget.py \
     test/test_preprocessing_fit_scope.py \
-    test/test_real_gpu_integrations.py \
-    test/test_runtime_install.py \
     test/test_sparse_downsampling.py \
     -x
+
+echo "GPU and licensed-model integrations are run by their dedicated scripts."
 
 echo "================================================================================="
 echo "Testing test dataset IO and basics"

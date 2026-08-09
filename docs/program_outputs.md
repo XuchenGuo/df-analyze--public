@@ -47,9 +47,9 @@ metrics.
 Final holdout cross-validation uses at most five folds. Grouped runs reduce the
 fold count when the holdout contains fewer than five distinct groups, while
 keeping groups separate. `final_cv_folds` records the count actually
-used. The value column named `5-fold` is retained for output compatibility and
-must be interpreted using `final_cv_folds`. Fewer than five folds also produces
-a warning because the resulting estimate can be unstable.
+used. The `cv_mean` value column contains the cross-validation mean and
+`final_cv_folds` identifies the actual fold count. Fewer than five folds also
+produces a warning because the resulting estimate can be unstable.
 
 ## Error Consistency Outputs
 
@@ -78,20 +78,15 @@ contain headers only so that final-test results are not presented as a model
 selection step.
 
 Each `<target>/<model>/<selection>_<embed-selector>/` directory contains the
-tables and checkpoint for one configuration. `--ec-output-detail pairwise`
+tables for one configuration. `--ec-output-detail pairwise`
 adds model-pair tables and plots. `full` also adds sample-level diagnostics.
 Classification directories always include `leave_one_model_out.csv`.
 `--ec-save-predictions` adds `trial_predictions.csv` and
 `residual_or_error_matrix.csv`.
 
-When adaptive error and EC are both enabled,
-`results/adaptive_error/tables` also contains
-`risk_stability_report.csv`, `risk_stability_summary.csv`, and
-`risk_stability_skipped.csv`.
-
 For multiple external test sets, these files are nested under `testXX`. See the
 [error-consistency guide](error_consistency.md) for the formulas, runtime
-guidance, checkpoints, and interpretation.
+guidance and interpretation.
 
 ## Output Files
 

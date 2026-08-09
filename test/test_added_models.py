@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -16,30 +15,26 @@ from pandas import DataFrame, Series
 from torch import Tensor
 from torch.nn import Linear, Module
 
-import df_analyze.models.tabpfn as tabpfn_module
+import df_analyze.enumerables as enumerables_module
 from df_analyze._main import _run
 from df_analyze.analysis.adaptive_error.base_models_runner import (
     _model_matrix_for_result,
 )
 from df_analyze.analysis.adaptive_error.oof import build_oof_for_result
-from df_analyze.cli.cli import ProgramOptions, get_options, make_parser
+from df_analyze.cli.cli import ArgumentError, get_options
 from df_analyze.enumerables import (
     ClassifierScorer,
     DfAnalyzeClassifier,
     DfAnalyzeRegressor,
-    TabPFNVersion,
 )
 from df_analyze.hypertune import EvaluationResults, HtuneResult, evaluate_tuned
 from df_analyze.models.base import DfAnalyzeModel
 from df_analyze.models.kan import KANEstimator, SkorchKAN
 from df_analyze.models.tabpfn import (
-    TABPFN_CLASSIFIERS,
     TABPFN_PRETRAINING_LIMITS,
-    TABPFN_REGRESSORS,
     TABPFN_V3_MODEL_CARD_MAX_FEATURES,
     TabPFNClassifierV3,
-    TabPFNClassifierV26,
-    TabPFNRegressorV25,
+    TabPFNRegressorV3,
     TabPFNSetupError,
 )
 from df_analyze.models.trees import (
@@ -60,21 +55,7 @@ def numeric_data(n: int = 40) -> DataFrame:
     return DataFrame(rng.normal(size=(n, 5)), columns=[f"x{i}" for i in range(5)])
 
 
-RUN_REAL_MODEL_TESTS = os.getenv("DF_ANALYZE_RUN_REAL_MODEL_TESTS", "").lower() in {
-    "1",
-    "true",
-    "yes",
-}
-RUN_REAL_TABPFN_TESTS = os.getenv(
-    "DF_ANALYZE_RUN_REAL_TABPFN_TESTS", ""
-).lower() in {"1", "true", "yes"}
-
-
 @pytest.mark.integration
-@pytest.mark.skipif(
-    not RUN_REAL_MODEL_TESTS,
-    reason="set DF_ANALYZE_RUN_REAL_MODEL_TESTS=1 to exercise real model backends",
-)
 @pytest.mark.parametrize("task", ["classification", "regression"])
 def test_real_kan_backend_smoke(task: str) -> None:
     X = numeric_data(24)
@@ -112,9 +93,7 @@ def test_real_kan_backend_smoke(task: str) -> None:
             atol=1e-7,
         )
     else:
-        np.testing.assert_allclose(
-            restored.predict(X), predictions, rtol=1e-6, atol=1e-7
-        )
+        np.testing.assert_allclose(restored.predict(X), predictions, rtol=1e-6, atol=1e-7)
 
     tuned_args = {
         "module__width": 8,
@@ -133,45 +112,6 @@ def test_real_kan_backend_smoke(task: str) -> None:
     assert np.isfinite(tuned_score)
     restored_tuned = jsonpickle.decode(jsonpickle.encode(model, unpicklable=True))
     assert restored_tuned.tuned_scores(X, y) == pytest.approx(tuned_score)
-
-
-@pytest.mark.integration
-@pytest.mark.skipif(
-    not RUN_REAL_TABPFN_TESTS,
-    reason=(
-        "set DF_ANALYZE_RUN_REAL_TABPFN_TESTS=1 after accepting the checkpoint "
-        "licenses and configuring authentication or cached weights"
-    ),
-)
-@pytest.mark.parametrize("version", ["v3", "v2_6", "v2_5"])
-@pytest.mark.parametrize("task", ["classification", "regression"])
-def test_real_tabpfn_backend_smoke(version: str, task: str) -> None:
-    X = numeric_data(24)
-    if task == "classification":
-        model_cls = TABPFN_CLASSIFIERS[version]
-        y = Series((X["x0"] + X["x1"] > 0).astype(int), name="target")
-    else:
-        model_cls = TABPFN_REGRESSORS[version]
-        y = Series(X["x0"] - 0.5 * X["x1"], name="target")
-    model = model_cls(
-        model_args={
-            "n_estimators": 1,
-            "auto_scale_n_estimators": False,
-        }
-    )
-    model.set_runtime(get_runtime("cpu"))
-
-    model.fit(X, y)
-
-    predictions = np.asarray(model.predict(X))
-    assert predictions.shape == (len(y),)
-    assert np.isfinite(predictions).all()
-    restored = jsonpickle.decode(jsonpickle.encode(model, unpicklable=True))
-    np.testing.assert_array_equal(restored.predict(X), predictions)
-    if task == "classification":
-        probabilities = np.asarray(model.predict_proba_untuned(X))
-        assert probabilities.shape == (len(y), 2)
-        np.testing.assert_allclose(restored.predict_proba_untuned(X), probabilities)
 
 
 @pytest.mark.fast
@@ -300,14 +240,14 @@ def test_prepare_data_builds_unimputed_tabpfn_view() -> None:
 def test_added_models_are_registered() -> None:
     classifiers = {
         DfAnalyzeClassifier.XGBoost: XGBoostClassifier,
-        DfAnalyzeClassifier.TabPFN: TABPFN_CLASSIFIERS["v3"],
+        DfAnalyzeClassifier.TabPFN: TabPFNClassifierV3,
         DfAnalyzeClassifier.DecisionTree: DecisionTreeClassifier,
         DfAnalyzeClassifier.ExtraTrees: ExtraTreesClassifier,
         DfAnalyzeClassifier.KAN: KANEstimator,
     }
     regressors = {
         DfAnalyzeRegressor.XGBoost: XGBoostRegressor,
-        DfAnalyzeRegressor.TabPFN: TABPFN_REGRESSORS["v3"],
+        DfAnalyzeRegressor.TabPFN: TabPFNRegressorV3,
         DfAnalyzeRegressor.DecisionTree: DecisionTreeRegressor,
         DfAnalyzeRegressor.ExtraTrees: ExtraTreesRegressor,
         DfAnalyzeRegressor.KAN: KANEstimator,
@@ -318,6 +258,24 @@ def test_added_models_are_registered() -> None:
     for source, model in regressors.items():
         assert source.value in DfAnalyzeRegressor.choices()
         assert source.get_model() is model
+
+
+@pytest.mark.fast
+def test_explicit_missing_model_dependency_is_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    data_path = tmp_path / "data.csv"
+    DataFrame({"feature": [0, 1, 2, 3], "target": [0, 1, 0, 1]}).to_csv(
+        data_path, index=False
+    )
+    monkeypatch.setattr(enumerables_module, "is_xgboost_available", lambda: False)
+
+    with pytest.raises(ArgumentError, match=r"XGBoost.*not installed"):
+        get_options(
+            f"--df {data_path} --target target --mode classify "
+            f"--classifiers xgb --outdir {tmp_path / 'output'}"
+        )
 
 
 @pytest.mark.fast
@@ -341,8 +299,9 @@ def test_tree_classifiers_support_multitarget(model: Any) -> None:
     model.refit_tuned(X, y, tuned_args={"max_depth": 3})
     assert np.asarray(model.tuned_predict(X)).shape == y.shape
     probabilities = model.predict_proba(X)
-    assert isinstance(probabilities, list)
-    assert len(probabilities) == y.shape[1]
+    assert isinstance(probabilities, dict)
+    assert set(probabilities) == set(y.columns)
+    assert all(values.shape == (len(y), 2) for values in probabilities.values())
 
 
 @pytest.mark.fast
@@ -422,15 +381,12 @@ def test_tree_models_complete_multitarget_cli_pipeline(
     assert expected_metrics <= set(results["metric"])
     assert results["final_cv_folds"].nunique() == 1
     assert 2 <= int(results["final_cv_folds"].iloc[0]) < 5
-    assert {"dtree", "et"} <= {
-        entry["model"] for entry in options._model_successes
-    }
+    assert {"dtree", "et"} <= {entry["model"] for entry in options._model_successes}
     assert options._model_failures == []
 
 
 @pytest.mark.fast
 def test_xgboost_multitarget_protocol() -> None:
-    pytest.importorskip("xgboost")
     X = numeric_data(30)
     y_cls = DataFrame(
         {
@@ -468,12 +424,9 @@ def test_xgboost_multitarget_protocol() -> None:
 
 @pytest.mark.fast
 def test_xgboost_classifier_handles_noncontiguous_encoded_labels() -> None:
-    pytest.importorskip("xgboost")
     X = numeric_data(30)
     y = Series(np.where(X["x0"] > 0, 2, 0), name="target")
-    model = XGBoostClassifier(
-        model_args={"n_estimators": 3, "max_depth": 2, "n_jobs": 1}
-    )
+    model = XGBoostClassifier(model_args={"n_estimators": 3, "max_depth": 2, "n_jobs": 1})
 
     model.fit(X, y)
 
@@ -488,7 +441,6 @@ def test_kan_output_width_preserves_missing_encoded_class() -> None:
 
 @pytest.mark.fast
 def test_xgboost_jsonpickle_multitarget_roundtrip() -> None:
-    pytest.importorskip("xgboost")
     X = numeric_data(30)
     y = DataFrame(
         {
@@ -496,9 +448,7 @@ def test_xgboost_jsonpickle_multitarget_roundtrip() -> None:
             "second": (X["x1"] > 0).astype(int),
         }
     )
-    model = XGBoostClassifier(
-        model_args={"n_estimators": 3, "max_depth": 2, "n_jobs": 1}
-    )
+    model = XGBoostClassifier(model_args={"n_estimators": 3, "max_depth": 2, "n_jobs": 1})
     model.fit(X, y)
     model.refit_tuned(X, y, tuned_args={"learning_rate": 0.2})
 
@@ -518,9 +468,7 @@ def test_xgboost_jsonpickle_multitarget_roundtrip() -> None:
         model_args={"n_estimators": 3, "max_depth": 2, "n_jobs": 1}
     )
     regressor.refit_tuned(X, y_reg, tuned_args={"learning_rate": 0.2})
-    restored_regressor = jsonpickle.decode(
-        jsonpickle.encode(regressor, unpicklable=True)
-    )
+    restored_regressor = jsonpickle.decode(jsonpickle.encode(regressor, unpicklable=True))
     np.testing.assert_allclose(
         restored_regressor.tuned_predict(X), regressor.tuned_predict(X)
     )
@@ -528,12 +476,9 @@ def test_xgboost_jsonpickle_multitarget_roundtrip() -> None:
 
 @pytest.mark.fast
 def test_xgboost_evaluation_results_roundtrip() -> None:
-    pytest.importorskip("xgboost")
     X = numeric_data(40)
     y = Series((X["x0"] + X["x1"] > 0).astype(int), name="target")
-    model = XGBoostClassifier(
-        model_args={"n_estimators": 3, "max_depth": 2, "n_jobs": 1}
-    )
+    model = XGBoostClassifier(model_args={"n_estimators": 3, "max_depth": 2, "n_jobs": 1})
     model.refit_tuned(X, y, tuned_args={})
     predictions = model.tuned_predict(X)
     probabilities = model.predict_proba(X)
@@ -672,9 +617,7 @@ def test_kan_skorch_adapter_and_multitarget(
     tuned_multi.refit_tuned(X, y, tuned_args=fixed_trial.params)
     multi_score = tuned_multi.tuned_scores(X, y)
     assert np.isfinite(multi_score)
-    restored_multi = jsonpickle.decode(
-        jsonpickle.encode(tuned_multi, unpicklable=True)
-    )
+    restored_multi = jsonpickle.decode(jsonpickle.encode(tuned_multi, unpicklable=True))
     assert restored_multi.tuned_scores(X, y) == pytest.approx(multi_score)
 
     y_reg = DataFrame(
@@ -697,9 +640,7 @@ def test_kan_skorch_adapter_and_multitarget(
     restored_regression = jsonpickle.decode(
         jsonpickle.encode(tuned_regression, unpicklable=True)
     )
-    assert restored_regression.tuned_scores(X, y_reg) == pytest.approx(
-        regression_score
-    )
+    assert restored_regression.tuned_scores(X, y_reg) == pytest.approx(regression_score)
 
 
 @pytest.mark.fast
@@ -707,9 +648,7 @@ def test_kan_scheduler_uses_training_batches() -> None:
     assert KANEstimator._scheduler_period(1_000, 8, has_validation=True) == 56
     assert KANEstimator._scheduler_period(1_000, 8, has_validation=False) == 64
     assert (
-        KANEstimator._scheduler_period(
-            1_000, 8, has_validation=True, batch_size=100
-        )
+        KANEstimator._scheduler_period(1_000, 8, has_validation=True, batch_size=100)
         == 64
     )
 
@@ -870,7 +809,8 @@ def test_tabpfn_adaptive_error_oof_uses_native_feature_view(
 
 
 @pytest.mark.fast
-def test_tabpfn_versions_and_multitarget_protocol(
+def test_tabpfn_v3_multitarget_protocol_and_official_fitted_state(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -881,6 +821,16 @@ def test_tabpfn_versions_and_multitarget_protocol(
     )
     monkeypatch.setattr("df_analyze.models.tabpfn.ModelVersion", str)
     monkeypatch.setattr("df_analyze.models.tabpfn._TABPFN_IMPORT_ERROR", None)
+    monkeypatch.setattr(
+        "df_analyze.models.tabpfn.load_official_fitted_model",
+        lambda path, device: jsonpickle.decode(Path(path).read_text()),
+    )
+    monkeypatch.setattr(
+        "df_analyze.models.tabpfn.save_official_fitted_model",
+        lambda model, path: Path(path).write_text(
+            jsonpickle.encode(model, unpicklable=True)
+        ),
+    )
     monkeypatch.setattr("df_analyze.models.tabpfn.torch.cuda.is_available", lambda: False)
 
     X = numeric_data(30)
@@ -890,9 +840,9 @@ def test_tabpfn_versions_and_multitarget_protocol(
             "second": (X["x1"] > 0).astype(int),
         }
     )
-    classifier = TabPFNClassifierV26(model_args={"n_estimators": 2})
+    classifier = TabPFNClassifierV3(model_args={"n_estimators": 2})
     classifier.fit(X, y_cls)
-    assert classifier.version == "v2.6"
+    assert classifier.version == "v3"
     assert classifier.predict(X).shape == y_cls.shape
     probabilities = classifier.predict_proba_untuned(X)
     assert isinstance(probabilities, dict)
@@ -909,33 +859,29 @@ def test_tabpfn_versions_and_multitarget_protocol(
     tuned_predictions = classifier.tuned_predict(X)
     probabilities = classifier.predict_proba_untuned(X)
     tuned_probabilities = classifier.predict_proba(X)
-    restored_classifier = jsonpickle.decode(
-        jsonpickle.encode(classifier, unpicklable=True)
-    )
-    np.testing.assert_array_equal(restored_classifier.predict(X), predictions)
-    np.testing.assert_array_equal(
-        restored_classifier.tuned_predict(X), tuned_predictions
-    )
-    restored_probabilities = restored_classifier.predict_proba_untuned(X)
-    restored_tuned_probabilities = restored_classifier.predict_proba(X)
+    classifier.externalize_fitted_models(tmp_path / "classifier")
+    assert classifier.model is None
+    assert classifier.tuned_model is None
+    classifier.load_externalized_models(tmp_path)
+    np.testing.assert_array_equal(classifier.predict(X), predictions)
+    np.testing.assert_array_equal(classifier.tuned_predict(X), tuned_predictions)
+    restored_probabilities = classifier.predict_proba_untuned(X)
+    restored_tuned_probabilities = classifier.predict_proba(X)
     for target in probabilities:
-        np.testing.assert_allclose(
-            restored_probabilities[target], probabilities[target]
-        )
+        np.testing.assert_allclose(restored_probabilities[target], probabilities[target])
         np.testing.assert_allclose(
             restored_tuned_probabilities[target], tuned_probabilities[target]
         )
 
-    regressor = TabPFNRegressorV25(model_args={"n_estimators": 2})
+    regressor = TabPFNRegressorV3(model_args={"n_estimators": 2})
     target = Series(X["x0"] + X["x1"], name="target")
     regressor.fit(X, target)
-    assert regressor.version == "v2.5"
+    assert regressor.version == "v3"
     predictions = regressor.predict(X)
     assert len(predictions) == len(target)
-    restored_regressor = jsonpickle.decode(
-        jsonpickle.encode(regressor, unpicklable=True)
-    )
-    np.testing.assert_allclose(restored_regressor.predict(X), predictions)
+    regressor.externalize_fitted_models(tmp_path / "regressor")
+    regressor.load_externalized_models(tmp_path)
+    np.testing.assert_allclose(regressor.predict(X), predictions)
 
 
 @pytest.mark.fast
@@ -978,7 +924,7 @@ def test_tabpfn_full_feature_evaluation_accepts_native_missing_values(
     train = prepared_part(slice(0, 40))
     test = prepared_part(slice(40, None))
     options = SimpleNamespace(
-        models=[TabPFNClassifierV26],
+        models=[TabPFNClassifierV3],
         htune_cls_metric=ClassifierScorer.Accuracy,
         htune_reg_metric=None,
         htune_trials=1,
@@ -997,13 +943,11 @@ def test_tabpfn_full_feature_evaluation_accepts_native_missing_values(
     )
 
     tabpfn = next(
-        result
-        for result in evaluated.results
-        if result.model_cls is TabPFNClassifierV26
+        result for result in evaluated.results if result.model_cls is TabPFNClassifierV3
     )
     assert tabpfn.failure_reason is None
     assert np.isfinite(tabpfn.score)
-    assert tabpfn.model.shortname == "tabpfn-v2_6"
+    assert tabpfn.model.shortname == "tabpfn-v3"
     assert tabpfn.selected_cols == ["age", "city"]
 
 
@@ -1018,7 +962,7 @@ def test_tabpfn_preflight_revalidates_cached_input(
     monkeypatch.setattr("df_analyze.models.tabpfn._TABPFN_IMPORT_ERROR", None)
     monkeypatch.delenv("TABPFN_ALLOW_CPU_LARGE_DATASET", raising=False)
 
-    model = TabPFNClassifierV26()
+    model = TabPFNClassifierV3()
     X = numeric_data(30)
     model.preflight(X, Series((X["x0"] > 0).astype(int), name="target"))
 
@@ -1035,7 +979,6 @@ def test_tabpfn_preflight_converts_upstream_system_exit(
     model = TabPFNClassifierV3()
     X = numeric_data(30)
     y = Series((X["x0"] > 0).astype(int), name="target")
-    monkeypatch.setattr(tabpfn_module, "_prepare_tabpfn_cache_dir", lambda: None)
 
     def exit_during_checkpoint_load(*args, **kwargs):
         raise SystemExit("checkpoint authentication failed")
@@ -1131,81 +1074,6 @@ def test_tabpfn_v3_checkpoint_feature_limit_is_per_estimator() -> None:
     y = Series([0, 1], name="target")
 
     TabPFNClassifierV3()._validate_checkpoint_limits(X, y, config)
-    with pytest.raises(ValueError, match=r"at most 1000 features"):
-        TabPFNClassifierV26()._validate_checkpoint_limits(X, y, config)
-
-
-@pytest.mark.fast
-def test_tabpfn_preflight_rejects_explicit_unwritable_cache(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    blocked = tmp_path / "blocked-cache"
-    monkeypatch.setenv("TABPFN_MODEL_CACHE_DIR", str(blocked))
-    monkeypatch.setattr(tabpfn_module, "_get_tabpfn_cache_dir", lambda: blocked)
-    monkeypatch.setattr(tabpfn_module, "_TABPFN_IMPORT_ERROR", None)
-    monkeypatch.setattr(tabpfn_module, "ModelVersion", str)
-    monkeypatch.setattr(
-        tabpfn_module, "OfficialTabPFNClassifier", FakeTabPFNClassifier
-    )
-
-    def reject_cache(path: Path) -> None:
-        raise PermissionError(f"denied: {path}")
-
-    monkeypatch.setattr(tabpfn_module, "_assert_cache_writable", reject_cache)
-    model = TabPFNClassifierV3()
-    X = numeric_data(30)
-    y = Series((X["x0"] > 0).astype(int), name="target")
-
-    with pytest.raises(
-        TabPFNSetupError,
-        match=r"TABPFN_MODEL_CACHE_DIR.*writable directory",
-    ):
-        model.preflight(X, y)
-
-
-@pytest.mark.fast
-def test_tabpfn_default_unwritable_cache_uses_writable_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    blocked = tmp_path / "blocked-cache"
-    state_dir = tmp_path / "state"
-    settings = SimpleNamespace(tabpfn=SimpleNamespace(model_cache_dir=None))
-    monkeypatch.delenv("TABPFN_MODEL_CACHE_DIR", raising=False)
-    monkeypatch.setenv("TABPFN_STATE_DIR", str(state_dir))
-    monkeypatch.setattr(tabpfn_module, "_get_tabpfn_cache_dir", lambda: blocked)
-    monkeypatch.setattr(tabpfn_module, "_tabpfn_settings", settings)
-
-    def check_cache(path: Path) -> None:
-        if path == blocked:
-            raise PermissionError(f"denied: {path}")
-        path.mkdir(parents=True, exist_ok=True)
-
-    monkeypatch.setattr(tabpfn_module, "_assert_cache_writable", check_cache)
-
-    with pytest.warns(UserWarning, match="default model cache is not writable"):
-        resolved = tabpfn_module._prepare_tabpfn_cache_dir()
-
-    fallback = state_dir / "model-cache"
-    assert resolved == fallback
-    assert os.environ["TABPFN_MODEL_CACHE_DIR"] == str(fallback)
-    assert settings.tabpfn.model_cache_dir == fallback
-
-
-@pytest.mark.fast
-def test_tabpfn_cli_version_selects_model_class() -> None:
-    parser = make_parser()
-    args = parser.parse_args(["--tabpfn-version", "v2_6"])
-    assert args.tabpfn_version == "v2_6"
-    dotted = parser.parse_args(["--tabpfn-version", "v2.5"])
-    assert dotted.tabpfn_version == "v2_5"
-    assert "--tabpfn-version {v3,v2.6,v2.5}" in parser.format_help()
-    options = object.__new__(ProgramOptions)
-    options.is_classification = True
-    options.classifiers = (DfAnalyzeClassifier.TabPFN,)
-    options.tabpfn_version = TabPFNVersion.V26
-    assert options.models == [TabPFNClassifierV26]
 
 
 @pytest.mark.fast

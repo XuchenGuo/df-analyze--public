@@ -7,15 +7,7 @@ sys.path.append(str(SRC))
 
 
 def main() -> None:
-    from df_analyze.runtime.bootstrap import bootstrap
-
-    script = ROOT / "df-analyze.py"
-    bootstrap(
-        "df-analyze",
-        script if script.exists() else None,
-        ROOT,
-        module="df_analyze",
-    )
+    import torch  # noqa: F401
 
     from df_analyze._main import main as run
 

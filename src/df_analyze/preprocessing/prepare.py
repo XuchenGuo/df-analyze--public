@@ -31,7 +31,7 @@ from df_analyze._constants import (
     UNIVARIATE_PRED_MAX_N_SAMPLES,
 )
 from df_analyze.analysis.univariate.describe import describe_all_features
-from df_analyze.enumerables import FeatureDownsampleMethod, NanHandling, ValidationMethod
+from df_analyze.enumerables import NanHandling, ValidationMethod
 from df_analyze.preprocessing.cleaning import (
     clean_regression_target,
     clean_regression_targets,
@@ -986,23 +986,15 @@ class PreparedData:
         if info is not None:
             info.final_shape = X.shape
             info.runtimes.setdefault(f"feature downsampling ({feature_origin})", 0.0)
-        is_projection = feature_origin in {
-            FeatureDownsampleMethod.SVD.value,
-            FeatureDownsampleMethod.SparseRandomProjection.value,
+        lineage = {
+            str(col): self.feature_lineage.get(str(col), str(col))
+            for col in X.columns
         }
-        if is_projection:
-            lineage = {str(col): str(col) for col in X.columns}
-            X_tabpfn = X
-        else:
-            lineage = {
-                str(col): self.feature_lineage.get(str(col), str(col))
-                for col in X.columns
-            }
-            raw_cols: list[str] = []
-            for source in lineage.values():
-                if source in self.X_tabpfn.columns and source not in raw_cols:
-                    raw_cols.append(source)
-            X_tabpfn = self.X_tabpfn.loc[:, raw_cols]
+        raw_cols: list[str] = []
+        for source in lineage.values():
+            if source in self.X_tabpfn.columns and source not in raw_cols:
+                raw_cols.append(source)
+        X_tabpfn = self.X_tabpfn.loc[:, raw_cols]
         return PreparedData(
             X=X,
             X_tabpfn=X_tabpfn,

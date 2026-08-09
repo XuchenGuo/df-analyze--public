@@ -16,7 +16,6 @@ from df_analyze.cli.parsing import (
     resolved_path,
 )
 from df_analyze.runtime.hardware import DeviceIntent, RuntimePolicy, get_runtime
-from df_analyze.runtime.install import DeviceInstall
 
 if TYPE_CHECKING:
     pass
@@ -217,13 +216,8 @@ generally be a small integer value like 2, 4, or 8.
 
 DEVICE_HELP = """
 Choose where embedding runs. `auto` (recommended) uses CUDA when available and
-tries the complete embedding once more on CPU after a CUDA runtime error. `cpu`
-disables GPU use. `cuda` requires CUDA and stops on CUDA runtime errors.
-"""
-
-DEVICE_INSTALL_HELP = """
-Choose whether df-embed may create a separate CUDA-enabled PyTorch environment:
-`auto`, `ask`, or `never` (the default).
+uses CPU otherwise. `cpu` disables GPU use. `cuda` requires CUDA and stops on
+CUDA runtime errors.
 """
 
 
@@ -244,7 +238,6 @@ class EmbeddingOptions(Debug):
         download: bool = False,
         force_download: bool = False,
         device: Union[str, DeviceIntent] = DeviceIntent.Auto,
-        device_install: Union[str, DeviceInstall, None] = None,
     ) -> None:
         # memoization-related
         # other
@@ -263,9 +256,6 @@ class EmbeddingOptions(Debug):
         self.force_download: bool = force_download
         self.any_download = any_download
         self.device = DeviceIntent.from_arg(device)
-        self.device_install = DeviceInstall.from_arg(
-            device_install, self.device.value
-        )
 
     @property
     def runtime(self) -> RuntimePolicy:
@@ -304,7 +294,6 @@ class EmbeddingOptions(Debug):
             download=args.download,
             force_download=args.force_download,
             device=args.device,
-            device_install=args.device_install,
         )
 
     def __str__(self) -> str:
@@ -387,13 +376,6 @@ def make_parser() -> ArgumentParser:
         choices=DeviceIntent.choices(),
         default=DeviceIntent.Auto.value,
         help=DEVICE_HELP,
-    )
-    parser.add_argument(
-        "--device-install",
-        type=DeviceInstall.parse,
-        choices=DeviceInstall.choices(),
-        default=None,
-        help=DEVICE_INSTALL_HELP,
     )
     parser.add_argument(
         "--download",

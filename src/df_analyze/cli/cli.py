@@ -16,7 +16,6 @@ import gzip
 import lzma
 import os
 import secrets
-import shlex
 import sys
 import traceback
 from argparse import ArgumentParser, Namespace, RawTextHelpFormatter
@@ -99,14 +98,12 @@ from df_analyze.cli.text import (
     CLS_HELP_STR,
     CLS_TUNE_METRIC,
     DEVICE_HELP,
-    DEVICE_INSTALL_HELP,
     DF_HELP_STR,
     DF_TEST_SETS_METHOD_HELP_STR,
     DF_TESTS_HELP_STR,
     DF_TRAIN_HELP_STR,
     DOWNSAMPLE_SCREENING_HELP,
     DROP_HELP_STR,
-    EC_CHECKPOINT_EVERY_HELP,
     EC_EMPTY_UNIONS_HELP,
     EC_EPSILON_HELP,
     EC_FOLDS_HELP,
@@ -114,10 +111,7 @@ from df_analyze.cli.text import (
     EC_METHODS_HELP,
     EC_MODEL_SEED_MODE_HELP,
     EC_OUTPUT_DETAIL_HELP,
-    EC_PROFILE_HELP,
-    EC_RECURRENCE_THRESHOLD_HELP,
     EC_REPETITIONS_HELP,
-    EC_RESUME_HELP,
     EC_SAVE_PREDICTIONS_HELP,
     EMBED_SELECT_MODEL_HELP,
     ERROR_CONSISTENCY_HELP,
@@ -151,7 +145,6 @@ from df_analyze.cli.text import (
     SEED_HELP_STR,
     SEP_HELP_STR,
     SHEET_HELP_STR,
-    TABPFN_VERSION_HELP,
     TARGET_HELP_STR,
     TARGETS_HELP_STR,
     TEST_VALSIZES_HELP,
@@ -162,6 +155,7 @@ from df_analyze.cli.text import (
     WRAP_SELECT_HELP,
     WRAP_SELECT_MODEL_HELP,
 )
+from df_analyze.cli.arguments import split_cli_args as _split_cli_args
 from df_analyze.enumerables import (
     ClassifierScorer,
     ClsScore,
@@ -176,14 +170,12 @@ from df_analyze.enumerables import (
     RegressorScorer,
     RegScore,
     SeedKind,
-    TabPFNVersion,
     ValidationMethod,
     WrapperSelection,
     WrapperSelectionModel,
 )
 from df_analyze.loading import load_spreadsheet
 from df_analyze.runtime.hardware import DeviceIntent, RuntimePolicy, get_runtime
-from df_analyze.runtime.install import DeviceInstall
 from df_analyze.saving import add_fold_idx
 
 if TYPE_CHECKING:
@@ -353,7 +345,6 @@ class ProgramOptions(Debug):
             str, FeatureDownsampleMethod
         ] = FeatureDownsampleMethod.None_,
         n_feat_downsample: Union[int, float] = N_FEAT_DOWNSAMPLE_DEFAULT,
-        downsample_variance_threshold: Optional[float] = None,
         downsample_save_scores: bool = False,
         downsample_chunk_size: int = DOWNSAMPLE_CHUNK_SIZE_DEFAULT,
         downsample_screening_fraction: float = 0.25,
@@ -367,26 +358,19 @@ class ProgramOptions(Debug):
         svmlight_sample_id_column: Optional[str] = None,
         downsample_protected_features: Optional[list[str]] = None,
         device: Union[str, DeviceIntent] = DeviceIntent.Auto,
-        device_install: Union[str, DeviceInstall, None] = None,
         targets: Optional[list[str]] = None,
         mt_agg_strategy: str = "borda",
         mt_top_k: Optional[int] = None,
         error_consistency: bool = False,
-        ec_profile: str = "none",
-        ec_profile_scope: str = "df-analyze defaults",
-        ec_profile_overrides: Optional[dict[str, Any]] = None,
         ec_folds: int = 5,
         ec_repetitions: int = 5,
         ec_model_seed_mode: str = "vary",
         ec_methods: Optional[tuple[str, ...]] = None,
         ec_holdout_role: str = "test",
         ec_output_detail: str = "full",
-        ec_resume: bool = False,
-        ec_checkpoint_every: int = 5,
         ec_save_predictions: bool = False,
         ec_empty_unions: str = "warn",
         ec_epsilon: float = 0.0,
-        ec_recurrence_threshold: float = 0.5,
         adaptive_error: bool = False,
         aer_oof_folds: int = 5,
         aer_bins: int = 20,
@@ -410,7 +394,6 @@ class ProgramOptions(Debug):
         aer_ens_trim_q: float = 0.6,
         aer_ens_tau_low: float = 0.15,
         aer_ens_tau_high: float = 0.35,
-        tabpfn_version: Union[str, TabPFNVersion] = TabPFNVersion.V3,
     ) -> None:
         # memoization-related
         # other
@@ -484,9 +467,6 @@ class ProgramOptions(Debug):
         if self.mt_top_k is not None and self.mt_top_k <= 0:
             self.mt_top_k = None
         self.error_consistency: bool = bool(error_consistency)
-        self.ec_profile: str = str(ec_profile).lower()
-        self.ec_profile_scope: str = str(ec_profile_scope)
-        self.ec_profile_overrides: dict[str, Any] = dict(ec_profile_overrides or {})
         self.ec_folds: int = int(ec_folds)
         self.ec_repetitions: int = int(ec_repetitions)
         self.ec_model_seed_mode: str = str(ec_model_seed_mode).lower()
@@ -501,21 +481,15 @@ class ProgramOptions(Debug):
         self.ec_output_detail: str = str(ec_output_detail).lower()
         if self.ec_output_detail not in {"summary", "pairwise", "full"}:
             raise ValueError("EC output detail must be summary, pairwise, or full.")
-        self.ec_resume: bool = bool(ec_resume)
-        self.ec_checkpoint_every: int = int(ec_checkpoint_every)
-        if self.ec_checkpoint_every < 1:
-            raise ValueError("EC checkpoint interval must be at least 1.")
         self.ec_save_predictions: bool = bool(ec_save_predictions)
         self.ec_empty_unions: str = str(ec_empty_unions)
         self.ec_epsilon: float = float(ec_epsilon)
-        self.ec_recurrence_threshold: float = float(ec_recurrence_threshold)
         self.is_classification: bool = is_classification
         self.classifiers: Tuple[DfAnalyzeClassifier, ...] = tuple(
             sorted(set(classifiers))
         )
         self.regressors: Tuple[DfAnalyzeRegressor, ...] = tuple(sorted(set(regressors)))
-        self.tabpfn_version = TabPFNVersion.from_arg(tabpfn_version)
-        self._validate_optional_model_dependencies()
+        self._validate_model_dependencies()
         # self.htune: bool = htune
         # self.htune_val: ValMethod = htune_val
         # self.htune_val_size: Size = htune_val_size
@@ -534,18 +508,6 @@ class ProgramOptions(Debug):
         self.no_preds: bool = no_preds
         self.feat_downsample = FeatureDownsampleMethod.from_arg(feat_downsample)
         self.n_feat_downsample = n_feat_downsample
-        self.downsample_variance_threshold = (
-            None
-            if downsample_variance_threshold is None
-            else float(downsample_variance_threshold)
-        )
-        if self.downsample_variance_threshold is not None and (
-            not np.isfinite(self.downsample_variance_threshold)
-            or self.downsample_variance_threshold < 0.0
-        ):
-            raise ValueError(
-                "Downsample variance threshold must be a finite non-negative value."
-            )
         self.downsample_save_scores = bool(downsample_save_scores)
         self.downsample_chunk_size = int(downsample_chunk_size)
         if self.downsample_chunk_size <= 0:
@@ -575,9 +537,6 @@ class ProgramOptions(Debug):
             dict.fromkeys(downsample_protected_features or [])
         )
         self.device: DeviceIntent = DeviceIntent.from_arg(device)
-        self.device_install: DeviceInstall = DeviceInstall.from_arg(
-            device_install, self.device.value
-        )
         self.adaptive_error: bool = adaptive_error
         self.aer_oof_folds: int = aer_oof_folds
         self.aer_bins: int = aer_bins
@@ -629,10 +588,11 @@ class ProgramOptions(Debug):
             if source.value != DfAnalyzeClassifier.TabPFN.value:
                 clses.append(source.get_model())
                 continue
-            from df_analyze.models.tabpfn import TABPFN_CLASSIFIERS, TABPFN_REGRESSORS
+            from df_analyze.models.tabpfn import TabPFNClassifierV3, TabPFNRegressorV3
 
-            versions = TABPFN_CLASSIFIERS if self.is_classification else TABPFN_REGRESSORS
-            clses.append(versions[self.tabpfn_version.value])
+            clses.append(
+                TabPFNClassifierV3 if self.is_classification else TabPFNRegressorV3
+            )
         return clses
 
     @property
@@ -650,7 +610,7 @@ class ProgramOptions(Debug):
     def set_runtime_workload(self, n_samples: int, n_features: int) -> None:
         self._runtime_workload = (int(n_samples), int(n_features))
 
-    def _validate_optional_model_dependencies(self) -> None:
+    def _validate_model_dependencies(self) -> None:
         from df_analyze.enumerables import (
             is_catboost_available,
             is_kan_available,
@@ -658,7 +618,7 @@ class ProgramOptions(Debug):
             is_xgboost_available,
         )
 
-        optional_models = (
+        model_dependencies = (
             (
                 "CatBoost",
                 "catboost",
@@ -689,39 +649,20 @@ class ProgramOptions(Debug):
             ),
         )
 
-        for display, package, classifier, regressor, available in optional_models:
+        for display, package, classifier, regressor, available in model_dependencies:
             requested_cls = classifier in self.classifiers
             requested_reg = regressor in self.regressors
             if not (requested_cls or requested_reg) or available():
                 continue
-            self.classifiers = tuple(
-                model for model in self.classifiers if model is not classifier
-            )
-            self.regressors = tuple(
-                model for model in self.regressors if model is not regressor
-            )
             selected_args = []
             if requested_cls:
                 selected_args.append(f"--classifiers {classifier.value}")
             if requested_reg:
                 selected_args.append(f"--regressors {regressor.value}")
-            warn(
+            raise ArgumentError(
                 f"{display} was requested but `{package}` is not installed. "
-                f"Continuing after removing it from {', '.join(selected_args)}. "
-                f"Install it with `pip install {package}` to enable it."
-            )
-
-        if self.is_classification and len(self.classifiers) == 0:
-            raise ArgumentError(
-                "No available classifiers remain after dependency checks. Install "
-                "the missing optional package(s) named in the preceding warning(s), "
-                "or choose a different value for `--classifiers`."
-            )
-        if not self.is_classification and len(self.regressors) == 0:
-            raise ArgumentError(
-                "No available regressors remain after dependency checks. Install "
-                "the missing optional package(s) named in the preceding warning(s), "
-                "or choose a different value for `--regressors`."
+                f"Cannot satisfy {', '.join(selected_args)}. Install the project "
+                "dependencies before running df-analyze."
             )
 
     @staticmethod
@@ -907,25 +848,6 @@ class ProgramOptions(Debug):
 
     def hash(self) -> str:
         hashable = {**self.__dict__}
-        # These options do not change the result. Excluding them from the hash
-        # lets --ec-resume find the original run directory.
-        hashable["ec_resume"] = False
-        hashable["ec_checkpoint_every"] = 5
-        argv = list(hashable.get("cli_argv", []))
-        normalized_argv = []
-        skip_next = False
-        for value in argv:
-            if skip_next:
-                skip_next = False
-                continue
-            if value == "--ec-resume":
-                continue
-            if value == "--ec-checkpoint-every":
-                skip_next = True
-                continue
-            normalized_argv.append(value)
-        hashable["cli_argv"] = normalized_argv
-        hashable["cli_args"] = " ".join(normalized_argv)
         return get_hash(
             hashable,
             ignores=[
@@ -1012,20 +934,10 @@ class ProgramOptions(Debug):
             opts.mt_top_k = None
         if not hasattr(opts, "device"):
             opts.device = DeviceIntent.Auto
-        if not hasattr(opts, "device_install"):
-            opts.device_install = DeviceInstall.Never
         if not hasattr(opts, "cli_argv"):
             opts.cli_argv = list(sys.argv)
-        if not hasattr(opts, "tabpfn_version"):
-            opts.tabpfn_version = TabPFNVersion.V3
         if not hasattr(opts, "error_consistency"):
             opts.error_consistency = False
-        if not hasattr(opts, "ec_profile"):
-            opts.ec_profile = "none"
-        if not hasattr(opts, "ec_profile_scope"):
-            opts.ec_profile_scope = "df-analyze defaults"
-        if not hasattr(opts, "ec_profile_overrides"):
-            opts.ec_profile_overrides = {}
         if not hasattr(opts, "ec_folds"):
             opts.ec_folds = 5
         if not hasattr(opts, "ec_repetitions"):
@@ -1038,22 +950,15 @@ class ProgramOptions(Debug):
             opts.ec_holdout_role = "test"
         if not hasattr(opts, "ec_output_detail"):
             opts.ec_output_detail = "full"
-        if not hasattr(opts, "ec_resume"):
-            opts.ec_resume = False
-        if not hasattr(opts, "ec_checkpoint_every"):
-            opts.ec_checkpoint_every = 5
         if not hasattr(opts, "ec_save_predictions"):
             opts.ec_save_predictions = False
         if not hasattr(opts, "ec_empty_unions"):
             opts.ec_empty_unions = "warn"
         if not hasattr(opts, "ec_epsilon"):
             opts.ec_epsilon = 0.0
-        if not hasattr(opts, "ec_recurrence_threshold"):
-            opts.ec_recurrence_threshold = 0.5
         defaults = {
             "feat_downsample": FeatureDownsampleMethod.None_,
             "n_feat_downsample": N_FEAT_DOWNSAMPLE_DEFAULT,
-            "downsample_variance_threshold": None,
             "downsample_save_scores": False,
             "downsample_chunk_size": DOWNSAMPLE_CHUNK_SIZE_DEFAULT,
             "downsample_screening_fraction": 0.25,
@@ -1161,41 +1066,6 @@ class ProgramOptions(Debug):
             )
 
         return df_all, ix_train, ix_tests
-
-
-_COLUMN_LIST_OPTIONS = frozenset({"--targets", "--categoricals", "--ordinals", "--drops"})
-
-
-def _split_cli_args(args: str) -> list[str]:
-    """Split programmatic/spreadsheet CLI text without damaging Windows paths."""
-    lexer = shlex.shlex(args, posix=True)
-    lexer.commenters = ""
-    lexer.whitespace_split = True
-    lexer.escape = ""
-    # These argument strings use double quotes for names containing spaces.
-    # Keep apostrophes in ordinary column names instead of treating them as quotes.
-    lexer.quotes = '"'
-    tokens = list(lexer)
-
-    # Spreadsheet headers may quote column names separately, while the CLI uses
-    # one comma-separated value. Convert both forms for ``column_parser``.
-    normalized: list[str] = []
-    index = 0
-    while index < len(tokens):
-        token = tokens[index]
-        normalized.append(token)
-        index += 1
-        if token not in _COLUMN_LIST_OPTIONS:
-            continue
-
-        columns: list[str] = []
-        while index < len(tokens) and not tokens[index].startswith("--"):
-            columns.extend(col for col in tokens[index].split(",") if col)
-            index += 1
-        if columns:
-            normalized.append(",".join(columns))
-
-    return normalized
 
 
 def parse_and_merge_args(parser: ArgumentParser, args: Optional[str] = None) -> Namespace:
@@ -1373,21 +1243,6 @@ def make_parser() -> ArgumentParser:
         default=DeviceIntent.Auto.value,
         help=DEVICE_HELP,
     )
-    parser.add_argument(
-        "--device-install",
-        type=DeviceInstall.parse,
-        choices=DeviceInstall.choices(),
-        default=None,
-        help=DEVICE_INSTALL_HELP,
-    )
-    parser.add_argument(
-        "--tabpfn-version",
-        type=TabPFNVersion.parse,
-        choices=TabPFNVersion.choices(),
-        metavar="{v3,v2.6,v2.5}",
-        default=TabPFNVersion.V3.value,
-        help=TABPFN_VERSION_HELP,
-    )
     # NOTE: `nargs="+"` allows repeats, must be removed after
     parser.add_argument(
         "--classifiers",
@@ -1429,12 +1284,6 @@ def make_parser() -> ArgumentParser:
         type=int_or_percent_parser(N_FEAT_DOWNSAMPLE_DEFAULT),
         default=N_FEAT_DOWNSAMPLE_DEFAULT,
         help=N_FEAT_DOWNSAMPLE_HELP,
-    )
-    parser.add_argument(
-        "--downsample-variance-threshold",
-        type=float,
-        default=None,
-        help="Minimum sample variance retained by variance downsampling.",
     )
     parser.add_argument(
         "--downsample-save-scores",
@@ -1743,7 +1592,7 @@ def make_parser() -> ArgumentParser:
     parser.add_argument(
         "--test-val-size",
         type=int_or_percent_parser(default=0.4),
-        default=None,
+        default=0.4,
         help=TEST_VALSIZES_HELP,
     )
     parser.add_argument(
@@ -1755,27 +1604,21 @@ def make_parser() -> ArgumentParser:
         help=ERROR_CONSISTENCY_HELP,
     )
     parser.add_argument(
-        "--ec-profile",
-        choices=["none", "classification-paper", "regression-paper"],
-        default="none",
-        help=EC_PROFILE_HELP,
-    )
-    parser.add_argument(
         "--ec-folds",
         type=int,
-        default=None,
+        default=5,
         help=EC_FOLDS_HELP,
     )
     parser.add_argument(
         "--ec-repetitions",
         type=int,
-        default=None,
+        default=5,
         help=EC_REPETITIONS_HELP,
     )
     parser.add_argument(
         "--ec-model-seed-mode",
         choices=["vary", "fixed"],
-        default=None,
+        default="vary",
         help=EC_MODEL_SEED_MODE_HELP,
     )
     parser.add_argument(
@@ -1787,7 +1630,7 @@ def make_parser() -> ArgumentParser:
     parser.add_argument(
         "--ec-holdout-role",
         choices=["test", "validation"],
-        default=None,
+        default="test",
         help=EC_HOLDOUT_ROLE_HELP,
     )
     parser.add_argument(
@@ -1795,18 +1638,6 @@ def make_parser() -> ArgumentParser:
         choices=["summary", "pairwise", "full"],
         default="full",
         help=EC_OUTPUT_DETAIL_HELP,
-    )
-    parser.add_argument(
-        "--ec-resume",
-        action="store_true",
-        default=False,
-        help=EC_RESUME_HELP,
-    )
-    parser.add_argument(
-        "--ec-checkpoint-every",
-        type=int,
-        default=5,
-        help=EC_CHECKPOINT_EVERY_HELP,
     )
     parser.add_argument(
         "--ec-save-predictions",
@@ -1825,12 +1656,6 @@ def make_parser() -> ArgumentParser:
         type=float,
         default=0.0,
         help=EC_EPSILON_HELP,
-    )
-    parser.add_argument(
-        "--ec-recurrence-threshold",
-        type=float,
-        default=0.5,
-        help=EC_RECURRENCE_THRESHOLD_HELP,
     )
     parser.add_argument(
         "--mt-agg-strategy",
@@ -2072,8 +1897,6 @@ def get_parser_dict() -> ArgsDict:
         "--drops": (RandKind.Columns, None),
         "--mode": (RandKind.ChooseOne, ["classify", "regress"]),
         "--device": (RandKind.ChooseOne, DeviceIntent.choices()),
-        "--device-install": (RandKind.ChooseOne, DeviceInstall.choices()),
-        "--tabpfn-version": (RandKind.ChooseOne, TabPFNVersion.choices()),
         "--classifiers": (
             RandKind.ChooseN,
             DfAnalyzeClassifier.choices(),
@@ -2335,56 +2158,28 @@ def get_options(args: Optional[str] = None) -> ProgramOptions:
     # parser = ArgumentParser(description=DESC)
     parser = make_parser()
     cli_args = parse_and_merge_args(parser, args)
-    from df_analyze.analysis.error_consistency.profiles import apply_ec_profile
-
-    try:
-        cli_args = apply_ec_profile(cli_args, cli_args.mode)
-    except ValueError as error:
-        raise ArgumentError(str(error)) from error
 
     if cli_args.ec_folds < 2:
         raise ArgumentError("Argument `--ec-folds` must be at least 2.")
     if cli_args.ec_repetitions < 1:
         raise ArgumentError("Argument `--ec-repetitions` must be at least 1.")
-    if cli_args.ec_checkpoint_every < 1:
-        raise ArgumentError("Argument `--ec-checkpoint-every` must be at least 1.")
     if not np.isfinite(cli_args.ec_epsilon) or cli_args.ec_epsilon < 0:
         raise ArgumentError("Argument `--ec-epsilon` must be a finite value >= 0.")
-    if not np.isfinite(cli_args.ec_recurrence_threshold) or not (
-        0.0 <= cli_args.ec_recurrence_threshold <= 1.0
-    ):
-        raise ArgumentError(
-            "Argument `--ec-recurrence-threshold` must be between 0 and 1."
-        )
     if cli_args.ec_methods:
         from df_analyze.analysis.error_consistency.regression import (
             normalize_regression_method,
         )
 
         normalized = []
-        legacy_ratio_diff_sign = False
         for method in cli_args.ec_methods:
             if str(method).strip().lower() == "all":
                 continue
-            if str(method).strip().lower().replace(" ", "_") in {
-                "ratio_diff_sign",
-                "ratio-diff-sign",
-                "ratio-diff-signed",
-            }:
-                legacy_ratio_diff_sign = True
             try:
                 clean = normalize_regression_method(method)
             except ValueError as error:
                 raise ArgumentError(str(error)) from error
             if clean not in normalized:
                 normalized.append(clean)
-        if legacy_ratio_diff_sign:
-            warn(
-                "`ratio_diff_sign` is an ambiguous legacy EC method name. "
-                "It retains the historical magnitude-first summary; prefer "
-                "`ratio_diff_sign_magnitude` or request "
-                "`ratio_diff_sign_reference` for the signed reference aggregation."
-            )
         cli_args.ec_methods = tuple(normalized) if normalized else None
 
     mode = str(cli_args.mode).lower()
@@ -2489,14 +2284,8 @@ def get_options(args: Optional[str] = None) -> ProgramOptions:
         if downsample_method is FeatureDownsampleMethod.None_:
             raise ArgumentError("SVMlight input requires `--feat-downsample`.")
         indexed_methods = {
-            FeatureDownsampleMethod.Auto,
-            FeatureDownsampleMethod.Random,
-            FeatureDownsampleMethod.Variance,
             FeatureDownsampleMethod.NormalizedVariance,
             FeatureDownsampleMethod.FTest,
-            FeatureDownsampleMethod.RankEnsemble,
-            FeatureDownsampleMethod.SelectorEnsemble,
-            FeatureDownsampleMethod.StableRank,
         }
         if downsample_method not in indexed_methods:
             allowed = ", ".join(sorted(method.value for method in indexed_methods))
@@ -2507,14 +2296,8 @@ def get_options(args: Optional[str] = None) -> ProgramOptions:
     elif cli_args.large_feature_mode:
         downsample_method = FeatureDownsampleMethod.from_arg(cli_args.feat_downsample)
         indexed_methods = {
-            FeatureDownsampleMethod.Auto,
-            FeatureDownsampleMethod.Random,
-            FeatureDownsampleMethod.Variance,
             FeatureDownsampleMethod.NormalizedVariance,
             FeatureDownsampleMethod.FTest,
-            FeatureDownsampleMethod.RankEnsemble,
-            FeatureDownsampleMethod.SelectorEnsemble,
-            FeatureDownsampleMethod.StableRank,
         }
         if downsample_method is FeatureDownsampleMethod.None_:
             raise ArgumentError("`--large-feature-mode` requires `--feat-downsample`.")
@@ -2579,25 +2362,18 @@ def get_options(args: Optional[str] = None) -> ProgramOptions:
         mt_agg_strategy=cli_args.mt_agg_strategy,
         mt_top_k=cli_args.mt_top_k,
         error_consistency=cli_args.error_consistency,
-        ec_profile=cli_args.ec_profile,
-        ec_profile_scope=cli_args.ec_profile_scope,
-        ec_profile_overrides=cli_args.ec_profile_overrides,
         ec_folds=cli_args.ec_folds,
         ec_repetitions=cli_args.ec_repetitions,
         ec_model_seed_mode=cli_args.ec_model_seed_mode,
         ec_methods=cli_args.ec_methods,
         ec_holdout_role=cli_args.ec_holdout_role,
         ec_output_detail=cli_args.ec_output_detail,
-        ec_resume=cli_args.ec_resume,
-        ec_checkpoint_every=cli_args.ec_checkpoint_every,
         ec_save_predictions=cli_args.ec_save_predictions,
         ec_empty_unions=cli_args.ec_empty_unions,
         ec_epsilon=cli_args.ec_epsilon,
-        ec_recurrence_threshold=cli_args.ec_recurrence_threshold,
         is_classification=is_cls,
         classifiers=classifiers,
         regressors=regressors,
-        tabpfn_version=cli_args.tabpfn_version,
         # htune=cli_args.htune,
         # htune_val=cli_args.htune_val,
         # htune_val_size=cli_args.htune_val_size,
@@ -2616,7 +2392,6 @@ def get_options(args: Optional[str] = None) -> ProgramOptions:
         no_preds=cli_args.no_preds,
         feat_downsample=cli_args.feat_downsample,
         n_feat_downsample=cli_args.n_feat_downsample,
-        downsample_variance_threshold=cli_args.downsample_variance_threshold,
         downsample_save_scores=cli_args.downsample_save_scores,
         downsample_chunk_size=cli_args.downsample_chunk_size,
         downsample_screening_fraction=cli_args.downsample_screening_fraction,
@@ -2632,7 +2407,6 @@ def get_options(args: Optional[str] = None) -> ProgramOptions:
         svmlight_sample_id_column=cli_args.svmlight_sample_id_column,
         downsample_protected_features=cli_args.downsample_protected_features,
         device=cli_args.device,
-        device_install=cli_args.device_install,
         adaptive_error=cli_args.adaptive_error,
         aer_oof_folds=cli_args.aer_oof_folds,
         aer_bins=cli_args.aer_bins,

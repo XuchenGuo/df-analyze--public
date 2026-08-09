@@ -226,19 +226,13 @@ If "classify", do classification. If "regress", do regression.
 """
 
 DEVICE_HELP = """
-Choose how supported work uses a GPU. `auto` (recommended) uses CUDA for neural
-models and TabPFN when it is available, and applies workload thresholds to KNN,
-CatBoost, XGBoost, and pairwise error consistency. An `auto` task that
-encounters a CUDA runtime error is tried once more on the CPU. `cpu` disables
-GPU use. `cuda` requires CUDA for selected work that supports it; CUDA errors
-stop the run, and CPU-only work remains on the CPU. GANDALF may use MPS in
-`auto` mode on a supported Mac.
-"""
-
-DEVICE_INSTALL_HELP = """
-Choose whether df-analyze may create a separate CUDA-enabled PyTorch
-environment: `auto`, `ask`, or `never` (the default). Setup requires a source
-checkout containing pyproject.toml and uv.lock.
+Choose how supported work uses an accelerator. `auto` (recommended) checks each
+selected component before execution: it uses CUDA when that component's backend
+is available, MPS for GANDALF on a supported Mac, and otherwise CPU. `cpu`
+disables accelerator checks. `cuda` requires CUDA for selected work that supports
+it; missing backends and runtime CUDA errors stop the run, while CPU-only work
+remains on the CPU. The startup plan shows the resolved device for every selected
+component.
 """
 
 CLASSIFIER_CHOICES = DfAnalyzeClassifier.choices()
@@ -325,16 +319,6 @@ Defaults are: [{" ".join(REGRESSOR_DEFAULTS)}].
   dummy       scikit-learn DummyRegressor.
 """
 
-TABPFN_VERSION_HELP = """
-TabPFN checkpoint to use. The default is v3; v2.6 and v2.5 select older
-checkpoints. This option applies only when `tabpfn` is selected. Before the
-first run, accept the matching Prior Labs license and authenticate with the
-Prior Labs browser flow or TABPFN_TOKEN. If the installed package reports a
-gated Hugging Face repository, use `hf auth login` or HF_TOKEN after accepting
-that repository's terms. Check the current license before commercial or
-production use.
-"""
-
 FEAT_SELECT_HELP = """
 The feature selection method(s) to use. Available options are:
 
@@ -364,9 +348,8 @@ is to prevent double-dipping / circular analysis that can result in
 
 FEAT_DOWNSAMPLE_HELP = """
 Reduce a wide feature matrix before the usual df-analyze feature selection.
-`auto` chooses a suitable method; `none` disables this step.
-`variance` uses raw sample variance; `normalized-variance` is scale invariant.
-The projection methods (`svd` and `sparse-rp`) create new component features.
+`normalized-variance` is target-independent and scale invariant. `f-test`
+uses a disjoint screening subset. `none` disables this step.
 """
 
 N_FEAT_DOWNSAMPLE_HELP = """
@@ -881,16 +864,6 @@ final-test holdout to select a model.
 
 """
 
-EC_PROFILE_HELP = """
-Use the settings from an EC reference experiment. `classification-paper` uses an
-80/20 holdout, 5 folds, 10 repetitions, and fixed model seeds.
-`regression-paper` uses an 80/20 holdout, 5 folds, 50 repetitions, fixed model
-seeds, and the seven reference methods. A CLI or spreadsheet value overrides
-the corresponding profile value. Profiles do not reproduce the original
-datasets, preprocessing, models, or result tables.
-
-"""
-
 EC_FOLDS_HELP = """
 Number of folds in each error-consistency repetition.
 
@@ -913,8 +886,8 @@ EC_METHODS_HELP = """
 Regression EC methods to calculate. The default is all seven methods:
 ratio, ratio_diff, ratio_sign, ratio_diff_sign_magnitude,
 intersection_union_sample, intersection_union_all, and
-intersection_union_distance. `ratio_diff_sign_reference` is an optional signed
-compatibility method and is not ranked. See docs/error_consistency.md for the
+intersection_union_distance. `ratio_diff_sign_reference` is the optional signed
+reference calculation and is not ranked. See docs/error_consistency.md for the
 formulas.
 
 """
@@ -941,17 +914,6 @@ at any level. The default is `full`.
 
 """
 
-EC_RESUME_HELP = """
-Continue EC from a matching checkpoint, or reuse a completed result. The
-prepared training data, holdout data, and EC settings must match.
-
-"""
-
-EC_CHECKPOINT_EVERY_HELP = """
-Save an EC checkpoint after this many completed repetitions. The default is 5.
-
-"""
-
 EC_EMPTY_UNIONS_HELP = """
 Handle classification pairs where neither model makes a holdout error. Choices
 are 0, 1, nan, drop, error, and warn. The default, warn, issues one warning and
@@ -962,12 +924,6 @@ stores the undefined comparison as NaN.
 EC_EPSILON_HELP = """
 Non-negative value added to regression ratio denominators near zero. The
 default is 0.
-
-"""
-
-EC_RECURRENCE_THRESHOLD_HELP = """
-Error-rate threshold used to label high recurrence in the combined
-adaptive-error/EC report. The default is 0.5; it is not a universal cutoff.
 
 """
 

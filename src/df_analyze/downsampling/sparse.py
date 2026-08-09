@@ -7,7 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Any, BinaryIO, Sequence, overload
+from typing import Any, Sequence, cast, overload
 from warnings import warn
 
 import numpy as np
@@ -104,6 +104,12 @@ class _MappedFeatureNames(_IndexedFeatureNames):
         super().__init__(size, index_base)
         self.mapped_names = mapped_names
 
+    @overload
+    def __getitem__(self, index: int) -> str: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> list[str]: ...
+
     def __getitem__(self, index: int | slice) -> str | list[str]:
         if isinstance(index, slice):
             return [self[idx] for idx in range(*index.indices(self.size))]
@@ -114,6 +120,22 @@ class _MappedFeatureNames(_IndexedFeatureNames):
         if mapped is not None:
             return str(mapped)
         return super().__getitem__(resolved)
+
+
+def _column_series(frame: object, name: str) -> Series:
+    if not isinstance(frame, DataFrame):
+        raise TypeError("Expected a pandas DataFrame.")
+    column = frame.loc[:, name]
+    if not isinstance(column, Series):
+        raise ValueError(f"Expected exactly one column named {name!r}.")
+    return column
+
+
+def _matrix_shape(matrix: csr_matrix) -> tuple[int, int]:
+    shape = matrix.shape
+    if shape is None or len(shape) != 2:
+        raise RuntimeError("Expected a two-dimensional sparse matrix.")
+    return int(shape[0]), int(shape[1])
 
 
 def _read_sidecar(path: Path, separator: str = ",") -> DataFrame:
@@ -163,22 +185,27 @@ def _feature_names_and_protected(
     missing = sorted(required - set(mapping.columns))
     if missing:
         raise ValueError(f"Feature map {path} is missing columns: {missing}")
-    numeric = pd.to_numeric(mapping["feature_index"], errors="raise")
-    if not np.equal(numeric, np.floor(numeric)).all():
+    numeric = Series(
+        pd.to_numeric(_column_series(mapping, "feature_index"), errors="raise"),
+        index=mapping.index,
+    )
+    numeric_values = numeric.to_numpy(dtype=np.float64)
+    if not np.equal(numeric_values, np.floor(numeric_values)).all():
         raise ValueError("Feature-map indices must be integers.")
-    internal = numeric.to_numpy(dtype=int) - index_base
+    internal = numeric_values.astype(int, copy=False) - index_base
     if np.any((internal < 0) | (internal >= n_features)):
         raise ValueError("Feature-map indices fall outside the SVMlight matrix.")
     if len(np.unique(internal)) != len(internal):
         raise ValueError("Feature-map indices must be unique.")
-    text_names = mapping["feature_name"].astype(str)
+    text_names = _column_series(mapping, "feature_name").astype(str)
     if text_names.duplicated().any():
         raise ValueError("Feature-map names must be unique.")
 
     mapped = np.full(n_features, None, dtype=object)
     mapped[internal] = text_names.to_numpy(dtype=object)
-    resolved_requested = internal[text_names.isin(requested).to_numpy()].tolist()
-    unresolved = requested - set(text_names[text_names.isin(requested)])
+    requested_mask = text_names.isin(list(requested))
+    resolved_requested = internal[requested_mask.to_numpy()].tolist()
+    unresolved = requested - set(text_names[requested_mask])
     for name in list(unresolved):
         if not name.startswith("feature_"):
             continue
@@ -232,7 +259,7 @@ def _validated_metadata(
         frame[target_name] = target
         return frame
 
-    observed = unify_nans(frame[[target_name]].copy())[target_name]
+    observed = _column_series(unify_nans(frame[[target_name]].copy()), target_name)
     if observed.isna().any():
         raise ValueError(
             f"Clinical sidecar target {target_name!r} contains missing values."
@@ -251,7 +278,9 @@ def _validated_metadata(
                 "label correspondence with the SVMlight target. Check row order."
             )
     else:
-        numeric = pd.to_numeric(observed, errors="raise").to_numpy(dtype=float)
+        numeric = Series(
+            pd.to_numeric(observed, errors="raise"), index=observed.index
+        ).to_numpy(dtype=np.float64)
         if not np.allclose(numeric, target.astype(float), equal_nan=False):
             raise ValueError(
                 f"Clinical target {target_name!r} in {path} does not match the "
@@ -279,7 +308,7 @@ def _force_imaging_continuous(
     inspection.conts = InspectionInfo(ColumnType.Continuous, dict(inspection.conts.infos))
 
 
-def _open_sparse(path: Path) -> BinaryIO:
+def _open_sparse(path: Path) -> Any:
     name = path.name.lower()
     if name.endswith(".gz"):
         return gzip.open(path, "rb")
@@ -420,7 +449,8 @@ def _load_sparse_matrix(
     index_base: int,
 ) -> csr_matrix:
     with _open_sparse(path) as source:
-        matrix, _ = load_svmlight_file(
+        loader = cast(Any, load_svmlight_file)
+        matrix, _ = loader(
             source,
             n_features=n_features,
             zero_based=index_base == 0,
@@ -451,8 +481,10 @@ def _encode_target(
         return Series(values.astype(float), name=name), None, None
     if encoder is None:
         encoder = LabelEncoder().fit(values)
+    assert encoder is not None
     encoded = encoder.transform(values)
-    labels = {idx: str(value) for idx, value in enumerate(encoder.classes_)}
+    classes = np.asarray(encoder.classes_, dtype=object).tolist()
+    labels = {idx: str(value) for idx, value in enumerate(classes)}
     return Series(encoded, name=name), labels, encoder
 
 
@@ -498,8 +530,9 @@ def _prepare_hybrid_split(
             "Clinical sidecars must have identical columns after name sanitization."
         )
 
-    train_imaging = DataFrame(train_values, columns=selected_names)
-    test_imaging = DataFrame(test_values, columns=selected_names)
+    imaging_columns = pd.Index(selected_names, dtype=str)
+    train_imaging = DataFrame(train_values, columns=imaging_columns)
+    test_imaging = DataFrame(test_values, columns=imaging_columns)
     frame = pd.concat(
         [
             pd.concat([train_metadata, train_imaging], axis=1),
@@ -532,9 +565,11 @@ def _prepare_hybrid_split(
         ValidationMethod.List,
     )
     return next(
-        prepared.get_splits(
-            test_size=options.test_val_size,
-            seed=options.seed,
+        iter(
+            prepared.get_splits(
+                test_size=options.test_val_size,
+                seed=options.seed,
+            )
         )
     )
 
@@ -588,9 +623,10 @@ def sparse_prepared_splits(
                         f"clinical sidecar {metadata_path}."
                     )
                 embedded_ids = _embedded_sample_ids(sparse_path, sample_id_column)
-                clinical_ids = unify_nans(raw_metadata[[sample_id_column]].copy())[
-                    sample_id_column
-                ]
+                clinical_ids = _column_series(
+                    unify_nans(raw_metadata[[sample_id_column]].copy()),
+                    sample_id_column,
+                )
                 if clinical_ids.isna().any():
                     raise ValueError(
                         f"Clinical sample-ID column {sample_id_column!r} contains "
@@ -775,7 +811,8 @@ def sparse_prepared_splits(
         if cached_train_matrix is None:
             raise RuntimeError("Sparse training matrix cache was not initialized.")
         train_source = cached_train_matrix
-        if train_source.shape[0] != len(split.train.target):
+        train_n_rows, train_n_features = _matrix_shape(train_source)
+        if train_n_rows != len(split.train.target):
             raise RuntimeError(
                 f"SVMlight row count changed while loading {split.train.path}."
             )
@@ -800,11 +837,11 @@ def sparse_prepared_splits(
                 f"SVMlight target in {test_description} contains labels that are not "
                 "present in its training partition."
             ) from error
-        n_select = resolve_n_features(options.n_feat_downsample, train_source.shape[1])
+        n_select = resolve_n_features(options.n_feat_downsample, train_n_features)
         resolved = resolve_feature_downsample_method(
             options.feat_downsample,
             len(train_rows),
-            train_source.shape[1],
+            train_n_features,
             n_select,
             options.is_classification,
             y_train,
@@ -823,7 +860,7 @@ def sparse_prepared_splits(
                 split.train.metadata[[options.grouper]].iloc[train_rows].copy()
             )
             groups_train = group_frame[options.grouper].reset_index(drop=True)
-        effective, screening, tuning, fallback_note = resolve_screening_split(
+        _, screening, tuning, _ = resolve_screening_split(
             options.feat_downsample,
             resolved,
             y_train,
@@ -835,68 +872,24 @@ def sparse_prepared_splits(
         cache_key = (str(split.train.path), train_rows.tobytes())
         cached = selection_cache.get(cache_key)
         if cached is None:
-            selection_request = (
-                options.feat_downsample if fallback_note is None else effective
+            selected, result = select_indexed_columns(
+                train_source,
+                train_rows,
+                y_train,
+                options.is_classification,
+                options.feat_downsample,
+                options.n_feat_downsample,
+                options.downsample_chunk_size,
+                screening,
+                feature_names,
+                options.downsample_save_scores,
+                sparse_input=True,
+                input_format="svmlight",
+                seed=options.seed,
+                protected_indices=protected_indices,
             )
-            try:
-                selected, result = select_indexed_columns(
-                    train_source,
-                    train_rows,
-                    y_train,
-                    options.is_classification,
-                    selection_request,
-                    options.n_feat_downsample,
-                    options.downsample_chunk_size,
-                    screening,
-                    feature_names,
-                    options.downsample_variance_threshold,
-                    options.downsample_save_scores,
-                    sparse_input=True,
-                    input_format="svmlight",
-                    seed=options.seed,
-                    protected_indices=protected_indices,
-                )
-            except ValueError as error:
-                if (
-                    options.feat_downsample is not FeatureDownsampleMethod.Auto
-                    or screening is None
-                    or "usable downsampling scores" not in str(error)
-                ):
-                    raise
-                fallback_note = (
-                    f"Auto feature downsampling fell back from {effective.value} to "
-                    "normalized-variance because supervised scoring produced no "
-                    f"usable feature scores: {error}"
-                )
-                warn(fallback_note, stacklevel=2)
-                screening = None
-                tuning = np.arange(len(y_train), dtype=int)
-                selected, result = select_indexed_columns(
-                    train_source,
-                    train_rows,
-                    y_train,
-                    options.is_classification,
-                    FeatureDownsampleMethod.NormalizedVariance,
-                    options.n_feat_downsample,
-                    options.downsample_chunk_size,
-                    None,
-                    feature_names,
-                    options.downsample_variance_threshold,
-                    options.downsample_save_scores,
-                    sparse_input=True,
-                    input_format="svmlight",
-                    seed=options.seed,
-                    protected_indices=protected_indices,
-                )
             result.requested_method = options.feat_downsample.value
             result.source_index_base = index_base
-            if (
-                options.feat_downsample is FeatureDownsampleMethod.Auto
-                and result.auto_reason is None
-            ):
-                result.auto_reason = fallback_note
-            if fallback_note is not None:
-                result.notes.append(fallback_note)
             result.tuning_rows = tuning.tolist()
             result.tuning_samples = len(tuning)
             selection_cache[cache_key] = (
@@ -927,7 +920,7 @@ def sparse_prepared_splits(
                 "--n-feat-downsample."
             )
         started = perf_counter()
-        selected_names = [feature_names[idx] for idx in selected]
+        selected_names = [feature_names[int(idx)] for idx in selected]
         train_values = _materialize(train_source, train_rows, selected)
         test_load_seconds = 0.0
         if len(split.tests) == 1:
@@ -938,7 +931,8 @@ def sparse_prepared_splits(
                 load_started = perf_counter()
                 test_source = _load_sparse_matrix(part.path, n_features, index_base)
                 test_load_seconds += perf_counter() - load_started
-            if test_source.shape[0] != len(part.target):
+            test_n_rows, _ = _matrix_shape(test_source)
+            if test_n_rows != len(part.target):
                 raise RuntimeError(
                     f"SVMlight row count changed while loading {part.path}."
                 )
@@ -952,7 +946,8 @@ def sparse_prepared_splits(
                 load_started = perf_counter()
                 test_source = _load_sparse_matrix(part.path, n_features, index_base)
                 test_load_seconds += perf_counter() - load_started
-                if test_source.shape[0] != len(part.target):
+                test_n_rows, _ = _matrix_shape(test_source)
+                if test_n_rows != len(part.target):
                     raise RuntimeError(
                         f"SVMlight row count changed while loading {part.path}."
                     )
@@ -960,13 +955,14 @@ def sparse_prepared_splits(
                 del test_source
                 start = stop
         scaler = MaxAbsScaler(copy=False)
-        train_values = scaler.fit_transform(train_values)
-        test_values = scaler.transform(test_values)
+        train_values = np.asarray(scaler.fit_transform(train_values), dtype=np.float64)
+        test_values = np.asarray(scaler.transform(test_values), dtype=np.float64)
         if result.resolved_method == FeatureDownsampleMethod.None_.value:
             result.notes.append(
                 "The requested feature limit did not reduce the SVMlight matrix; "
                 "all source columns were materialized densely."
             )
+        n_metadata_predictors = 0
         if split.train.metadata is not None:
             train, test = _prepare_hybrid_split(
                 split,
@@ -991,19 +987,20 @@ def sparse_prepared_splits(
             )
             original_shape = (
                 len(train_rows) + n_test_rows,
-                train_source.shape[1] + max(0, n_metadata_predictors),
+                train_n_features + max(0, n_metadata_predictors),
             )
             if train.info is not None:
                 train.info.original_shape = original_shape
             if test.info is not None:
                 test.info.original_shape = original_shape
         else:
-            X_train = pd.DataFrame(train_values, columns=selected_names)
-            X_test = pd.DataFrame(test_values, columns=selected_names)
+            selected_columns = pd.Index(selected_names, dtype=str)
+            X_train = pd.DataFrame(train_values, columns=selected_columns)
+            X_test = pd.DataFrame(test_values, columns=selected_columns)
             info = PreparationInfo(
                 original_shape=(
                     len(train_rows) + n_test_rows,
-                    train_source.shape[1],
+                    train_n_features,
                 ),
                 final_shape=X_train.shape,
                 n_samples_dropped_via_target_NaNs=0,
@@ -1034,7 +1031,7 @@ def sparse_prepared_splits(
                 info=test_info,
                 phase="test",
             )
-        source_feature_count = train_source.shape[1] + max(
+        source_feature_count = train_n_features + max(
             0, n_metadata_predictors if split.train.metadata is not None else 0
         )
         source_train_shape = (len(train_rows), source_feature_count)

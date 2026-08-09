@@ -4,11 +4,11 @@ import gc
 import os
 import shutil
 import subprocess
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass
 from enum import Enum
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
-from typing import Literal, Mapping, Optional
+from typing import Mapping, Optional
 
 
 class DeviceIntent(Enum):
@@ -59,6 +59,22 @@ CUDA_BACKENDS = {
     RuntimeComponent.Embedding: "torch",
     RuntimeComponent.ErrorConsistency: "torch",
 }
+CPU_BACKENDS = {
+    RuntimeComponent.CatBoost: "catboost",
+    RuntimeComponent.XGBoost: "xgboost",
+    RuntimeComponent.KNN: "scikit-learn",
+    RuntimeComponent.TabPFN: "torch",
+    RuntimeComponent.MLP: "torch",
+    RuntimeComponent.KAN: "torch",
+    RuntimeComponent.Gandalf: "torch",
+    RuntimeComponent.Embedding: "torch",
+    RuntimeComponent.ErrorConsistency: "numpy",
+    RuntimeComponent.LightGBM: "lightgbm",
+    RuntimeComponent.Sklearn: "scikit-learn",
+    RuntimeComponent.Preprocessing: "cpu",
+    RuntimeComponent.Selection: "cpu",
+    RuntimeComponent.Univariate: "cpu",
+}
 MPS_COMPONENTS = {RuntimeComponent.Gandalf}
 COMPONENT_LABELS = {
     RuntimeComponent.CatBoost: "CatBoost",
@@ -96,79 +112,33 @@ class RuntimeWorkload:
         ):
             raise ValueError("Runtime workload dimensions must be non-negative.")
 
-    @property
-    def matrix_elements(self) -> int:
-        return int(self.n_samples) * int(self.n_features)
-
-    @property
-    def query_samples(self) -> int:
-        return int(self.n_samples if self.n_queries is None else self.n_queries)
-
-    @property
-    def pairwise_elements(self) -> int:
-        return int(self.n_samples) * self.query_samples * int(self.n_features)
-
-
-@dataclass(frozen=True)
-class AutoCudaRule:
-    work_metric: Literal["matrix_elements", "pairwise_elements"]
-    min_work_items: int
-
-    def work_items(self, workload: RuntimeWorkload) -> int:
-        return int(getattr(workload, self.work_metric))
-
-
-# Keep small traditional-model jobs on CPU when CUDA startup and data transfer
-# are likely to cost more than the calculation. Neural and embedding jobs still
-# prefer an accelerator.
-AUTO_CUDA_RULES = {
-    RuntimeComponent.KNN: AutoCudaRule("pairwise_elements", 20_000_000),
-    RuntimeComponent.CatBoost: AutoCudaRule("matrix_elements", 1_000_000),
-    RuntimeComponent.XGBoost: AutoCudaRule("matrix_elements", 200_000),
-}
-
 
 @dataclass(frozen=True)
 class DeviceDecision:
     requested: str
     resolved: str
+    backend: str
     reason: str
     n_samples: Optional[int] = None
     n_features: Optional[int] = None
     n_queries: Optional[int] = None
-    work_metric: Optional[str] = None
-    work_items: Optional[int] = None
-    threshold: Optional[int] = None
 
     def to_dict(self) -> dict[str, int | str | None]:
         return asdict(self)
 
 
 def device_reason_text(decision: DeviceDecision) -> str:
-    if decision.reason.startswith("cuda_runtime_fallback:"):
-        return "CUDA failed; retried on CPU"
     reasons = {
         "explicit_cpu": "requested by --device cpu",
         "explicit_cuda_available": "required by --device cuda",
         "explicit_cuda_unavailable": "required CUDA backend is unavailable",
         "component_has_no_cuda_backend": "no supported CUDA backend",
-        "auto_workload_unknown": "workload is not known yet",
-        "auto_workload_below_threshold": "workload below CUDA threshold",
-        "auto_threshold_met_but_cuda_unavailable": "CUDA backend unavailable",
-        "auto_workload_at_or_above_threshold": "workload meets CUDA threshold",
-        "auto_accelerator_preferred": "accelerator-preferred model",
+        "auto_cuda_available": "CUDA backend available",
         "auto_mps_available": "MPS available",
-        "accelerator_backend_unavailable": "accelerator backend unavailable",
-        "component_has_no_accelerator_backend": "no accelerator backend",
+        "auto_cuda_unavailable": "CUDA backend unavailable",
+        "auto_cpu_only": "no supported accelerator backend",
     }
     return reasons.get(decision.reason, decision.reason.replace("_", " "))
-
-
-@dataclass
-class _RuntimeState:
-    cpu_fallbacks: dict[
-        tuple[RuntimeComponent, Optional[RuntimeWorkload]], str
-    ] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -185,10 +155,16 @@ class HardwareCapabilities:
         return _torch_capabilities()[1] if self.torch_mps is None else self.torch_mps
 
     def catboost_cuda_available(self) -> bool:
-        return _catboost_cuda_available() if self.catboost_cuda is None else self.catboost_cuda
+        return (
+            _catboost_cuda_available()
+            if self.catboost_cuda is None
+            else self.catboost_cuda
+        )
 
     def xgboost_cuda_available(self) -> bool:
-        return _xgboost_cuda_available() if self.xgboost_cuda is None else self.xgboost_cuda
+        return (
+            _xgboost_cuda_available() if self.xgboost_cuda is None else self.xgboost_cuda
+        )
 
     def cuda_available_for(self, component: RuntimeComponent) -> bool:
         backend = CUDA_BACKENDS.get(component)
@@ -288,8 +264,7 @@ def _package_version(distribution: str) -> str:
 def _backend_unavailable_detail(backend: str) -> str:
     if backend == "torch":
         return (
-            "PyTorch CUDA is unavailable "
-            f"(installed torch: {_package_version('torch')})"
+            f"PyTorch CUDA is unavailable (installed torch: {_package_version('torch')})"
         )
     if backend == "catboost":
         return (
@@ -345,7 +320,6 @@ class RuntimePolicy:
     intent: DeviceIntent
     capabilities: HardwareCapabilities
     workload: Optional[RuntimeWorkload] = None
-    _state: _RuntimeState = field(default_factory=_RuntimeState, compare=False, repr=False)
 
     def with_workload(
         self,
@@ -361,7 +335,6 @@ class RuntimePolicy:
                 int(n_features),
                 None if n_queries is None else int(n_queries),
             ),
-            _state=self._state,
         )
 
     def for_task(
@@ -389,88 +362,67 @@ class RuntimePolicy:
             "n_queries": None if self.workload is None else self.workload.n_queries,
         }
         if self.intent is DeviceIntent.CPU:
-            return DeviceDecision(resolved="cpu", reason="explicit_cpu", **base)
-
-        if self.intent is DeviceIntent.CUDA:
-            cuda_available = self.capabilities.cuda_available_for(component)
-            if cuda_available:
-                return DeviceDecision(
-                    resolved="cuda", reason="explicit_cuda_available", **base
-                )
-            if component in CUDA_BACKENDS:
-                return DeviceDecision(
-                    resolved="unavailable",
-                    reason="explicit_cuda_unavailable",
-                    **base,
-                )
             return DeviceDecision(
                 resolved="cpu",
-                reason="component_has_no_cuda_backend",
+                backend=CPU_BACKENDS[component],
+                reason="explicit_cpu",
                 **base,
             )
 
-        rule = AUTO_CUDA_RULES.get(component)
-        if rule is not None:
-            if self.workload is None:
+        if self.intent is DeviceIntent.CUDA:
+            backend = CUDA_BACKENDS.get(component)
+            if backend is None:
                 return DeviceDecision(
                     resolved="cpu",
-                    reason="auto_workload_unknown",
-                    work_metric=rule.work_metric,
-                    threshold=rule.min_work_items,
+                    backend=CPU_BACKENDS[component],
+                    reason="component_has_no_cuda_backend",
                     **base,
                 )
-            work_items = rule.work_items(self.workload)
-            if work_items < rule.min_work_items:
+            if self.capabilities.cuda_available_for(component):
                 return DeviceDecision(
-                    resolved="cpu",
-                    reason="auto_workload_below_threshold",
-                    work_metric=rule.work_metric,
-                    work_items=work_items,
-                    threshold=rule.min_work_items,
+                    resolved="cuda",
+                    backend=backend,
+                    reason="explicit_cuda_available",
                     **base,
                 )
-            cuda_available = self.capabilities.cuda_available_for(component)
-            if not cuda_available:
-                return DeviceDecision(
-                    resolved="cpu",
-                    reason="auto_threshold_met_but_cuda_unavailable",
-                    work_metric=rule.work_metric,
-                    work_items=work_items,
-                    threshold=rule.min_work_items,
-                    **base,
-                )
+            return DeviceDecision(
+                resolved="unavailable",
+                backend=backend,
+                reason="explicit_cuda_unavailable",
+                **base,
+            )
+
+        backend = CUDA_BACKENDS.get(component)
+        if backend is None:
+            return DeviceDecision(
+                resolved="cpu",
+                backend=CPU_BACKENDS[component],
+                reason="auto_cpu_only",
+                **base,
+            )
+        if self.capabilities.cuda_available_for(component):
             return DeviceDecision(
                 resolved="cuda",
-                reason="auto_workload_at_or_above_threshold",
-                work_metric=rule.work_metric,
-                work_items=work_items,
-                threshold=rule.min_work_items,
+                backend=backend,
+                reason="auto_cuda_available",
                 **base,
             )
-
-        cuda_available = self.capabilities.cuda_available_for(component)
-        if cuda_available:
-            return DeviceDecision(
-                resolved="cuda", reason="auto_accelerator_preferred", **base
-            )
         if component in MPS_COMPONENTS and self.capabilities.torch_mps_available():
-            return DeviceDecision(resolved="mps", reason="auto_mps_available", **base)
-        reason = (
-            "accelerator_backend_unavailable"
-            if component in CUDA_BACKENDS
-            else "component_has_no_accelerator_backend"
+            return DeviceDecision(
+                resolved="mps",
+                backend="torch",
+                reason="auto_mps_available",
+                **base,
+            )
+        return DeviceDecision(
+            resolved="cpu",
+            backend=CPU_BACKENDS[component],
+            reason="auto_cuda_unavailable",
+            **base,
         )
-        return DeviceDecision(resolved="cpu", reason=reason, **base)
 
     def decision_for(self, component: RuntimeComponent) -> DeviceDecision:
-        planned = self._planned_decision_for(component)
-        reason = self._state.cpu_fallbacks.get((component, self.workload))
-        if reason is None:
-            return planned
-        return replace(planned, resolved="cpu", reason=reason)
-
-    def record_cpu_fallback(self, component: RuntimeComponent, reason: str) -> None:
-        self._state.cpu_fallbacks[(component, self.workload)] = str(reason)
+        return self._planned_decision_for(component)
 
     def device_for(self, component: RuntimeComponent) -> str:
         decision = self.decision_for(component)
@@ -480,7 +432,7 @@ class RuntimePolicy:
             raise CudaConfigurationError(
                 f"Cannot satisfy --device cuda for {label}: "
                 f"{_backend_unavailable_detail(backend)}. "
-                "Use --device auto to allow CPU fallback, or install a "
+                "Use --device auto to select an available backend, or install a "
                 "CUDA-capable backend."
             )
         return decision.resolved
@@ -497,10 +449,11 @@ def configure_torch_cuda(runtime: RuntimePolicy, component: RuntimeComponent) ->
         return
     import torch
 
-    torch.set_float32_matmul_precision("high")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
 
 def cleanup_torch_accelerator(
@@ -537,38 +490,6 @@ def clear_fitted_model_state(model: object) -> None:
     for name in ("tuned_model", "model", "tuned_trainer", "trainer"):
         if hasattr(model, name):
             setattr(model, name, None)
-
-
-def is_cuda_runtime_error(error: BaseException) -> bool:
-    """Return whether an exception chain describes a CUDA/GPU runtime failure."""
-    current: Optional[BaseException] = error
-    seen: set[int] = set()
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        try:
-            import torch
-
-            if isinstance(current, torch.cuda.OutOfMemoryError):
-                return True
-        except Exception:
-            pass
-        message = f"{type(current).__name__}: {current}".lower()
-        gpu_tokens = (
-            "cuda",
-            "cudnn",
-            "cublas",
-            "nccl",
-            "gpu",
-            "device-side",
-            "status_alloc_failed",
-            "bad allocation",
-        )
-        if any(token in message for token in gpu_tokens):
-            return True
-        if "out of memory" in message:
-            return True
-        current = current.__cause__ or current.__context__
-    return False
 
 
 def validate_cuda_request(
@@ -616,38 +537,26 @@ def format_device_plan(
     runtime: RuntimePolicy,
     components: Mapping[str, RuntimeComponent],
 ) -> str:
-    """Create a concise startup plan without importing CUDA backends."""
-    cuda_names = [
-        name for name, component in components.items() if component in CUDA_BACKENDS
-    ]
-    cpu_names = [
-        name for name, component in components.items() if component not in CUDA_BACKENDS
-    ]
+    """Resolve and display the device for every selected component."""
+    decisions = {
+        name: runtime.decision_for(component) for name, component in components.items()
+    }
     lines = [f"Device mode: {runtime.intent.value}"]
-    if runtime.intent is not DeviceIntent.CPU:
+    if any(decision.resolved == "cuda" for decision in decisions.values()):
         device_name = cuda_device_name()
         if device_name is not None:
             lines.append(f"CUDA device: {device_name}")
     lines.extend(["", "Execution plan:"])
-    if runtime.intent is DeviceIntent.CPU:
-        lines.append(f"  CPU:  {', '.join(components) or 'all work'}")
+    if not decisions:
+        lines.append("  all work -> CPU")
         return "\n".join(lines)
-    if runtime.intent is DeviceIntent.CUDA:
-        lines.append(f"  CUDA: {', '.join(cuda_names)}")
-        if cpu_names:
-            lines.append(
-                f"  CPU:  {', '.join(cpu_names)} (no supported CUDA backend)"
-            )
-        return "\n".join(lines)
-
-    if cuda_names:
+    width = max(len(name) for name in decisions)
+    for name, decision in decisions.items():
+        reason = device_reason_text(decision)
         lines.append(
-            f"  Auto: {', '.join(cuda_names)} "
-            "(device chosen per task and input size)"
+            f"  {name:<{width}} -> {decision.resolved.upper():<4} "
+            f"[{decision.backend}] {reason}"
         )
-    if cpu_names:
-        lines.append(f"  CPU:  {', '.join(cpu_names)}")
-    lines.append("  Final model devices use each model's actual input size.")
     return "\n".join(lines)
 
 

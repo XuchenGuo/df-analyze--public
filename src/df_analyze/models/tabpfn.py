@@ -1,13 +1,9 @@
 from __future__ import annotations
 
 # Reference: https://docs.priorlabs.ai
-from base64 import b64decode, b64encode
 import os
-import pickle
 from math import ceil, prod
 from pathlib import Path
-from tempfile import TemporaryDirectory, gettempdir
-from time import time_ns
 from typing import Any, Callable, Mapping, Optional, Type, Union
 from warnings import warn
 
@@ -26,37 +22,28 @@ from df_analyze.runtime.hardware import (
     RuntimeComponent,
     cleanup_torch_accelerator,
     configure_torch_cuda,
-    get_runtime,
 )
 from df_analyze.splitting import OmniKFold
-
-os.environ.setdefault("TABPFN_DISABLE_TELEMETRY", "1")
-os.environ.setdefault(
-    "TABPFN_STATE_DIR", os.path.join(gettempdir(), "df-analyze-tabpfn-state")
-)
 
 try:
     from tabpfn import TabPFNClassifier as OfficialTabPFNClassifier
     from tabpfn import TabPFNRegressor as OfficialTabPFNRegressor
     from tabpfn.constants import ModelVersion
+    from tabpfn.model_loading import (
+        load_fitted_tabpfn_model as load_official_fitted_model,
+    )
+    from tabpfn.model_loading import (
+        save_fitted_tabpfn_model as save_official_fitted_model,
+    )
 except ImportError as exc:
     OfficialTabPFNClassifier = None
     OfficialTabPFNRegressor = None
+    load_official_fitted_model = None
+    save_official_fitted_model = None
     ModelVersion = None
     _TABPFN_IMPORT_ERROR = exc
 else:
     _TABPFN_IMPORT_ERROR = None
-    try:
-        from tabpfn.model_loading import get_cache_dir as _get_tabpfn_cache_dir
-        from tabpfn.settings import settings as _tabpfn_settings
-    except ImportError:
-        _get_tabpfn_cache_dir = None
-        _tabpfn_settings = None
-
-if _TABPFN_IMPORT_ERROR is not None:
-    _get_tabpfn_cache_dir = None
-    _tabpfn_settings = None
-
 TABPFN_MAX_FEATURES_PER_ESTIMATOR = 200
 TABPFN_DEFAULT_N_ESTIMATORS = 8
 TABPFN_HIGH_DIM_N_ESTIMATORS = 16
@@ -75,23 +62,18 @@ TABPFN_PRETRAINING_LIMITS: dict[str, dict[str, int | None]] = {
         "sample_feature_values": None,
         "classes": 160,
     },
-    "v2.6": {
-        "samples": 100_000,
-        "features": 2_000,
-        "sample_feature_values": None,
-        "classes": 10,
-    },
-    "v2.5": {
-        "samples": 50_000,
-        "features": 2_000,
-        "sample_feature_values": None,
-        "classes": 10,
-    },
 }
 
 
 class TabPFNSetupError(RuntimeError):
     pass
+
+
+def _target_series(frame: DataFrame, name: object) -> Series:
+    target = frame.loc[:, name]
+    if not isinstance(target, Series):
+        raise ValueError(f"Expected one target column named {name!r}.")
+    return target
 
 
 def _setup_message(model_name: str, error: BaseException) -> str:
@@ -109,54 +91,6 @@ def _setup_message(model_name: str, error: BaseException) -> str:
     )
 
 
-def _assert_cache_writable(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    if not path.is_dir():
-        raise NotADirectoryError(f"{path} is not a directory")
-    probe = path / f".df-analyze-write-check-{os.getpid()}-{time_ns()}"
-    with probe.open("xb"):
-        pass
-    probe.unlink()
-
-
-def _cache_error(path: Path, error: BaseException) -> TabPFNSetupError:
-    return TabPFNSetupError(
-        f"TabPFN model cache directory is not writable: {path}. Set "
-        "TABPFN_MODEL_CACHE_DIR to a writable directory before running df-analyze. "
-        f"Original error: {type(error).__name__}: {error}"
-    )
-
-
-def _prepare_tabpfn_cache_dir() -> Optional[Path]:
-    if _get_tabpfn_cache_dir is None:
-        return None
-
-    configured = os.getenv("TABPFN_MODEL_CACHE_DIR", "").strip()
-    cache_dir = Path(configured).expanduser() if configured else _get_tabpfn_cache_dir()
-    try:
-        _assert_cache_writable(cache_dir)
-    except OSError as exc:
-        if configured:
-            raise _cache_error(cache_dir, exc) from exc
-
-        fallback = Path(os.environ["TABPFN_STATE_DIR"]) / "model-cache"
-        try:
-            _assert_cache_writable(fallback)
-        except OSError as fallback_exc:
-            raise _cache_error(fallback, fallback_exc) from fallback_exc
-
-        os.environ["TABPFN_MODEL_CACHE_DIR"] = str(fallback)
-        if _tabpfn_settings is not None:
-            _tabpfn_settings.tabpfn.model_cache_dir = fallback
-        warn(
-            f"TabPFN's default model cache is not writable ({cache_dir}). "
-            f"Using the writable fallback {fallback}.",
-            stacklevel=2,
-        )
-        return fallback
-    return cache_dir
-
-
 class TabPFNEstimator(DfAnalyzeModel):
     runtime_component = RuntimeComponent.TabPFN
     version = "v3"
@@ -172,6 +106,8 @@ class TabPFNEstimator(DfAnalyzeModel):
         self.target_classes: dict[str, np.ndarray] = {}
         self._preflight_done = False
         self._preflight_config: Any = None
+        self._external_model_manifest: dict[str, Any] | None = None
+        self._external_model_directory: str | None = None
         self.default_args = dict(
             n_estimators=TABPFN_DEFAULT_N_ESTIMATORS,
             auto_scale_n_estimators=True,
@@ -201,93 +137,75 @@ class TabPFNEstimator(DfAnalyzeModel):
         cleanup_torch_accelerator(self.runtime, RuntimeComponent.TabPFN)
 
     @staticmethod
-    def _serialize_model(model: Any) -> dict[str, str]:
-        save_fit_state = getattr(model, "save_fit_state", None)
-        if callable(save_fit_state):
-            with TemporaryDirectory() as tempdir:
-                path = Path(tempdir) / "model.tabpfn_fit"
-                try:
-                    save_fit_state(path)
-                except NotImplementedError as exc:
-                    raise RuntimeError(
-                        "TabPFN fitted-state serialization does not support "
-                        "fit_mode='fit_with_cache'. Use the df-analyze default "
-                        "fit_mode='fit_preprocessors' when results must be reloadable."
-                    ) from exc
-                payload = path.read_bytes()
-            return {
-                "format": "tabpfn_fit",
-                "payload": b64encode(payload).decode("ascii"),
-            }
-
-        # Small test or third-party estimators may lack TabPFN's fitted-state
-        # API. Pickle those objects; official estimators use the format above.
-        payload = pickle.dumps(model, protocol=pickle.HIGHEST_PROTOCOL)
-        return {
-            "format": "pickle",
-            "payload": b64encode(payload).decode("ascii"),
-        }
-
-    def _serialize_models(self, models: Any) -> Optional[dict[str, Any]]:
+    def _save_model_group(
+        models: Any, directory: Path, prefix: str
+    ) -> dict[str, Any] | None:
         if models is None:
             return None
-        if isinstance(models, dict):
-            return {
-                "kind": "multi",
-                "models": {
-                    str(target): self._serialize_model(model)
-                    for target, model in models.items()
-                },
-            }
-        return {"kind": "single", "model": self._serialize_model(models)}
+        if save_official_fitted_model is None:
+            raise RuntimeError("TabPFN fitted-model saving is unavailable.")
+        items = list(models.items()) if isinstance(models, dict) else [(None, models)]
+        saved = []
+        for index, (target, model) in enumerate(items):
+            filename = f"{prefix}_{index}.tabpfn_fit"
+            save_official_fitted_model(model, directory / filename)
+            saved.append({"target": target, "filename": filename})
+        return {
+            "kind": "multi" if isinstance(models, dict) else "single",
+            "models": saved,
+        }
 
-    def _restore_model(self, state: Mapping[str, str]) -> Any:
-        payload = b64decode(state["payload"])
-        if state["format"] == "pickle":
-            return pickle.loads(payload)
-        if state["format"] != "tabpfn_fit":
-            raise ValueError(f"Unknown serialized TabPFN format: {state['format']}")
+    def externalize_fitted_models(self, directory: Path) -> dict[str, Any]:
+        directory.mkdir(parents=True, exist_ok=True)
+        originals = {"model": self.model, "tuned_model": self.tuned_model}
+        self._external_model_manifest = {
+            "model": self._save_model_group(self.model, directory, "model"),
+            "tuned_model": self._save_model_group(
+                self.tuned_model, directory, "tuned_model"
+            ),
+        }
+        self._external_model_directory = directory.name
+        self.model = None
+        self.tuned_model = None
+        return originals
 
-        self._assert_available()
-        from tabpfn import load_fitted_tabpfn_model
+    def restore_externalized_models(self, originals: Mapping[str, Any]) -> None:
+        self.model = originals["model"]
+        self.tuned_model = originals["tuned_model"]
 
-        with TemporaryDirectory() as tempdir:
-            path = Path(tempdir) / "model.tabpfn_fit"
-            path.write_bytes(payload)
-            try:
-                return load_fitted_tabpfn_model(path, device=self._device())
-            except Exception as exc:
-                raise TabPFNSetupError(_setup_message(self.longname, exc)) from exc
-
-    def _restore_models(self, state: Optional[Mapping[str, Any]]) -> Any:
+    def _load_model_group(self, directory: Path, state: Mapping[str, Any] | None) -> Any:
         if state is None:
             return None
+        self._assert_available()
+        if load_official_fitted_model is None:
+            raise RuntimeError("TabPFN fitted-model loading is unavailable.")
+
+        loaded = [
+            (
+                item["target"],
+                load_official_fitted_model(
+                    directory / item["filename"], device=self._device()
+                ),
+            )
+            for item in state["models"]
+        ]
         if state["kind"] == "multi":
-            return {
-                str(target): self._restore_model(model_state)
-                for target, model_state in state["models"].items()
-            }
-        return self._restore_model(state["model"])
+            return {str(target): model for target, model in loaded}
+        return loaded[0][1]
 
-    def __getstate__(self) -> dict[str, Any]:
-        state = self.__dict__.copy()
-        state["_serialized_model"] = self._serialize_models(state.pop("model", None))
-        state["_serialized_tuned_model"] = self._serialize_models(
-            state.pop("tuned_model", None)
+    def load_externalized_models(self, root: Path) -> None:
+        if (
+            self._external_model_manifest is None
+            or self._external_model_directory is None
+        ):
+            return
+        directory = root / self._external_model_directory
+        self.model = self._load_model_group(
+            directory, self._external_model_manifest["model"]
         )
-        state["_preflight_done"] = False
-        state["_preflight_config"] = None
-        return state
-
-    def __setstate__(self, state: dict[str, Any]) -> None:
-        model_state = state.pop("_serialized_model", None)
-        tuned_model_state = state.pop("_serialized_tuned_model", None)
-        self.__dict__.update(state)
-        # Load saved models on CPU; callers can choose another device later.
-        self.runtime = get_runtime("cpu")
-        self._configure_runtime()
-        self.model = self._restore_models(model_state)
-        self.tuned_model = self._restore_models(tuned_model_state)
+        self.tuned_model = self._load_model_group(
+            directory, self._external_model_manifest["tuned_model"]
+        )
 
     @staticmethod
     def _move_model(model: Any, device: str) -> None:
@@ -351,44 +269,22 @@ class TabPFNEstimator(DfAnalyzeModel):
     def _validate_limits(self, X: DataFrame, y: Union[Series, DataFrame]) -> None:
         n_samples, n_features = X.shape
         limits = TABPFN_PRETRAINING_LIMITS[self.version]
-        max_samples = int(limits["samples"])
-        max_features = int(limits["features"])
-        max_values = limits["sample_feature_values"]
-        max_classes = int(limits["classes"])
-        if self.version == "v3":
-            exceeds = not any(
-                n_samples <= row_limit and n_features <= feature_limit
-                for row_limit, feature_limit in TABPFN_V3_SUPPORTED_SHAPES
-            )
-        else:
-            exceeds = n_samples > max_samples or n_features > max_features
-            if max_values is not None:
-                exceeds = exceeds or n_samples * n_features > int(max_values)
+        max_classes = limits["classes"]
+        assert max_classes is not None
+        exceeds = not any(
+            n_samples <= row_limit and n_features <= feature_limit
+            for row_limit, feature_limit in TABPFN_V3_SUPPORTED_SHAPES
+        )
         if exceeds:
-            if self.version == "v3":
-                regimes = ", ".join(
-                    f"{rows:,} samples x {features:,} features"
-                    for rows, features in TABPFN_V3_SUPPORTED_SHAPES
-                )
-                raise ValueError(
-                    f"{self.longname} input shape {X.shape} exceeds its documented "
-                    f"row/feature regimes ({regimes})."
-                )
-            raise ValueError(
-                f"{self.longname} input shape {X.shape} exceeds its supported "
-                f"pretraining envelope (samples <= {max_samples:,}, features <= "
-                f"{max_features:,}"
-                + (
-                    f", sample-feature values <= {int(max_values):,}"
-                    if max_values is not None
-                    else ""
-                )
-                + ")."
+            regimes = ", ".join(
+                f"{rows:,} samples x {features:,} features"
+                for rows, features in TABPFN_V3_SUPPORTED_SHAPES
             )
-        if (
-            self.version == "v3"
-            and n_features > TABPFN_V3_MODEL_CARD_MAX_FEATURES
-        ):
+            raise ValueError(
+                f"{self.longname} input shape {X.shape} exceeds its documented "
+                f"row/feature regimes ({regimes})."
+            )
+        if n_features > TABPFN_V3_MODEL_CARD_MAX_FEATURES:
             warn(
                 f"{self.longname} received {n_features:,} features. This is within "
                 "a wider TabPFN 8.x row/feature regime enforced by df-analyze, "
@@ -419,12 +315,6 @@ class TabPFNEstimator(DfAnalyzeModel):
         self, X: DataFrame, y: Union[Series, DataFrame], config: Any
     ) -> None:
         limits = {"samples": self._config_limit(config, "MAX_NUMBER_OF_SAMPLES")}
-        # In v3, MAX_NUMBER_OF_FEATURES applies to one estimator. The wrapper's
-        # full row/feature limits are checked in ``_validate_limits``.
-        if self.version != "v3":
-            limits["features"] = self._config_limit(
-                config, "MAX_NUMBER_OF_FEATURES"
-            )
         for label, limit in limits.items():
             actual = len(X) if label == "samples" else X.shape[1]
             if limit is not None and actual > limit:
@@ -477,7 +367,6 @@ class TabPFNEstimator(DfAnalyzeModel):
 
         config = self._preflight_config
         if not self._preflight_done:
-            _prepare_tabpfn_cache_dir()
             model = None
             try:
                 model = self._create_estimator(args, X)
@@ -543,10 +432,10 @@ class TabPFNEstimator(DfAnalyzeModel):
         if not isinstance(y, DataFrame):
             return self._fit_one(X, y, args)
         if y.shape[1] == 1:
-            return self._fit_one(X, y.iloc[:, 0], args)
+            return self._fit_one(X, _target_series(y, y.columns[0]), args)
         models = {}
         for col in y.columns:
-            model = self._fit_one(X, y[col], args)
+            model = self._fit_one(X, _target_series(y, col), args)
             if self._device() == "cuda":
                 self._move_model(model, "cpu")
                 self._cleanup_after_fold()
@@ -667,7 +556,10 @@ class TabPFNEstimator(DfAnalyzeModel):
             scores.append(
                 float(
                     self._run_model(
-                        model, lambda model=model, col=col: model.score(X, y[col])
+                        model,
+                        lambda model=model, col=col: model.score(
+                            X, _target_series(y, col)
+                        ),
                     )
                 )
             )
@@ -698,11 +590,7 @@ class TabPFNEstimator(DfAnalyzeModel):
             X_train,
             y_split,
             g_train,
-            multitarget_y=(
-                y_df
-                if y_df.shape[1] > 1
-                else None
-            ),
+            multitarget_y=(y_df if y_df.shape[1] > 1 else None),
         )[0]
 
         def objective(trial: Trial) -> float:
@@ -814,43 +702,7 @@ class TabPFNClassifierV3(TabPFNClassifier):
     longname = "TabPFN v3 Classifier"
 
 
-class TabPFNClassifierV26(TabPFNClassifier):
-    version = "v2.6"
-    shortname = "tabpfn-v2_6"
-    longname = "TabPFN v2.6 Classifier"
-
-
-class TabPFNClassifierV25(TabPFNClassifier):
-    version = "v2.5"
-    shortname = "tabpfn-v2_5"
-    longname = "TabPFN v2.5 Classifier"
-
-
 class TabPFNRegressorV3(TabPFNRegressor):
     version = "v3"
     shortname = "tabpfn-v3"
     longname = "TabPFN v3 Regressor"
-
-
-class TabPFNRegressorV26(TabPFNRegressor):
-    version = "v2.6"
-    shortname = "tabpfn-v2_6"
-    longname = "TabPFN v2.6 Regressor"
-
-
-class TabPFNRegressorV25(TabPFNRegressor):
-    version = "v2.5"
-    shortname = "tabpfn-v2_5"
-    longname = "TabPFN v2.5 Regressor"
-
-
-TABPFN_CLASSIFIERS = {
-    "v3": TabPFNClassifierV3,
-    "v2_6": TabPFNClassifierV26,
-    "v2_5": TabPFNClassifierV25,
-}
-TABPFN_REGRESSORS = {
-    "v3": TabPFNRegressorV3,
-    "v2_6": TabPFNRegressorV26,
-    "v2_5": TabPFNRegressorV25,
-}

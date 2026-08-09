@@ -89,6 +89,10 @@ def test_main_ds_nlp_loading(capsys: CaptureFixture) -> None:
 
 
 @pytest.mark.fast
+@pytest.mark.skipif(
+    not HAS_VISION_TEST_DATA,
+    reason="Vision test data is not installed",
+)
 def test_main_ds_vision_loading(capsys: CaptureFixture) -> None:
     test_dses = VisionTestingDataset.get_all_cls()
     dses = [ds.to_embedding_dataset() for ds in test_dses]
@@ -182,7 +186,10 @@ def test_vision_embed(capsys: CaptureFixture) -> None:
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(not HAS_VISION_MODEL, reason="Vision model is not installed")
+@pytest.mark.skipif(
+    not (HAS_VISION_TEST_DATA and HAS_VISION_MODEL),
+    reason="Vision test data or model is not installed",
+)
 def test_main_vision(capsys: CaptureFixture) -> None:
     with capsys.disabled():
         dses = VisionTestingDataset.get_all_cls()

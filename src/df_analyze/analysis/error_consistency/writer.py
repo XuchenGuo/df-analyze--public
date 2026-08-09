@@ -1,7 +1,7 @@
 """Write EC tables, plots, metadata, and the result README.
 
 ``summary`` keeps the main tables, ``pairwise`` adds model-pair output, and
-``full`` adds sample-level diagnostics. The EC calculations do not change.
+``full`` adds sample-level metric output. The EC calculations do not change.
 """
 
 from __future__ import annotations
@@ -50,7 +50,9 @@ def _write_detail_plots(detail_dir: Path, pairwise: DataFrame) -> None:
         return
     plots = detail_dir / "plots"
     _io_path(plots).mkdir(parents=True, exist_ok=True)
-    methods = pairwise.get("ec_method", pd.Series("ec", index=pairwise.index))
+    methods = pairwise.loc[:, "ec_method"] if "ec_method" in pairwise else None
+    if not isinstance(methods, pd.Series):
+        methods = pd.Series("ec", index=pairwise.index)
     for method in methods.dropna().unique():
         values = pairwise.loc[methods == method, "pair_mean"].dropna()
         if len(values) == 0:
@@ -73,7 +75,6 @@ def write_model_outputs(
     trial_design: DataFrame,
     fold_assignments: DataFrame,
     trial_scores: DataFrame,
-    diagnostics: dict[str, DataFrame],
     predictions: DataFrame | None = None,
     residuals_or_errors: DataFrame | None = None,
     output_detail: str = "full",
@@ -126,42 +127,6 @@ def write_model_outputs(
     if detail in {"pairwise", "full"}:
         _write_frame(pairwise, detail_dir / "pairwise_values.csv")
 
-    if detail == "full":
-        for filename, frame in diagnostics.items():
-            _write_frame(frame, detail_dir / filename)
-        samples = diagnostics.get("sample_diagnostics.csv", DataFrame())
-        if "error_rate" in samples:
-            _write_frame(
-                samples.sort_values("error_rate", ascending=False).head(50),
-                detail_dir / "difficult_samples.csv",
-            )
-            _write_frame(
-                samples.sort_values("instability", ascending=False).head(50),
-                detail_dir / "unstable_samples.csv",
-            )
-            _write_frame(
-                samples[samples["all_models_wrong"]],
-                detail_dir / "consistently_wrong_samples.csv",
-            )
-        elif "mean_abs_residual" in samples:
-            _write_frame(
-                samples.sort_values("mean_abs_residual", ascending=False).head(50),
-                detail_dir / "difficult_samples.csv",
-            )
-            _write_frame(
-                samples.sort_values("residual_sd", ascending=False).head(50),
-                detail_dir / "unstable_samples.csv",
-            )
-            threshold = samples["mean_abs_residual"].quantile(0.75)
-            consensus = samples[
-                (samples["mean_abs_residual"] >= threshold)
-                & (samples["sign_consensus"] >= 0.75)
-            ]
-            _write_frame(
-                consensus,
-                detail_dir / "large_residual_consensus_samples.csv",
-            )
-
     if predictions is not None:
         _write_frame(predictions, detail_dir / "trial_predictions.csv")
     if residuals_or_errors is not None:
@@ -204,9 +169,10 @@ def _write_root_plots(
     ]
     if keys and not performance.empty:
         merged = summary.merge(performance, on=keys, how="inner")
-        for (metric, method), group in merged.groupby(
-            ["metric", "ec_method"], dropna=False
-        ):
+        for group_key, group in merged.groupby(["metric", "ec_method"], dropna=False):
+            if not isinstance(group_key, tuple) or len(group_key) != 2:
+                raise ValueError("Expected metric and EC method group keys.")
+            metric, method = group_key
             finite = group[["ec_mean", "ec_trial_mean"]].dropna()
             if finite.empty:
                 continue
@@ -249,14 +215,16 @@ def write_root_outputs(root: Path, result: ErrorConsistencyResult) -> None:
         correlations = compute_correlation_summary(result.summary, result.performance)
         ranking = compute_model_ec_ranking(result.summary, result.performance)
     else:
-        correlations = DataFrame(columns=CORRELATION_COLUMNS)
+        correlations = DataFrame(columns=pd.Index(CORRELATION_COLUMNS, dtype=str))
         ranking = DataFrame(
-            columns=[
-                *result.summary.columns,
-                "stability_distance",
-                "rank_by_stability",
-                "rank_by_performance",
-            ]
+            columns=pd.Index(
+                [
+                    *result.summary.columns,
+                    "stability_distance",
+                    "rank_by_stability",
+                    "rank_by_performance",
+                ]
+            )
         )
     trend = compute_target_ec_trend(result.summary)
     selection_guard = DataFrame(
@@ -324,7 +292,7 @@ def write_root_outputs(root: Path, result: ErrorConsistencyResult) -> None:
         f"{selection_note}"
         f"Output detail for this run: `{output_detail}`. "
         "`trial_design.csv` and `fold_assignments.csv` record the seeds and folds. "
-        "The `.ec_checkpoint` directories are used by `--ec-resume`.\n\n"
+        "\n"
         f"{method_evidence_scope}\n\n"
         "EC complements predictive performance. The same fitted models appear in "
         "many comparisons, so the reported standard deviations are not standard "

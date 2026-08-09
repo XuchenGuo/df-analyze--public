@@ -24,14 +24,25 @@ from df_analyze.runtime.hardware import RuntimeComponent, get_runtime
 from df_analyze.splitting import OmniKFold
 
 try:
-    from xgboost import XGBClassifier as SklearnXGBClassifier
-    from xgboost import XGBRegressor as SklearnXGBRegressor
+    from xgboost import (
+        XGBClassifier as SklearnXGBClassifier,  # pyright: ignore[reportAttributeAccessIssue]
+    )
+    from xgboost import (
+        XGBRegressor as SklearnXGBRegressor,  # pyright: ignore[reportAttributeAccessIssue]
+    )
 except ImportError as exc:
     SklearnXGBClassifier = None
     SklearnXGBRegressor = None
     _XGBOOST_IMPORT_ERROR = exc
 else:
     _XGBOOST_IMPORT_ERROR = None
+
+
+def _target_series(frame: DataFrame, name: object) -> Series:
+    target = frame.loc[:, name]
+    if not isinstance(target, Series):
+        raise ValueError(f"Expected one target column named {name!r}.")
+    return target
 
 
 class _EncodedXGBClassifier:
@@ -128,7 +139,8 @@ class XGBoostEstimator(DfAnalyzeModel):
     def __setstate__(self, state: dict[str, Any]) -> None:
         model_state = state.pop("_serialized_model", None)
         tuned_model_state = state.pop("_serialized_tuned_model", None)
-        self.__dict__.update(state)
+        for name, value in state.items():
+            setattr(self, name, value)
         # Load saved models on CPU. Callers can choose another device before
         # fitting or predicting again.
         self.runtime = get_runtime("cpu")
@@ -191,8 +203,10 @@ class XGBoostEstimator(DfAnalyzeModel):
         if not isinstance(y, DataFrame):
             return self._fit_one(X, y, args)
         if y.shape[1] == 1:
-            return self._fit_one(X, y.iloc[:, 0], args)
-        return {str(col): self._fit_one(X, y[col], args) for col in y.columns}
+            return self._fit_one(X, _target_series(y, y.columns[0]), args)
+        return {
+            str(col): self._fit_one(X, _target_series(y, col), args) for col in y.columns
+        }
 
     def fit(self, X_train: DataFrame, y_train: Union[Series, DataFrame]) -> None:
         self._set_target_cols(y_train)
@@ -249,7 +263,10 @@ class XGBoostEstimator(DfAnalyzeModel):
             return float(self.tuned_model.score(X, y))
         if not isinstance(y, DataFrame):
             raise ValueError("Expected DataFrame targets for a multi-target model.")
-        scores = [float(self.tuned_model[str(col)].score(X, y[col])) for col in y.columns]
+        scores = [
+            float(self.tuned_model[str(col)].score(X, _target_series(y, col)))
+            for col in y.columns
+        ]
         return float(np.mean(scores))
 
     def optuna_objective(
@@ -278,11 +295,7 @@ class XGBoostEstimator(DfAnalyzeModel):
             X_train,
             y_split,
             g_train,
-            multitarget_y=(
-                y_df
-                if y_df.shape[1] > 1
-                else None
-            ),
+            multitarget_y=(y_df if y_df.shape[1] > 1 else None),
         )[0]
 
         def objective(trial: Trial) -> float:

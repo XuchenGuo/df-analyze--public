@@ -1,7 +1,7 @@
 """Record the data, settings, versions, and command used for an EC run.
 
-The hashes are also used to decide whether a checkpoint matches the current
-run. Matching records do not guarantee identical results on every platform.
+The hashes identify the inputs used for a run. Matching records do not
+guarantee identical results on every platform.
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ def sha256_file(path: Path) -> str:
 
 
 def _input_record(path: object) -> dict[str, Any]:
-    candidate = Path(path).expanduser().resolve()
+    candidate = Path(str(path)).expanduser().resolve()
     record: dict[str, Any] = {
         "path": str(candidate),
         "exists": candidate.is_file(),
@@ -139,9 +139,6 @@ def build_reproducibility_manifest(
         inputs.append(_input_record(path))
 
     settings = {
-        "profile": getattr(options, "ec_profile", "none"),
-        "profile_scope": getattr(options, "ec_profile_scope", "df-analyze defaults"),
-        "profile_overrides": getattr(options, "ec_profile_overrides", {}),
         "folds": getattr(options, "ec_folds", None),
         "repetitions": getattr(options, "ec_repetitions", None),
         "model_seed_mode": getattr(options, "ec_model_seed_mode", None),
@@ -153,8 +150,6 @@ def build_reproducibility_manifest(
         "epsilon": getattr(options, "ec_epsilon", None),
         "output_detail": getattr(options, "ec_output_detail", "full"),
         "save_predictions": bool(getattr(options, "ec_save_predictions", False)),
-        "resume": bool(getattr(options, "ec_resume", False)),
-        "checkpoint_every": getattr(options, "ec_checkpoint_every", 5),
     }
     return {
         "schema_version": EC_OUTPUT_SCHEMA_VERSION,
@@ -180,7 +175,6 @@ def build_reproducibility_manifest(
         "targets": metadata.get("targets", []),
         "n_configurations": metadata.get("n_configurations", 0),
         "n_failed_trials": int(trial_failures),
-        "n_skipped_configurations": len(metadata.get("skipped_configurations", [])),
         "audit_files": {
             "fold_assignments": "fold_assignments.csv",
             "trial_design": "trial_design.csv",

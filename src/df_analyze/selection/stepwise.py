@@ -9,7 +9,6 @@ if TYPE_CHECKING:
 from dataclasses import dataclass
 from math import ceil
 from time import perf_counter
-from warnings import warn
 
 import numpy as np
 from pandas import DataFrame, Series
@@ -23,15 +22,7 @@ from df_analyze.models.knn import KNNClassifier, KNNRegressor
 from df_analyze.models.lgbm import LightGBMClassifier, LightGBMRegressor
 from df_analyze.models.linear import ElasticNetRegressor, SGDClassifierSelector
 from df_analyze.preprocessing.prepare import PreparedData
-from df_analyze.runtime.hardware import (
-    DeviceIntent,
-    RuntimeComponent,
-    RuntimePolicy,
-    clear_fitted_model_state,
-    get_runtime,
-    is_cuda_runtime_error,
-    release_accelerator_memory,
-)
+from df_analyze.runtime.hardware import RuntimeComponent, RuntimePolicy, get_runtime
 from df_analyze.splitting import OmniKFold
 
 
@@ -77,7 +68,9 @@ def _largest_fold_workload(
     splits: Sequence[tuple[np.ndarray, np.ndarray]],
 ) -> tuple[int, int]:
     if not splits:
-        raise RuntimeError("Wrapper selection could not create any cross-validation folds.")
+        raise RuntimeError(
+            "Wrapper selection could not create any cross-validation folds."
+        )
     train_idx, query_idx = max(
         splits,
         key=lambda split: len(split[0]) * len(split[1]),
@@ -102,7 +95,9 @@ def _wrapper_cv_splits(
     )
     splits = splitter.split(y.to_frame(), y.copy(), groups)[0]
     if not splits:
-        raise RuntimeError("Wrapper selection could not create any cross-validation folds.")
+        raise RuntimeError(
+            "Wrapper selection could not create any cross-validation folds."
+        )
     return splits
 
 
@@ -185,10 +180,7 @@ def get_dfanalyze_score(
     )
     component = getattr(model_cls, "runtime_component", RuntimeComponent.Sklearn)
     decision = actual_runtime.decision_for(component)
-    if (
-        decision.resolved == "cpu"
-        and model_cls in (KNNClassifier, KNNRegressor)
-    ):
+    if decision.resolved == "cpu" and model_cls in (KNNClassifier, KNNRegressor):
         # CPU wrapper candidates parallelize at the outer candidate level.
         # Keep each sklearn KNN fold single-threaded to avoid nested pools.
         model = model_cls(model_args={"n_jobs": 1})
@@ -231,44 +223,7 @@ def get_dfanalyze_score(
                 error=error,
             )
         )
-        if not (
-            actual_runtime.intent is DeviceIntent.Auto
-            and decision.resolved == "cuda"
-            and is_cuda_runtime_error(error)
-        ):
-            raise
-        clear_fitted_model_state(model)
-        model = None
-        release_accelerator_memory()
-        actual_runtime.record_cpu_fallback(
-            component, f"cuda_runtime_fallback:{type(error).__name__}"
-        )
-        warn(
-            f"Wrapper candidate {candidate} encountered a CUDA runtime failure; "
-            "retrying this candidate on CPU once."
-        )
-        model = model_cls()
-        model.set_runtime(actual_runtime)
-        score = model.cv_score(
-            X_new,
-            y.copy(),
-            g,
-            test=test,
-            metric=metric,
-            splits=splits,
-        )
-        audit.append(
-            _wrapper_audit_record(
-                model_name=model_name,
-                candidate=candidate,
-                is_forward=is_forward,
-                runtime=actual_runtime,
-                component=component,
-                attempt=2,
-                stage="completed",
-            )
-        )
-        return WrapperScoreResult(score=score, audit=audit)
+        raise
 
 
 def n_feat_int(prepared: PreparedData, n_features: Union[int, float, None]) -> int:
@@ -449,9 +404,7 @@ class StepwiseSelector:
         # loop only over un-flagged features
         candidates = list(self.to_consider.copy())
         splits = self._ensure_cv_splits()
-        outcomes: list[WrapperScoreResult] = Parallel(
-            n_jobs=self._candidate_n_jobs()
-        )(
+        outcomes: list[WrapperScoreResult] = Parallel(n_jobs=self._candidate_n_jobs())(
             delayed(get_dfanalyze_score)(  # type: ignore
                 model_cls=model_cls,
                 X=self.prepared.X,
@@ -518,9 +471,7 @@ class StepwiseSelector:
 
         candidates = list(self.to_consider.copy())
         splits = self._ensure_cv_splits()
-        outcomes: list[WrapperScoreResult] = Parallel(
-            n_jobs=self._candidate_n_jobs()
-        )(
+        outcomes: list[WrapperScoreResult] = Parallel(n_jobs=self._candidate_n_jobs())(
             delayed(get_dfanalyze_score)(  # type: ignore
                 model_cls=model_cls,
                 X=self.prepared.X,

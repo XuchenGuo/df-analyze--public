@@ -13,7 +13,6 @@ from typing import (
     Any,
     Optional,
 )
-from warnings import warn
 
 import numpy as np
 import pandas as pd
@@ -54,14 +53,7 @@ from df_analyze.analysis.adaptive_error.report import (
     _write_parquet,
     _write_sanity_checks,
 )
-from df_analyze.runtime.hardware import (
-    DeviceIntent,
-    RuntimeComponent,
-    clear_fitted_model_state,
-    device_reason_text,
-    is_cuda_runtime_error,
-    release_accelerator_memory,
-)
+from df_analyze.runtime.hardware import RuntimeComponent, device_reason_text
 
 
 @dataclass
@@ -440,20 +432,6 @@ def _evaluate_test_stage_attempt(
     )
 
 
-def _clear_model_state_for_cpu_retry(model) -> None:
-    try:
-        clear_fitted_model_state(model)
-    except Exception:
-        pass
-    cleanup = getattr(model, "_cleanup_after_fold", None)
-    if callable(cleanup):
-        try:
-            cleanup()
-        except Exception:
-            pass
-    release_accelerator_memory()
-
-
 def _evaluate_test_stage(
     *,
     result,
@@ -516,28 +494,5 @@ def _evaluate_test_stage(
         f"{X_train.shape[1]} features; {device_reason_text(decision)})"
     )
 
-    try:
-        model.set_runtime(runtime)
-        return _evaluate_test_stage_attempt(**attempt_args)
-    except Exception as error:
-        cuda_failure = (
-            decision.resolved == "cuda" and is_cuda_runtime_error(error)
-        )
-        if runtime.intent is DeviceIntent.Auto and cuda_failure:
-            _clear_model_state_for_cpu_retry(model)
-            runtime.record_cpu_fallback(
-                component,
-                f"cuda_runtime_fallback:{type(error).__name__}",
-            )
-            model.set_runtime(runtime)
-            warn(
-                "Adaptive error holdout encountered a CUDA runtime failure. "
-                "Restarting this complete model/selection holdout task on CPU once."
-            )
-            return _evaluate_test_stage_attempt(**attempt_args)
-        if runtime.intent is DeviceIntent.CUDA and cuda_failure:
-            raise RuntimeError(
-                "Adaptive error holdout failed on CUDA while --device cuda is "
-                "strict. CPU fallback is disabled."
-            ) from error
-        raise
+    model.set_runtime(runtime)
+    return _evaluate_test_stage_attempt(**attempt_args)

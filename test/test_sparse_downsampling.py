@@ -29,11 +29,14 @@ from df_analyze.enumerables import FeatureDownsampleMethod, ValidationMethod
 def test_svmlight_cli_rejects_unsupported_combinations(tmp_path: Path):
     path = tmp_path / "input.svmlight"
     path.write_text("0 1:1\n1 2:1\n", encoding="utf-8")
-    base = f"--df {path} --outdir {tmp_path} --mode classify --feat-downsample variance"
+    base = (
+        f"--df {path} --outdir {tmp_path} --mode classify "
+        "--feat-downsample normalized-variance"
+    )
 
     with pytest.raises(ArgumentError, match="large-feature-mode"):
         get_options(f"{base} --large-feature-mode")
-    with pytest.raises(ArgumentError, match="indexed feature downsampling"):
+    with pytest.raises(SystemExit):
         get_options(f"{base} --feat-downsample mutual-info")
     with pytest.raises(ArgumentError, match="exactly one target"):
         get_options(f"{base} --targets first,second")
@@ -59,7 +62,7 @@ def test_svmlight_cli_accepts_clinical_and_feature_sidecars(tmp_path: Path):
 
     options = get_options(
         f"--df {sparse_path} --outdir {tmp_path} --target diagnosis "
-        "--mode classify --feat-downsample variance "
+        "--mode classify --feat-downsample normalized-variance "
         f"--svmlight-metadata {metadata_path} "
         f"--svmlight-feature-map {feature_map_path} "
         "--svmlight-sample-id-column participant_id "
@@ -92,7 +95,7 @@ def test_extensionless_svmlight_auto_detection_supports_external_regression(
     options = get_options(
         f"--df-train {train_path} --df-tests {test_path} "
         "--df-tests-method list --target target --mode regress "
-        f"--feat-downsample variance --outdir {tmp_path}"
+        f"--feat-downsample normalized-variance --outdir {tmp_path}"
     )
 
     assert looks_like_svmlight_path(train_path)
@@ -136,11 +139,10 @@ def test_svmlight_index_base_and_downsample(tmp_path: Path):
         datapath=path,
         test_paths=[],
         svmlight_index_base="auto",
-        feat_downsample=FeatureDownsampleMethod.Auto,
+        feat_downsample=FeatureDownsampleMethod.FTest,
         n_feat_downsample=10,
         downsample_chunk_size=11,
         downsample_screening_fraction=0.25,
-        downsample_variance_threshold=None,
         downsample_save_scores=False,
         is_classification=True,
         target="target",
@@ -152,7 +154,6 @@ def test_svmlight_index_base_and_downsample(tmp_path: Path):
     assert test.X.shape == (60, 10)
     assert result.sparse_input
     assert result.resolved_method == FeatureDownsampleMethod.FTest.value
-    assert result.auto_reason is not None
     assert result.source_index_base == 1
     for name, index in zip(result.selected_features, result.selected_indices):
         assert name == f"feature_{index + 1}"
@@ -170,56 +171,6 @@ def test_svmlight_index_base_and_downsample(tmp_path: Path):
     assert payload["selected_source_indices"] == [
         index + 1 for index in result.selected_indices
     ]
-
-
-def test_sparse_auto_fallback_records_its_reason(tmp_path: Path, monkeypatch):
-    rng = np.random.default_rng(71)
-    train_path = tmp_path / "fallback-train.svmlight"
-    test_path = tmp_path / "fallback-test.svmlight"
-    dump_svmlight_file(
-        sparse.csr_matrix(rng.normal(size=(80, 8))),
-        np.arange(80) % 2,
-        str(train_path),
-        zero_based=True,
-    )
-    dump_svmlight_file(
-        sparse.csr_matrix(rng.normal(size=(40, 8))),
-        np.arange(40) % 2,
-        str(test_path),
-        zero_based=True,
-    )
-    fallback_note = "Auto screening was not feasible in this test."
-
-    def force_fallback(requested, resolved, y, *args, **kwargs):
-        return (
-            FeatureDownsampleMethod.NormalizedVariance,
-            None,
-            np.arange(len(y), dtype=int),
-            fallback_note,
-        )
-
-    monkeypatch.setattr(sparse_module, "resolve_screening_split", force_fallback)
-    options = SimpleNamespace(
-        datapath=train_path,
-        test_paths=[test_path],
-        tests_method=ValidationMethod.List,
-        svmlight_index_base="zero",
-        feat_downsample=FeatureDownsampleMethod.Auto,
-        n_feat_downsample=3,
-        downsample_chunk_size=4,
-        downsample_screening_fraction=0.25,
-        downsample_variance_threshold=None,
-        downsample_save_scores=False,
-        is_classification=True,
-        target="target",
-        test_val_size=0.25,
-        seed=42,
-    )
-
-    _, _, result = sparse_prepared_splits(options)[0]
-
-    assert result.resolved_method == FeatureDownsampleMethod.NormalizedVariance.value
-    assert result.auto_reason == fallback_note
 
 
 def test_sparse_external_reports_all_timing_and_split_shape_phases(tmp_path: Path):
@@ -243,11 +194,10 @@ def test_sparse_external_reports_all_timing_and_split_shape_phases(tmp_path: Pat
         test_paths=[test_path],
         tests_method=ValidationMethod.List,
         svmlight_index_base="zero",
-        feat_downsample=FeatureDownsampleMethod.Variance,
+        feat_downsample=FeatureDownsampleMethod.NormalizedVariance,
         n_feat_downsample=4,
         downsample_chunk_size=5,
         downsample_screening_fraction=0.25,
-        downsample_variance_threshold=None,
         downsample_save_scores=False,
         is_classification=True,
         target="target",
@@ -312,11 +262,10 @@ def test_sparse_lodo_uses_each_partition_as_training_set(tmp_path: Path, monkeyp
         test_paths=paths[1:],
         tests_method=ValidationMethod.LODO,
         svmlight_index_base="zero",
-        feat_downsample=FeatureDownsampleMethod.Variance,
+        feat_downsample=FeatureDownsampleMethod.NormalizedVariance,
         n_feat_downsample=4,
         downsample_chunk_size=10,
         downsample_screening_fraction=0.25,
-        downsample_variance_threshold=None,
         downsample_save_scores=False,
         is_classification=True,
         target="target",
@@ -396,11 +345,10 @@ def test_sparse_path_rejects_constant_training_target(tmp_path: Path):
         datapath=path,
         test_paths=[],
         svmlight_index_base="zero",
-        feat_downsample=FeatureDownsampleMethod.Variance,
+        feat_downsample=FeatureDownsampleMethod.NormalizedVariance,
         n_feat_downsample=5,
         downsample_chunk_size=10,
         downsample_screening_fraction=0.25,
-        downsample_variance_threshold=None,
         downsample_save_scores=False,
         is_classification=True,
         target="target",
@@ -429,11 +377,10 @@ def test_sparse_path_validates_external_values(
         datapath=train_path,
         test_paths=[test_path],
         svmlight_index_base="one",
-        feat_downsample=FeatureDownsampleMethod.Variance,
+        feat_downsample=FeatureDownsampleMethod.NormalizedVariance,
         n_feat_downsample=2,
         downsample_chunk_size=10,
         downsample_screening_fraction=0.25,
-        downsample_variance_threshold=None,
         downsample_save_scores=False,
         is_classification=True,
         target="target",
@@ -450,10 +397,8 @@ def test_sparse_scaling_preserves_rare_nonzero_features(tmp_path: Path):
     test_path = tmp_path / "rare-test.svmlight"
     train_values = np.zeros((100, 2), dtype=np.float64)
     train_values[:4, 0] = 1.0
-    train_values[::2, 1] = 0.01
     test_values = np.zeros((50, 2), dtype=np.float64)
     test_values[:2, 0] = 1.0
-    test_values[::2, 1] = 0.01
     dump_svmlight_file(
         sparse.csr_matrix(train_values),
         np.arange(100) % 2,
@@ -471,11 +416,10 @@ def test_sparse_scaling_preserves_rare_nonzero_features(tmp_path: Path):
         test_paths=[test_path],
         tests_method=ValidationMethod.List,
         svmlight_index_base="zero",
-        feat_downsample=FeatureDownsampleMethod.Variance,
+        feat_downsample=FeatureDownsampleMethod.NormalizedVariance,
         n_feat_downsample=1,
         downsample_chunk_size=10,
         downsample_screening_fraction=0.25,
-        downsample_variance_threshold=None,
         downsample_save_scores=False,
         is_classification=True,
         target="target",
@@ -541,7 +485,6 @@ def test_sparse_clinical_sidecar_feature_map_and_protection(tmp_path: Path):
         n_feat_downsample=4,
         downsample_chunk_size=5,
         downsample_screening_fraction=0.25,
-        downsample_variance_threshold=None,
         downsample_save_scores=False,
         is_classification=True,
         target="diagnosis",
@@ -585,11 +528,10 @@ def test_sparse_clinical_sidecar_detects_row_misalignment(tmp_path: Path):
         svmlight_metadata=[metadata_path],
         svmlight_feature_map=None,
         downsample_protected_features=[],
-        feat_downsample=FeatureDownsampleMethod.Variance,
+        feat_downsample=FeatureDownsampleMethod.NormalizedVariance,
         n_feat_downsample=3,
         downsample_chunk_size=5,
         downsample_screening_fraction=0.25,
-        downsample_variance_threshold=None,
         downsample_save_scores=False,
         is_classification=True,
         target="diagnosis",
@@ -628,7 +570,6 @@ def test_sparse_million_feature_smoke(tmp_path: Path):
         n_feat_downsample=20,
         downsample_chunk_size=100_000,
         downsample_screening_fraction=0.25,
-        downsample_variance_threshold=None,
         downsample_save_scores=False,
         is_classification=True,
         target="target",

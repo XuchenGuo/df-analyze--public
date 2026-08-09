@@ -28,11 +28,8 @@ DATA_JSON = DATAFILE.parent / "mcic.json"
 CLEAN_JSON = DATAFILE.parent / "mcic_clean.json"
 UNCORRELATED = DATADIR / "mcic_uncorrelated_cols.json"
 
-# Legacy model-name lists retained for callers that import these constants.
-# The current CLI choices come from the enums in df_analyze.enumerables.
 CLASSIFIERS = ["rf", "svm", "dtree", "mlp", "bag", "dummy", "lgb"]
 REGRESSORS = ["linear", "rf", "svm", "adaboost", "gboost", "mlp", "knn", "lgb"]
-
 DIMENSION_REDUCTION = ["pca", "kpca", "umap"]
 WRAPPER_METHODS = ["step-up", "step-down"]
 UNIVARIATE_FILTER_METHODS = ["d", "auc", "pearson", "t-test", "u-test", "chi", "info"]
@@ -155,10 +152,6 @@ Notes
 -----
 Using one third means, for example, that a 3-target problem can retain rows
 with up to one rare label while still discarding rows dominated by rare labels.
-
-This legacy threshold is retained for import compatibility. The current
-multi-target cleaning path keeps low-support rows and validates their support
-when constructing splits, so it does not apply this threshold.
 """
 
 N_TARG_LEVEL_MIN_INTERNAL = N_TARG_LEVEL_MIN // 2

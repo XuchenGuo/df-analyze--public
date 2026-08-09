@@ -304,22 +304,6 @@ class DfAnalyzeRegressor(RandEnum, Enum):
         )
 
 
-class TabPFNVersion(RandEnum, Enum):
-    V3 = "v3"
-    V26 = "v2_6"
-    V25 = "v2_5"
-
-    @classmethod
-    def parse(cls, value: str) -> str:
-        return cls.from_arg(value).value
-
-    @classmethod
-    def from_arg(cls, value: str | TabPFNVersion) -> TabPFNVersion:
-        if isinstance(value, cls):
-            return value
-        return cls(str(value).lower().replace(".", "_"))
-
-
 @dataclass
 class ClassifierScorer(Scorer, RandEnum, Enum):
     Accuracy = "acc"
@@ -520,19 +504,8 @@ class FeatureSelection(RandEnum, Enum):
 
 class FeatureDownsampleMethod(RandEnum, Enum):
     None_ = "none"
-    Auto = "auto"
-    Random = "random"
-    Variance = "variance"
     NormalizedVariance = "normalized-variance"
     FTest = "f-test"
-    MutualInfo = "mutual-info"
-    Linear = "linear"
-    LGBM = "lgbm"
-    SVD = "svd"
-    SparseRandomProjection = "sparse-rp"
-    RankEnsemble = "rank-ensemble"
-    SelectorEnsemble = "selector-ensemble"
-    StableRank = "stable-rank"
 
 
 class ModelFeatureSelection(RandEnum, Enum):

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from itertools import combinations
 from typing import Iterable
-from warnings import warn
 
 import numpy as np
 import pandas as pd
@@ -19,25 +18,17 @@ from df_analyze.analysis.error_consistency.containers import (
     ECMetricComputation,
     ECMetricInfo,
 )
-from df_analyze.runtime.hardware import DeviceIntent
 
 CUDA_PAIR_WORK_ITEMS = 2_000_000
-RATIO_DIFF_SIGN_LEGACY = "ratio_diff_sign"
 RATIO_DIFF_SIGN_MAGNITUDE = "ratio_diff_sign_magnitude"
 RATIO_DIFF_SIGN_REFERENCE = "ratio_diff_sign_reference"
 RATIO_DIFF_SIGN_METHODS = {
-    RATIO_DIFF_SIGN_LEGACY,
     RATIO_DIFF_SIGN_MAGNITUDE,
     RATIO_DIFF_SIGN_REFERENCE,
 }
-RATIO_DIFF_SIGN_MAGNITUDE_PRIMARY = {
-    RATIO_DIFF_SIGN_LEGACY,
-    RATIO_DIFF_SIGN_MAGNITUDE,
-}
+RATIO_DIFF_SIGN_MAGNITUDE_PRIMARY = {RATIO_DIFF_SIGN_MAGNITUDE}
 REGRESSION_EC_METRICS: dict[str, ECMetricInfo] = {
-    "ratio": ECMetricInfo(
-        "ratio", "Ratio", True, 1.0, 0.0, 1.0, None, True, legacy_equation_label="1"
-    ),
+    "ratio": ECMetricInfo("ratio", "Ratio", True, 1.0, 0.0, 1.0, None, True),
     "ratio_diff": ECMetricInfo(
         "ratio_diff",
         "Ratio-diff",
@@ -47,7 +38,6 @@ REGRESSION_EC_METRICS: dict[str, ECMetricInfo] = {
         1.0,
         None,
         True,
-        legacy_equation_label="2",
     ),
     "ratio_sign": ECMetricInfo(
         "ratio_sign",
@@ -58,18 +48,6 @@ REGRESSION_EC_METRICS: dict[str, ECMetricInfo] = {
         1.0,
         None,
         True,
-        legacy_equation_label="3",
-    ),
-    "ratio_diff_sign": ECMetricInfo(
-        "ratio_diff_sign",
-        "Ratio-diff-sign magnitude (legacy name)",
-        False,
-        0.0,
-        0.0,
-        1.0,
-        None,
-        True,
-        legacy_equation_label="4",
     ),
     "ratio_diff_sign_magnitude": ECMetricInfo(
         "ratio_diff_sign_magnitude",
@@ -80,7 +58,6 @@ REGRESSION_EC_METRICS: dict[str, ECMetricInfo] = {
         1.0,
         None,
         True,
-        legacy_equation_label="4",
     ),
     "ratio_diff_sign_reference": ECMetricInfo(
         "ratio_diff_sign_reference",
@@ -91,7 +68,6 @@ REGRESSION_EC_METRICS: dict[str, ECMetricInfo] = {
         1.0,
         None,
         True,
-        legacy_equation_label="4",
         ranking_supported=False,
     ),
     "intersection_union_sample": ECMetricInfo(
@@ -103,7 +79,6 @@ REGRESSION_EC_METRICS: dict[str, ECMetricInfo] = {
         1.0,
         None,
         True,
-        legacy_equation_label="6",
     ),
     "intersection_union_all": ECMetricInfo(
         "intersection_union_all",
@@ -114,7 +89,6 @@ REGRESSION_EC_METRICS: dict[str, ECMetricInfo] = {
         1.0,
         None,
         False,
-        legacy_equation_label="5",
     ),
     "intersection_union_distance": ECMetricInfo(
         "intersection_union_distance",
@@ -131,13 +105,9 @@ METHOD_ALIASES = {
     "ratio-diff": "ratio_diff",
     "ratio-signed": "ratio_sign",
     "ratio-sign": "ratio_sign",
-    # ``ratio_diff_sign`` remains accepted with its historical magnitude-first
-    # summary. New calls should select one of the two explicit variants.
     "ratio-diff-sign-magnitude": "ratio_diff_sign_magnitude",
     "ratio-diff-sign-reference": "ratio_diff_sign_reference",
     "ratio-diff-sign-signed": "ratio_diff_sign_reference",
-    "ratio-diff-sign": "ratio_diff_sign",
-    "ratio-diff-signed": "ratio_diff_sign",
     "intersection-union-sample": "intersection_union_sample",
     "intersection-union-all": "intersection_union_all",
     "intersection-union-distance": "intersection_union_distance",
@@ -156,9 +126,7 @@ def normalize_regression_method(method: str) -> str:
 
 
 def default_regression_methods() -> list[str]:
-    # Seven non-ambiguous defaults. The legacy and strict-reference signed
-    # variants remain opt-in so adding compatibility does not change the
-    # historical seven-method run count.
+    # Seven non-ambiguous defaults. The signed-reference variant is opt-in.
     return [
         "ratio",
         "ratio_diff",
@@ -225,7 +193,7 @@ def regression_pairwise_consistency(
             denominator = abs1 + abs2
             values = np.abs(abs1 - abs2) / (denominator + epsilon)
             values[denominator == 0] = 0.0
-            if method in {RATIO_DIFF_SIGN_LEGACY, RATIO_DIFF_SIGN_REFERENCE}:
+            if method == RATIO_DIFF_SIGN_REFERENCE:
                 values = sign * values
             return np.nan_to_num(values, nan=0.0)
         if method == "intersection_union_sample":
@@ -268,7 +236,7 @@ def _torch_pairwise(r1, r2, method: str, epsilon: float):
         denominator = abs1 + abs2
         values = torch.abs(abs1 - abs2) / (denominator + epsilon)
         values = torch.where(denominator == 0, torch.zeros_like(values), values)
-        if method in {RATIO_DIFF_SIGN_LEGACY, RATIO_DIFF_SIGN_REFERENCE}:
+        if method == RATIO_DIFF_SIGN_REFERENCE:
             values = sign * values
         return torch.nan_to_num(values, nan=0.0)
 
@@ -344,30 +312,9 @@ def compute_regression_ec(
 
     residual_t = None
     if backend is not None and backend.resolved == "torch_cuda":
-        try:
-            import torch
+        import torch
 
-            residual_t = torch.as_tensor(
-                residual_matrix, dtype=torch.float64, device="cuda"
-            )
-        except Exception as error:
-            if backend.requested == DeviceIntent.CUDA.value:
-                raise RuntimeError(
-                    "Regression error consistency failed on CUDA while "
-                    "--device cuda is strict."
-                ) from error
-            warn(
-                "Could not compute regression EC on CUDA; falling back to numpy. "
-                f"Details: {error}"
-            )
-            return compute_regression_ec(
-                residual_matrix,
-                methods=selected,
-                epsilon=epsilon,
-                backend=backend.fallback(f"torch_cuda_error:{type(error).__name__}"),
-                row_ids=sample_ids,
-                output_detail=detail,
-            )
+        residual_t = torch.as_tensor(residual_matrix, dtype=torch.float64, device="cuda")
 
     computations = []
     for method in selected:
@@ -406,12 +353,12 @@ def compute_regression_ec(
             nonlocal signed_flat_sum
             i, j = pair
             values = np.asarray(values, dtype=float).ravel()
-            if primary_values is None:
-                primary_values = values
-            primary_values = np.asarray(primary_values, dtype=float).ravel()
-            valid = np.isfinite(primary_values)
+            primary = np.asarray(
+                values if primary_values is None else primary_values, dtype=float
+            ).ravel()
+            valid = np.isfinite(primary)
             signed_finite = values[valid]
-            finite = primary_values[valid]
+            finite = primary[valid]
             pair_mean = float(np.mean(finite)) if finite.size else np.nan
             pair_means.append(pair_mean)
             matrix[i, j] = matrix[j, i] = pair_mean
@@ -454,14 +401,15 @@ def compute_regression_ec(
                 flat_max = max(flat_max, float(np.max(finite)))
 
             if sample_sum is not None:
-                if primary_values.size != sample_sum.size:
+                assert sample_sum_sq is not None and sample_count is not None
+                if primary.size != sample_sum.size:
                     raise RuntimeError(
                         f"Regression EC method '{method}' returned "
-                        f"{primary_values.size} "
+                        f"{primary.size} "
                         f"values for {sample_sum.size} samples."
                     )
-                sample_sum[valid] += primary_values[valid]
-                sample_sum_sq[valid] += primary_values[valid] ** 2
+                sample_sum[valid] += primary[valid]
+                sample_sum_sq[valid] += primary[valid] ** 2
                 sample_count[valid] += 1
                 if signed_sample_sum is not None:
                     signed_sample_sum[valid] += values[valid]
@@ -535,26 +483,15 @@ def compute_regression_ec(
                     ):
                         record_pair(pair, values, primary_values)
             except Exception as error:
-                if backend.requested == DeviceIntent.CUDA.value:
-                    raise RuntimeError(
-                        "Regression error consistency failed on CUDA while "
-                        "--device cuda is strict."
-                    ) from error
-                warn(
-                    "Could not compute regression EC on CUDA; falling back to "
-                    f"numpy. Details: {error}"
-                )
-                return compute_regression_ec(
-                    residual_matrix,
-                    methods=selected,
-                    epsilon=epsilon,
-                    backend=backend.fallback(f"torch_cuda_error:{type(error).__name__}"),
-                    row_ids=sample_ids,
-                    output_detail=detail,
-                )
+                raise RuntimeError(
+                    "Regression error consistency failed during CUDA calculation."
+                ) from error
 
         samplewise = None
         if info.samplewise_defined:
+            assert sample_sum is not None
+            assert sample_sum_sq is not None
+            assert sample_count is not None
             with np.errstate(divide="ignore", invalid="ignore"):
                 sample_mean = sample_sum / sample_count
                 sample_var = (sample_sum_sq - sample_sum**2 / sample_count) / (
@@ -599,8 +536,7 @@ def compute_regression_ec(
             ),
             "EC_scalar_sd": ec_scalar_sd,
             "EC_vec_sd": ec_vec_sd,
-            # Explicit aliases avoid treating the legacy paper labels as
-            # interchangeable. The model-pair SD is defined for every metric.
+            # The model-pair SD is defined for every metric.
             "ec_pooled_value_sd": flat_sd,
             "ec_model_pair_sd": _sample_sd(np.asarray(pair_means)),
             "ec_sample_profile_sd": ec_vec_sd if info.samplewise_defined else np.nan,
@@ -620,13 +556,6 @@ def compute_regression_ec(
                     if method == RATIO_DIFF_SIGN_REFERENCE
                     else "magnitude"
                 ),
-                preferred_method_name=(
-                    RATIO_DIFF_SIGN_REFERENCE
-                    if method == RATIO_DIFF_SIGN_REFERENCE
-                    else RATIO_DIFF_SIGN_MAGNITUDE
-                ),
-                compatibility_method_name=RATIO_DIFF_SIGN_LEGACY,
-                legacy_ambiguous_method_name=(method == RATIO_DIFF_SIGN_LEGACY),
                 ec_signed_mean=(signed_flat_sum / flat_count if flat_count else np.nan),
             )
         if backend is not None:

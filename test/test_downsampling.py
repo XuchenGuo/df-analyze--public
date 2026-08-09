@@ -8,7 +8,6 @@ from scipy import sparse
 from sklearn.feature_selection import f_classif
 
 import df_analyze.downsampling.large as large_module
-import df_analyze.downsampling.methods as methods_module
 from df_analyze.cli.cli import make_parser
 from df_analyze.downsampling.base import resolve_n_features
 from df_analyze.downsampling.chunked import (
@@ -19,11 +18,9 @@ from df_analyze.downsampling.chunked import (
 from df_analyze.downsampling.containers import FeatureDownsampleResult
 from df_analyze.downsampling.large import large_table_prepared_splits
 from df_analyze.downsampling.methods import (
-    _level_preserving_sample,
     _rank_indices,
     _rank_score,
     downsample_split,
-    resolve_feature_downsample_method,
     select_indexed_columns,
 )
 from df_analyze.downsampling.screening import screening_tuning_indices
@@ -66,7 +63,6 @@ def _options(method: FeatureDownsampleMethod, n_features: int = 12) -> SimpleNam
         n_feat_downsample=n_features,
         downsample_chunk_size=13,
         downsample_screening_fraction=0.25,
-        downsample_variance_threshold=None,
         downsample_save_scores=False,
         seed=42,
     )
@@ -169,19 +165,8 @@ def test_range_normalized_variance_matches_sparse_input():
 @pytest.mark.parametrize(
     "method",
     [
-        FeatureDownsampleMethod.Auto,
-        FeatureDownsampleMethod.Random,
-        FeatureDownsampleMethod.Variance,
         FeatureDownsampleMethod.NormalizedVariance,
         FeatureDownsampleMethod.FTest,
-        FeatureDownsampleMethod.MutualInfo,
-        FeatureDownsampleMethod.Linear,
-        FeatureDownsampleMethod.LGBM,
-        FeatureDownsampleMethod.SVD,
-        FeatureDownsampleMethod.SparseRandomProjection,
-        FeatureDownsampleMethod.RankEnsemble,
-        FeatureDownsampleMethod.SelectorEnsemble,
-        FeatureDownsampleMethod.StableRank,
     ],
 )
 def test_all_downsample_methods(method):
@@ -192,106 +177,6 @@ def test_all_downsample_methods(method):
     assert result.n_features_in == 60
     assert result.n_features_out == 12
     assert train_out.X.columns.tolist() == test_out.X.columns.tolist()
-    if method in {
-        FeatureDownsampleMethod.RankEnsemble,
-        FeatureDownsampleMethod.SelectorEnsemble,
-    }:
-        assert result.ensemble_members == [
-            "range-normalized-variance",
-            "f-test",
-            "mutual-info",
-            "linear",
-            "lgbm",
-        ]
-
-
-def test_ensemble_records_only_members_that_produced_scores(monkeypatch):
-    train, _ = _frames()
-
-    def controlled_scores(X, y, is_classification, method, seed):
-        del y, is_classification, seed
-        if method is FeatureDownsampleMethod.Linear:
-            raise ValueError("deliberate member failure")
-        return np.arange(X.shape[1], dtype=np.float64)
-
-    monkeypatch.setattr(methods_module, "_aggregate_direct_scores", controlled_scores)
-
-    with pytest.warns(UserWarning, match="Skipping 'linear'"):
-        _, result = select_indexed_columns(
-            train.X,
-            np.arange(len(train.X)),
-            train.y,
-            True,
-            FeatureDownsampleMethod.RankEnsemble,
-            12,
-        )
-
-    assert result.ensemble_members == [
-        "range-normalized-variance",
-        "f-test",
-        "mutual-info",
-        "lgbm",
-    ]
-
-
-def test_ensemble_skips_full_matrix_members_over_memory_budget(monkeypatch):
-    train, _ = _frames()
-
-    def unexpected_direct_score(*args, **kwargs):
-        raise AssertionError("full-matrix ensemble member should have been skipped")
-
-    monkeypatch.setattr(methods_module, "DOWNSAMPLE_MAX_DENSE_BYTES", 1)
-    monkeypatch.setattr(
-        methods_module, "_aggregate_direct_scores", unexpected_direct_score
-    )
-
-    _, result = select_indexed_columns(
-        train.X,
-        np.arange(len(train.X)),
-        train.y,
-        True,
-        FeatureDownsampleMethod.RankEnsemble,
-        12,
-    )
-
-    assert result.ensemble_members == ["range-normalized-variance", "f-test"]
-
-
-def test_explicit_full_matrix_method_honors_memory_budget(monkeypatch):
-    train, test = _frames()
-    monkeypatch.setattr(methods_module, "DOWNSAMPLE_MAX_DENSE_BYTES", 1)
-
-    with pytest.raises(MemoryError, match="peak dense fitting memory"):
-        downsample_split(
-            train,
-            test,
-            _options(FeatureDownsampleMethod.MutualInfo),
-        )
-
-
-def test_large_feature_ensemble_uses_only_chunked_scale_invariant_members(
-    monkeypatch,
-):
-    train, _ = _frames()
-
-    def unexpected_direct_score(*args, **kwargs):
-        raise AssertionError("large-feature mode should not use direct ensemble members")
-
-    monkeypatch.setattr(
-        methods_module, "_aggregate_direct_scores", unexpected_direct_score
-    )
-    _, result = select_indexed_columns(
-        train.X,
-        np.arange(len(train.X)),
-        train.y,
-        True,
-        FeatureDownsampleMethod.RankEnsemble,
-        12,
-        large_feature_mode=True,
-    )
-
-    assert result.ensemble_members == ["range-normalized-variance", "f-test"]
-    assert result.large_feature_mode
 
 
 def test_supervised_screening_is_disjoint_from_tuning():
@@ -363,51 +248,6 @@ def test_indexed_selection_rejects_all_invalid_scores():
             FeatureDownsampleMethod.FTest,
             5,
         )
-
-
-def test_auto_downsampling_falls_back_for_singleton_multitarget():
-    rng = np.random.default_rng(44)
-    X = pd.DataFrame(rng.normal(size=(40, 20)))
-    y = pd.DataFrame(
-        {
-            "common": np.tile([0, 1], 20),
-            "singleton": [1, *([0] * 39)],
-        }
-    )
-    train = PreparedData(X, y, None, True, X_cont=X)
-    test = PreparedData(
-        X.iloc[:10].copy(),
-        y.iloc[:10].copy(),
-        None,
-        True,
-        X_cont=X.iloc[:10],
-    )
-
-    with pytest.warns(UserWarning, match="fell back.*normalized-variance"):
-        _, _, result = downsample_split(
-            train, test, _options(FeatureDownsampleMethod.Auto, 5)
-        )
-
-    assert result.requested_method == FeatureDownsampleMethod.Auto.value
-    assert result.resolved_method == FeatureDownsampleMethod.NormalizedVariance.value
-    assert result.screening_rows == []
-    assert result.tuning_rows == list(range(len(train.X)))
-    assert result.auto_reason is not None
-
-
-def test_auto_uses_stable_supervised_ranking_for_extreme_p_over_n():
-    y = pd.Series([0, 1] * 5)
-
-    resolved = resolve_feature_downsample_method(
-        FeatureDownsampleMethod.Auto,
-        n_samples=10,
-        n_features=10_001,
-        n_features_out=100,
-        is_classification=True,
-        y=y,
-    )
-
-    assert resolved is FeatureDownsampleMethod.StableRank
 
 
 def test_explicit_supervised_downsampling_rejects_singleton_multitarget():
@@ -495,22 +335,6 @@ def test_grouped_screening_rejects_a_single_group():
         screening_tuning_indices(y, 0.25, True, groups)
 
 
-def test_auto_downsampling_falls_back_when_group_screening_is_impossible():
-    train, test = _frames()
-    train.groups = pd.Series(["only-group"] * len(train.X))
-
-    _, _, result = downsample_split(
-        train,
-        test,
-        _options(FeatureDownsampleMethod.Auto),
-    )
-
-    assert result.resolved_method == FeatureDownsampleMethod.NormalizedVariance.value
-    assert result.screening_rows == []
-    assert result.tuning_rows == list(range(len(train.X)))
-    assert any("at least two distinct training groups" in note for note in result.notes)
-
-
 def test_explicit_supervised_downsampling_rejects_a_single_group():
     train, test = _frames()
     train.groups = pd.Series(["only-group"] * len(train.X))
@@ -558,56 +382,12 @@ def test_test_only_signal_is_not_used_for_scoring():
     assert 19 not in selected
 
 
-def test_stable_rank_handles_constant_features():
-    train, test = _frames()
-    train.X.iloc[:, 20:] = 1.0
-    test.X.iloc[:, 20:] = 1.0
-    out, _, result = downsample_split(
-        train, test, _options(FeatureDownsampleMethod.StableRank)
-    )
-    assert out.X.shape[1] == 12
-    assert result.strategy == "selection_frequency_then_mean_rank"
-    assert result.stability_repeats == 20
-    assert result.stability_subsample == pytest.approx(0.75)
-
-
-def test_variance_threshold_is_enforced():
-    train, test = _frames()
-    options = _options(FeatureDownsampleMethod.Variance)
-    options.downsample_variance_threshold = 1e6
-    with pytest.raises(ValueError, match="score threshold"):
-        downsample_split(train, test, options)
-
-
-def test_variance_threshold_is_enforced_even_when_count_keeps_all_features():
-    train, test = _frames()
-    options = _options(FeatureDownsampleMethod.Variance, train.X.shape[1])
-    options.downsample_variance_threshold = 1e6
-
-    with pytest.raises(ValueError, match="score threshold"):
-        downsample_split(train, test, options)
-
-
-def test_random_downsampling_uses_the_configured_seed():
-    train, test = _frames()
-    first = _options(FeatureDownsampleMethod.Random, 12)
-    second = _options(FeatureDownsampleMethod.Random, 12)
-    second.seed = 1234
-
-    _, _, first_result = downsample_split(train, test, first)
-    _, _, repeated_result = downsample_split(train, test, first)
-    _, _, second_result = downsample_split(train, test, second)
-
-    assert first_result.selected_indices == repeated_result.selected_indices
-    assert first_result.selected_indices != second_result.selected_indices
-
-
-def test_large_table_path_selects_before_materializing():
+def test_large_table_path_selects_before_materializing(monkeypatch):
     rng = np.random.default_rng(6)
     values = rng.normal(size=(240, 200))
     frame = pd.DataFrame(values, columns=[f"x{idx}" for idx in range(200)])
     frame["target"] = (values[:, 17] > 0).astype(int)
-    options = _options(FeatureDownsampleMethod.Auto, 15)
+    options = _options(FeatureDownsampleMethod.FTest, 15)
     options.is_classification = True
     options.target = "target"
     options.targets = ["target"]
@@ -618,46 +398,21 @@ def test_large_table_path_selects_before_materializing():
     options.test_val_size = 0.25
     options.seed = 42
     options.assume_numeric_features = False
+    prepared_widths = []
+    original_prepare = large_module.prepare_data
+
+    def record_prepare(selected_frame, *args, **kwargs):
+        prepared_widths.append(selected_frame.shape[1])
+        return original_prepare(selected_frame, *args, **kwargs)
+
+    monkeypatch.setattr(large_module, "prepare_data", record_prepare)
     train, test, result = large_table_prepared_splits(frame, options)[0]
     assert train.X.shape == (180, 15)
     assert test.X.shape == (60, 15)
     assert result.input_format == "table-large"
     assert result.large_feature_mode
     assert result.resolved_method == FeatureDownsampleMethod.FTest.value
-    assert result.auto_reason is not None
-
-
-def test_large_table_auto_fallback_records_its_reason(monkeypatch):
-    rng = np.random.default_rng(61)
-    values = rng.normal(size=(160, 30))
-    frame = pd.DataFrame(values, columns=[f"x{idx}" for idx in range(30)])
-    frame["target"] = np.arange(160) % 2
-    options = _options(FeatureDownsampleMethod.Auto, 8)
-    options.is_classification = True
-    options.target = "target"
-    options.targets = ["target"]
-    options.categoricals = []
-    options.ordinals = []
-    options.drops = []
-    options.grouper = None
-    options.test_val_size = 0.25
-    options.assume_numeric_features = False
-    fallback_note = "Auto screening was not feasible in this test."
-
-    def force_fallback(requested, resolved, y, *args, **kwargs):
-        return (
-            FeatureDownsampleMethod.NormalizedVariance,
-            None,
-            np.arange(len(y), dtype=int),
-            fallback_note,
-        )
-
-    monkeypatch.setattr(large_module, "resolve_screening_split", force_fallback)
-
-    _, _, result = large_table_prepared_splits(frame, options)[0]
-
-    assert result.resolved_method == FeatureDownsampleMethod.NormalizedVariance.value
-    assert result.auto_reason == fallback_note
+    assert prepared_widths == [16]
 
 
 def test_large_table_regression_does_not_stratify_continuous_target():
@@ -693,7 +448,7 @@ def test_large_table_keeps_numeric_binary_feature_name():
         }
     )
     frame["target"] = np.tile([0, 1], 120)
-    options = _options(FeatureDownsampleMethod.Variance, 5)
+    options = _options(FeatureDownsampleMethod.NormalizedVariance, 5)
     options.is_classification = True
     options.target = "target"
     options.targets = ["target"]
@@ -718,7 +473,7 @@ def test_large_table_rejects_constant_targets(is_classification: bool):
     rng = np.random.default_rng(18)
     frame = pd.DataFrame(rng.normal(size=(80, 20)))
     frame["target"] = 1 if is_classification else 2.5
-    options = _options(FeatureDownsampleMethod.Variance, 5)
+    options = _options(FeatureDownsampleMethod.NormalizedVariance, 5)
     options.is_classification = is_classification
     options.target = "target"
     options.targets = ["target"]
@@ -739,7 +494,7 @@ def test_large_table_multitarget_split_and_target_audits():
     frame = pd.DataFrame(rng.normal(size=(120, 20)))
     frame["target_a"] = [*([1] * 8), *([0] * 112)]
     frame["target_b"] = [*([0] * 8), *([1] * 8), *([0] * 104)]
-    options = _options(FeatureDownsampleMethod.Variance, 5)
+    options = _options(FeatureDownsampleMethod.NormalizedVariance, 5)
     options.is_classification = True
     options.target = "target_a"
     options.targets = ["target_a", "target_b"]
@@ -770,7 +525,7 @@ def test_large_table_lodo_uses_every_partition_as_training_set():
         rng.normal(size=(210, 12)), columns=[f"x{idx}" for idx in range(12)]
     )
     frame["target"] = np.arange(210) % 2
-    options = _options(FeatureDownsampleMethod.Variance, 5)
+    options = _options(FeatureDownsampleMethod.NormalizedVariance, 5)
     options.is_classification = True
     options.target = "target"
     options.targets = ["target"]
@@ -800,7 +555,7 @@ def test_large_table_list_materializes_only_the_current_split(monkeypatch):
         rng.normal(size=(150, 12)), columns=[f"x{idx}" for idx in range(12)]
     )
     frame["target"] = np.arange(150) % 2
-    options = _options(FeatureDownsampleMethod.Variance, 5)
+    options = _options(FeatureDownsampleMethod.NormalizedVariance, 5)
     options.is_classification = True
     options.target = "target"
     options.targets = ["target"]
@@ -836,7 +591,7 @@ def test_large_table_fits_target_encoder_on_training_partition():
         rng.normal(size=(90, 10)), columns=[f"x{idx}" for idx in range(10)]
     )
     frame["target"] = [0, 1] * 30 + [2] * 30
-    options = _options(FeatureDownsampleMethod.Variance, 4)
+    options = _options(FeatureDownsampleMethod.NormalizedVariance, 4)
     options.is_classification = True
     options.target = "target"
     options.targets = ["target"]
@@ -888,7 +643,7 @@ def test_large_table_normalizes_only_group_metadata(monkeypatch):
     )
     frame["site"] = np.repeat([f"site_{idx}" for idx in range(40)], 4)
     frame["target"] = np.arange(len(frame)) % 2
-    options = _options(FeatureDownsampleMethod.Variance, 8)
+    options = _options(FeatureDownsampleMethod.NormalizedVariance, 8)
     options.is_classification = True
     options.target = "target"
     options.targets = ["target"]
@@ -940,18 +695,41 @@ def test_large_table_retains_protected_source_features():
     assert len(result.selected_features) == 5
 
 
-def test_projection_result_has_a_selected_features_table():
-    result = FeatureDownsampleResult(
-        requested_method="svd",
-        resolved_method="svd",
-        n_features_in=100,
-        n_features_out=3,
-        selected_features=["svd_1", "svd_2", "svd_3"],
-        projection=True,
+def test_protected_feature_does_not_change_nonprotected_ranking():
+    rng = np.random.default_rng(911)
+    y = pd.Series(np.tile([0, 1], 60))
+    X = pd.DataFrame(
+        {
+            "protected": y.to_numpy(dtype=float),
+            "signal_a": y.to_numpy(dtype=float) + rng.normal(0, 0.05, len(y)),
+            "signal_b": y.to_numpy(dtype=float) + rng.normal(0, 0.15, len(y)),
+            "noise_a": rng.normal(size=len(y)),
+            "noise_b": rng.normal(size=len(y)),
+        }
     )
-    frame = result.selected_frame()
-    assert frame.shape == (3, 3)
-    assert frame["feature_index"].isna().all()
+    rows = np.arange(len(X))
+
+    selected, _ = select_indexed_columns(
+        X,
+        rows,
+        y,
+        True,
+        FeatureDownsampleMethod.FTest,
+        n_features_out=3,
+        protected_indices=[0],
+    )
+    without_protected, _ = select_indexed_columns(
+        X.drop(columns="protected"),
+        rows,
+        y,
+        True,
+        FeatureDownsampleMethod.FTest,
+        n_features_out=2,
+    )
+
+    selected_names = [X.columns[index] for index in selected if index != 0]
+    expected_names = [X.columns[1:][index] for index in without_protected]
+    assert selected_names == expected_names
 
 
 def test_downsampling_json_replaces_nonfinite_scores_with_null():
@@ -973,8 +751,8 @@ def test_downsampling_json_replaces_nonfinite_scores_with_null():
 
 def test_sparse_index_metadata_without_scores_is_serializable():
     result = FeatureDownsampleResult(
-        requested_method="random",
-        resolved_method="random",
+        requested_method="normalized-variance",
+        resolved_method="normalized-variance",
         n_features_in=3,
         n_features_out=1,
         selected_features=["feature_2"],
@@ -1074,37 +852,3 @@ def test_select_indexed_columns_attaches_complete_raw_score_vector():
     exported = pd.concat(list(result.iter_score_frames(chunk_size=2)))
     assert exported["feature"].tolist() == list(X.columns)
     assert not exported.loc[exported["feature"] == "constant", "score_valid"].item()
-
-
-def test_stable_rank_sample_keeps_every_target_level():
-    y = pd.DataFrame(
-        {
-            "target_a": [1, *([0] * 19)],
-            "target_b": [0, 1, *([0] * 18)],
-        }
-    )
-
-    sampled = _level_preserving_sample(y, 16, np.random.default_rng(42))
-
-    assert len(sampled) == 16
-    assert set(y.iloc[sampled]["target_a"]) == {0, 1}
-    assert set(y.iloc[sampled]["target_b"]) == {0, 1}
-    for target in y:
-        original_counts = y[target].value_counts()
-        sampled_counts = y.iloc[sampled][target].value_counts()
-        for level, count in original_counts.items():
-            assert sampled_counts[level] >= min(2, count)
-
-
-def test_direct_method_is_rejected_for_indexed_large_input():
-    X = np.zeros((10, 50_001), dtype=np.float32)
-    y = pd.Series([0, 1] * 5)
-    with pytest.raises(ValueError, match="materialized training matrix"):
-        select_indexed_columns(
-            X,
-            np.arange(10),
-            y,
-            True,
-            FeatureDownsampleMethod.MutualInfo,
-            10,
-        )

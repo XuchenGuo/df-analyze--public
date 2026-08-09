@@ -18,6 +18,7 @@ from typing import (
     Dict,
     Iterable,
     Literal,
+    Mapping,
     Optional,
     Tuple,
     Type,
@@ -81,11 +82,9 @@ from df_analyze.models.kan import KANEstimator
 from df_analyze.models.mlp import MLPEstimator
 from df_analyze.preprocessing.prepare import PreparedData
 from df_analyze.runtime.hardware import (
-    DeviceIntent,
     RuntimeComponent,
     clear_fitted_model_state,
     device_reason_text,
-    is_cuda_runtime_error,
     release_accelerator_memory,
 )
 from df_analyze.saving import add_fold_idx
@@ -125,11 +124,6 @@ class HtuneResult:
     n_downsampled_features: int = 0
     failure_reason: Optional[str] = None
     per_target_tuning_scores: dict[str, float] = field(default_factory=dict)
-    _model_snapshot: Optional[str] = field(
-        default=None,
-        repr=False,
-        compare=False,
-    )
 
     @no_type_check  # Pyright mucks up the conditionals here...
     def __eq__(self, other: object) -> bool:
@@ -434,9 +428,9 @@ class EvaluationResults:
         return df
 
     def wide_table(
-        self, valset: Literal["5-fold", "trainset", "holdout"] = "5-fold"
+        self, valset: Literal["cv_mean", "trainset", "holdout"] = "cv_mean"
     ) -> DataFrame:
-        cols = ["trainset", "holdout", "5-fold"]
+        cols = ["trainset", "holdout", "cv_mean"]
         cols.remove(valset)
         col = valset
         idx = ~self.df.mean(axis=1, numeric_only=True).isna()
@@ -463,30 +457,28 @@ class EvaluationResults:
         sorters = ["acc"] if self.is_classification else ["multi-nmae", "mae"]
         for sorter in sorters:
             if sorter in df.columns:
-                return df.sort_values(
-                    by=sorter, ascending=not self.is_classification
-                )
+                return df.sort_values(by=sorter, ascending=not self.is_classification)
         return df
 
     def to_markdown(self) -> str:
         df_train = self.wide_table("trainset")
         df_hold = self.wide_table("holdout")
-        df_fold = self.wide_table("5-fold")
+        df_fold = self.wide_table("cv_mean")
         tab_train = df_train.to_markdown(tablefmt="simple", floatfmt="0.3f", index=False)
         tab_hold = df_hold.to_markdown(tablefmt="simple", floatfmt="0.3f", index=False)
         tab_fold = df_fold.to_markdown(tablefmt="simple", floatfmt="0.3f", index=False)
+        if "final_cv_folds" not in self.df.columns:
+            raise ValueError("Evaluation results are missing `final_cv_folds`.")
         fold_counts = (
             pd.to_numeric(self.df["final_cv_folds"], errors="coerce")
             .dropna()
             .astype(int)
             .unique()
-            if "final_cv_folds" in self.df.columns
-            else np.asarray([5])
         )
+        if len(fold_counts) == 0:
+            raise ValueError("Evaluation results contain no valid final CV fold count.")
         fold_heading = (
-            f"{int(fold_counts[0])}-fold"
-            if len(fold_counts) == 1
-            else "adaptive-fold"
+            f"{int(fold_counts[0])}-fold" if len(fold_counts) == 1 else "adaptive-fold"
         )
         text = (
             "# Final Model Performances\n\n"
@@ -543,12 +535,23 @@ class EvaluationResults:
             "results": self.results,
             "is_classification": self.is_classification,
         }
+        externalized: list[tuple[DfAnalyzeModel, Mapping[str, Any]]] = []
         try:
-            enc = str(jsonpickle.encode(remain, unpicklable=True))
-            fix(root / "eval_htune_results_jsonpickle.json").write_text(enc)
-        except TypeError:
-            enc = str(jsonpickle.encode(remain, unpicklable=True, fail_safe=str))
-            fix(root / "eval_htune_results_jsonpickle.json").write_text(enc)
+            for index, result in enumerate(self.results):
+                externalize = getattr(result.model, "externalize_fitted_models", None)
+                if callable(externalize):
+                    directory = fix(root / f"tabpfn_fitted_model_{index}")
+                    originals = externalize(directory)
+                    externalized.append((result.model, originals))
+            try:
+                enc = str(jsonpickle.encode(remain, unpicklable=True))
+                fix(root / "eval_htune_results_jsonpickle.json").write_text(enc)
+            except TypeError:
+                enc = str(jsonpickle.encode(remain, unpicklable=True, fail_safe=str))
+                fix(root / "eval_htune_results_jsonpickle.json").write_text(enc)
+        finally:
+            for model, originals in externalized:
+                model.restore_externalized_models(originals)
         try:
             fix(root / "prediction_results.json").write_text(results_json)
         except Exception as e:
@@ -563,9 +566,7 @@ class EvaluationResults:
         # TODO: handle fold_idx
         df = pd.read_csv(root / "performance_long_table.csv")
         per_target_path = root / "performance_long_table_per_target.csv"
-        per_target_df = (
-            pd.read_csv(per_target_path) if per_target_path.exists() else None
-        )
+        per_target_df = pd.read_csv(per_target_path) if per_target_path.exists() else None
         for results_df in (df, per_target_df):
             if results_df is not None and "failure_reason" in results_df.columns:
                 reasons = results_df["failure_reason"].astype(object)
@@ -593,11 +594,9 @@ class EvaluationResults:
         remain = cast(dict[str, Any], jsonpickle.decode(enc))
         loaded_results = cast(list[HtuneResult], remain["results"])
         for result in loaded_results:
-            snapshot = getattr(result, "_model_snapshot", None)
-            if snapshot is None:
-                continue
-            result.model = jsonpickle.decode(snapshot)
-            result._model_snapshot = None
+            load_externalized = getattr(result.model, "load_externalized_models", None)
+            if callable(load_externalized):
+                load_externalized(root)
         return EvaluationResults(
             df=df,
             X_train=X_train,
@@ -640,9 +639,7 @@ class EvaluationResults:
                 target=result.get("target"),
                 downsample_requested=result.get("downsample_requested", "none"),
                 downsample_resolved=result.get("downsample_resolved", "none"),
-                n_downsampled_features=int(
-                    result.get("n_downsampled_features", 0)
-                ),
+                n_downsampled_features=int(result.get("n_downsampled_features", 0)),
                 per_target_tuning_scores={
                     str(target): float(score)
                     for target, score in result.get(
@@ -772,34 +769,6 @@ def _release_fitted_model_state(
         release_accelerator_memory()
 
 
-def _snapshot_accelerator_model(
-    result: HtuneResult,
-    component: RuntimeComponent,
-) -> bool:
-    """Save a reloadable fitted model before releasing accelerator state."""
-    runtime = getattr(result.model, "runtime", None)
-    if runtime is None:
-        return False
-    try:
-        resolved = runtime.decision_for(component).resolved
-    except Exception:
-        return False
-    if resolved not in {"cuda", "mps"}:
-        return False
-    try:
-        result._model_snapshot = str(
-            jsonpickle.encode(result.model, unpicklable=True)
-        )
-    except Exception as error:
-        warn(
-            "Could not snapshot fitted accelerator model "
-            f"{getattr(result.model, 'shortname', type(result.model).__name__)}; "
-            f"keeping it resident so saved results remain usable: {error}"
-        )
-        return False
-    return True
-
-
 def _tune_and_evaluate_model(
     model: DfAnalyzeModel,
     X_train: DataFrame,
@@ -817,9 +786,7 @@ def _tune_and_evaluate_model(
     )
     X_tune = X_train.iloc[tuning_rows]
     y_tune = prep_train.y.iloc[tuning_rows]
-    g_tune = (
-        None if prep_train.groups is None else prep_train.groups.iloc[tuning_rows]
-    )
+    g_tune = None if prep_train.groups is None else prep_train.groups.iloc[tuning_rows]
     study = model.htune_optuna(
         X_train=X_tune,
         y_train=y_tune,
@@ -918,17 +885,13 @@ def evaluate_tuned(
                 X_train.shape[1],
                 n_queries=len(X_train),
             )
-            component = getattr(
-                model_cls, "runtime_component", RuntimeComponent.Sklearn
-            )
+            component = getattr(model_cls, "runtime_component", RuntimeComponent.Sklearn)
             model = _new_model(model_cls, prepared)
             attempt = 0
             release_model_state = False
             try:
                 while True:
                     attempt += 1
-                    if attempt > 1:
-                        model = _new_model(model_cls, prepared)
                     decision = model_runtime.decision_for(component)
                     print(
                         f"[device] {model.shortname} / {selection}: "
@@ -947,9 +910,7 @@ def evaluate_tuned(
                     )
                     try:
                         model.set_runtime(model_runtime)
-                        print(
-                            f"Tuning {model.longname} for selection={selection}"
-                        )
+                        print(f"Tuning {model.longname} for selection={selection}")
                         study, evaluation = _tune_and_evaluate_model(
                             model=model,
                             X_train=X_train,
@@ -996,38 +957,6 @@ def evaluate_tuned(
                             stage="failed",
                             error=error,
                         )
-                        cuda_failure = (
-                            decision.resolved == "cuda"
-                            and is_cuda_runtime_error(error)
-                        )
-                        if (
-                            model_runtime.intent is DeviceIntent.Auto
-                            and cuda_failure
-                            and attempt == 1
-                        ):
-                            _release_fitted_model_state(
-                                model, component, force=True
-                            )
-                            reason = (
-                                "cuda_runtime_fallback:"
-                                f"{type(error).__name__}"
-                            )
-                            model_runtime.record_cpu_fallback(component, reason)
-                            warn(
-                                f"{model.shortname} / {selection} encountered a "
-                                "CUDA runtime failure. Retrying this model on CPU "
-                                "once; other models may continue using CUDA."
-                            )
-                            continue
-                        if (
-                            model_runtime.intent is DeviceIntent.CUDA
-                            and cuda_failure
-                        ):
-                            raise RuntimeError(
-                                f"{model.shortname} / {selection} failed on CUDA "
-                                "while --device cuda is strict. CPU fallback is "
-                                "disabled; use --device auto to allow one CPU retry."
-                            ) from error
                         raise
                 result = HtuneResult(
                     selection="embed" if is_embed else selection,  # type: ignore
@@ -1053,27 +982,20 @@ def evaluate_tuned(
                         else downsample_result.resolved_method
                     ),
                     n_downsampled_features=n_downsampled_features,
-                    per_target_tuning_scores=dict(
-                        model.per_target_tuning_scores
-                    ),
-                )
-                release_model_state = _snapshot_accelerator_model(
-                    result, component
+                    per_target_tuning_scores=dict(model.per_target_tuning_scores),
                 )
                 results.append(result)
                 if df_target is not None and len(df_target) > 0:
                     df_target = df_target.copy()
-                    if prepared.is_classification and isinstance(
-                        prep_train.labels, dict
-                    ):
+                    if prepared.is_classification and isinstance(prep_train.labels, dict):
                         positive_classes = {}
                         for target_name in prep_train.target_cols:
                             mapping = prep_train.labels.get(target_name)
                             if isinstance(mapping, dict) and len(mapping) == 2:
                                 positive_classes[str(target_name)] = mapping.get(1)
-                        df_target["positive_class"] = df_target["target"].astype(
-                            str
-                        ).map(positive_classes)
+                        df_target["positive_class"] = (
+                            df_target["target"].astype(str).map(positive_classes)
+                        )
                     df_target["model"] = model.shortname
                     df_target["selection"] = selection
                     df_target["embed_selector"] = (
@@ -1081,17 +1003,9 @@ def evaluate_tuned(
                     )
                     df_target["downsample_requested"] = result.downsample_requested
                     df_target["downsample"] = result.downsample_resolved
-                    df_target["n_downsampled_features"] = (
-                        result.n_downsampled_features
-                    )
+                    df_target["n_downsampled_features"] = result.n_downsampled_features
                     per_target_dfs.append(df_target)
             except Exception as e:
-                if (
-                    model_runtime.intent is DeviceIntent.CUDA
-                    and decision.resolved == "cuda"
-                    and is_cuda_runtime_error(e)
-                ):
-                    raise
                 if prepared.is_classification:
                     nulls = Series(ClassifierScorer.null_scores(), name="metric")
                 else:
@@ -1101,7 +1015,7 @@ def evaluate_tuned(
                     f"{traceback.format_exc()}"
                 )
                 df = DataFrame(
-                    {"trainset": nulls, "holdout": nulls, "5-fold": nulls}
+                    {"trainset": nulls, "holdout": nulls, "cv_mean": nulls}
                 ).reset_index()
                 if "index" in df.columns:
                     df = df.rename(columns={"index": "metric"})
@@ -1143,7 +1057,7 @@ def evaluate_tuned(
                                     "metric": str(metric_name),
                                     "trainset": float(null_val),
                                     "holdout": float(null_val),
-                                    "5-fold": float(null_val),
+                                    "cv_mean": float(null_val),
                                     "model": model.shortname,
                                     "selection": selection,
                                     "embed_selector": (
@@ -1171,9 +1085,7 @@ def evaluate_tuned(
                 else downsample_result.requested_method
             )
             df["downsample"] = (
-                "none"
-                if downsample_result is None
-                else downsample_result.resolved_method
+                "none" if downsample_result is None else downsample_result.resolved_method
             )
             df["n_downsampled_features"] = n_downsampled_features
             dfs.append(df)

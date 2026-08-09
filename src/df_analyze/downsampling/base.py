@@ -23,15 +23,6 @@ def resolve_n_features(requested: Union[int, float], n_features: int) -> int:
     )
 
 
-def projection_n_components(
-    requested: Union[int, float], n_samples: int, n_features: int
-) -> int:
-    n_components = resolve_n_features(requested, n_features)
-    if n_samples > 1:
-        n_components = min(n_components, n_samples - 1)
-    return max(1, n_components)
-
-
 def auto_chunk_size(
     n_rows: int,
     itemsize: int,

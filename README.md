@@ -327,86 +327,10 @@ python df-embed.py --help
 ## CPU and CUDA Devices
 
 Both `df-analyze` and `df-embed` accept `--device auto`, `--device cpu`, and
-`--device cuda`. This option controls the parts of the run that support a GPU;
-preprocessing and CPU-only models still run on the CPU.
-
-- `auto` is the recommended default. KNN, CatBoost, and XGBoost use workload
-  thresholds; neural models, TabPFN, and embeddings use CUDA when it is
-  available. If an `auto` task encounters a CUDA runtime error, the complete
-  affected task is tried once more on the CPU.
-- `cpu` runs everything on the CPU and does not check for a GPU.
-- `cuda` requires CUDA for selected models that support it. A missing backend
-  or CUDA runtime failure stops the run instead of falling back. CPU-only
-  models and preprocessing still run on the CPU. The command also stops if
-  none of the selected work has a supported CUDA backend.
-
-CatBoost, XGBoost, KNN, MLP, KAN, GANDALF, TabPFN, image and text embedding,
-and error-consistency calculations can use CUDA. Neural models and embedding,
-together with larger CatBoost, XGBoost, KNN, or error-consistency workloads,
-are the most likely to show a noticeable improvement. Small jobs may see little
-improvement because device setup and data transfer still take time, and
-CPU-only stages can remain a substantial part of the run. On a supported Mac,
-GANDALF may use MPS in `auto` mode.
-
-For example:
-
-```shell
-uv run python df-analyze.py \
-    --df data/small_classifier_data.json \
-    --target target \
-    --mode classify \
-    --classifiers xgb dummy \
-    --device auto \
-    --htune-trials 5 \
-    --outdir ./device_results
-
-uv run python df-embed.py \
-    --data images.parquet \
-    --modality vision \
-    --device cuda \
-    --out embeddings.parquet
-```
-
-If the installed copy of PyTorch cannot use an NVIDIA GPU, `df-analyze` and
-`df-embed` can create a separate CUDA environment for the run:
-
-```shell
-uv run python df-analyze.py \
-    --df data/small_classifier_data.json \
-    --target target \
-    --mode classify \
-    --classifiers mlp dummy \
-    --device cuda \
-    --device-install auto \
-    --htune-trials 5 \
-    --outdir ./managed_cuda_results
-```
-
-The default, `--device-install never`, leaves the current Python environment
-unchanged. Use `ask` to confirm setup interactively or `auto` to allow it
-without a prompt. This requires a source checkout containing `pyproject.toml`
-and `uv.lock`. The managed environment is stored in `.df-analyze-runtime` and
-is reused until either of those files changes. It supplies CUDA-enabled
-PyTorch; CatBoost and XGBoost use their own CUDA backends, so selecting only
-those models does not trigger this setup.
-
-### Verifying CUDA and GPU Visibility
-
-Run these checks in the same terminal and environment that will run
-`df-analyze`:
-
-| Check | Command | Expected result |
-|---|---|---|
-| NVIDIA driver visibility | `nvidia-smi` | GPU name, driver version, memory information, and runtime status |
-| PyTorch CUDA visibility | `python -c "import torch; print(torch.cuda.is_available()); print(torch.version.cuda)"` | `True` when the installed PyTorch build can use CUDA; the second value is that build's CUDA runtime |
-| CatBoost GPU visibility | `python -c "from catboost.utils import get_gpu_device_count; print(get_gpu_device_count())"` | A positive number when CatBoost sees one or more GPUs |
-
-If `nvidia-smi` works but the PyTorch check prints `False`, the installed
-PyTorch build may not support the available driver or CUDA runtime. For
-installation and compatibility details, use the
-[NVIDIA CUDA compatibility documentation](https://docs.nvidia.com/deploy/cuda-compatibility/),
-the [PyTorch CUDA availability reference](https://docs.pytorch.org/docs/stable/generated/torch.cuda.is_available.html),
-and the [official PyTorch installation selector](https://pytorch.org/get-started/locally/).
+`--device cuda`. The recommended `auto` mode resolves every selected component
+to an available supported backend while CPU-only work remains on the CPU. See
+[GPU experiments and device behavior](docs/gpu_experiments.md) for supported
+components, verification commands, examples, and interpretation guidance.
 
 
 ## Quick Start and Examples
@@ -446,9 +370,8 @@ currently disables SVM training because of its runtime cost. The other tokens
 can be evaluated when their dependencies and, where needed, model weights are
 available.
 
-TabPFN defaults to the v3 checkpoint. Use `--tabpfn-version v2.6` or
-`--tabpfn-version v2.5` to select an older supported checkpoint. Before the
-first download, accept the license for the selected checkpoint. The recommended
+TabPFN uses the current v3 checkpoint. Before the first download, accept its
+license. The recommended
 setup is the Prior Labs browser flow or a `TABPFN_TOKEN` from the Prior Labs
 account page. Some `tabpfn` versions may instead report that a checkpoint is in
 a gated Hugging Face repository. In that case, accept the terms for the named
@@ -456,7 +379,6 @@ repository and authenticate with `hf auth login` or a read-only `HF_TOKEN`.
 Do not commit either token. For an offline machine, download the weights
 separately and point `TABPFN_MODEL_CACHE_DIR` at that directory. See
 [Prior Labs' model-access instructions](https://docs.priorlabs.ai/how-to-access-gated-models).
-`df-analyze` checks that the selected cache is writable before a download.
 
 Checkpoint licenses can differ and may change. Review the current license for
 the selected version before commercial or production use; the
@@ -489,7 +411,7 @@ The following tokens add model backends beyond the original defaults:
 |---|---|
 | `catboost` | CatBoost gradient-boosted trees |
 | `xgb` | XGBoost gradient-boosted trees |
-| `tabpfn` | The selected TabPFN checkpoint |
+| `tabpfn` | TabPFN v3 |
 | `dtree` | A scikit-learn decision tree |
 | `et` | Scikit-learn extremely randomized trees |
 | `kan` | A Kolmogorov-Arnold Network using PyKAN |
@@ -854,121 +776,21 @@ recommendations here.
 ## Large-Scale Feature Downsampling
 
 Feature downsampling reduces a very wide matrix before the usual univariate
-analyses, feature selection, and model tuning. It is disabled by default. Use
-`--feat-downsample` to choose a method and `--n-feat-downsample` to give either
-a maximum feature count or retained fraction:
+analyses, feature selection, and model tuning. It is disabled by default.
 
 ```shell
 python df-analyze.py \
     --df wide.parquet \
     --target outcome \
     --mode classify \
-    --feat-downsample auto \
+    --feat-downsample f-test \
     --n-feat-downsample 1000 \
     --outdir ./wide_results
 ```
 
-For example, `--n-feat-downsample 500` keeps at most 500 features, while
-`--n-feat-downsample 0.1` keeps 10 percent. The default maximum is 1000. The
-available methods are:
-
-```text
-none auto random variance normalized-variance f-test mutual-info linear lgbm svd sparse-rp
-rank-ensemble selector-ensemble stable-rank
-```
-
-`random` and `variance` do not use the target. `f-test`, `mutual-info`,
-`linear`, and `lgbm` are supervised. The ensemble methods combine several
-rankings, while `svd` and `sparse-rp` create new component features instead of
-retaining named source columns.
-
-The recommended method is `auto`. It leaves the data unchanged when the
-requested number of features is already available, normally uses an F-test,
-and uses repeated-subsample supervised `stable-rank` for extremely wide data.
-If the target cannot support supervised screening, it falls back to
-range-normalized variance.
-
-Supervised methods use only training rows when scoring features. A separate
-part of the training data is reserved for model tuning, and holdout or external
-test rows are never used for feature scoring. Grouped data keep complete groups
-together. If a safe supervised split cannot be made, `auto` falls back to
-range-normalized variance; an explicitly requested supervised method stops with
-an error.
-
-For numeric tables that are too wide for the ordinary preparation path, use
-`--large-feature-mode`:
-
-```shell
-python df-analyze.py \
-    --df wide.parquet \
-    --target outcome \
-    --mode classify \
-    --large-feature-mode \
-    --feat-downsample rank-ensemble \
-    --n-feat-downsample 1000 \
-    --outdir ./large_feature_results
-```
-
-This mode splits rows and scores columns before building the selected training
-and holdout matrices. Predictors must be numeric and finite. The source table
-is still loaded as a pandas DataFrame and must fit in memory.
-
-SVMlight input is available when the source matrix cannot be safely
-materialized as a dense table:
-
-```shell
-python df-analyze.py \
-    --df wide.svmlight \
-    --target outcome \
-    --mode classify \
-    --feat-downsample f-test \
-    --n-feat-downsample 500 \
-    --outdir ./svmlight_results
-```
-
-Files ending in `.svm`, `.svmlight`, `.libsvm`, or `.binary` are recognized,
-including gzip, bzip2, and xz compressed forms. The matrix remains sparse while
-features are scored. SVMlight input requires feature downsampling and exactly
-one target. Use `--svmlight-metadata` to append row-aligned clinical CSV, TSV,
-JSON, or Parquet sidecars after imaging downsampling, and
-`--svmlight-feature-map` to restore anatomical feature names. Feature maps may
-mark prior-required imaging columns as protected. SVMlight row comments can be
-checked against a BIDS/clinical ID column with
-`--svmlight-sample-id-column`.
-
-Auto mode also performs a bounded content check for SVMlight files with
-nonstandard names, including extensionless text and gzip, bzip2, or xz files
-such as `log1p.E2006.train.bz2`. For producers with a known feature-index
-convention, pass `--svmlight-index-base zero` or `one`; absence of feature index
-0 is inherently ambiguous. For example, the one-based E2006 regression
-benchmark can be run with external validation using:
-
-```powershell
-python df-analyze.py `
-  --df-train C:\data\log1p.E2006.train `
-  --df-tests C:\data\log1p.E2006.test `
-  --df-tests-method list `
-  --target target --mode regress `
-  --input-format svmlight --svmlight-index-base one `
-  --feat-downsample auto --n-feat-downsample 500 `
-  --regressors sgd dummy --htune-trials 10 `
-  --outdir .\e2006_results
-```
-
-Results are written below `features/downsampling`. The main files are
-`downsampling_report.md`, `downsampling.json`, `selected_features.csv`, and,
-when scores are available, `feature_scores.csv`.
-
-Sparse reports separate input scanning, train/test CSR loading, feature scoring,
-and selected-feature materialization/scaling time. The score-chunk budget is not
-a whole-process memory cap; source sparse matrices, temporary conversions,
-full-length score vectors, and selected dense outputs remain additional.
-
-Downsampling is a screening step and can discard useful interactions. When the
-full analysis is practical, compare its holdout results with a run that does not
-use downsampling. See
-[Large-scale feature downsampling](docs/feature_downsampling.md) for the full
-method descriptions and input restrictions.
+The supported methods are `normalized-variance` and `f-test`. See
+[large-scale feature downsampling](docs/feature_downsampling.md) for table,
+large-table, sparse SVMlight, protected-feature, and output details.
 
 ## Usage on Compute Canada / Digital Research Alliance of Canada / Slurm HPC Clusters
 
@@ -1456,13 +1278,7 @@ bins or increase `--aer-min-bin-count` to merge sparse bins more aggressively.
 ### Error Consistency
 
 Error consistency (EC) asks whether models trained on slightly different rows
-make similar mistakes on the same samples. df-analyze completes feature
-selection and tuning first. It then repeats K-fold splitting on the training
-data, fits one model per fold, and evaluates every fitted model on the same
-external holdout.
-
-This small classification example uses 2 folds and 2 repetitions, so each
-configuration is refitted 4 times:
+make similar mistakes on the same samples. Enable it with `--ec`:
 
 ```shell
 python df-analyze.py \
@@ -1479,73 +1295,11 @@ python df-analyze.py \
     --outdir ./ec_classification_results
 ```
 
-The regression example uses the small Forest Fires dataset included in this
-repository:
-
-```shell
-python df-analyze.py \
-    --df data/testing/regression/forest_fires/forest_fires.parquet \
-    --target target \
-    --mode regress \
-    --regressors elastic dummy \
-    --feat-select filter \
-    --htune-trials 1 \
-    --ec \
-    --ec-folds 2 \
-    --ec-repetitions 2 \
-    --ec-methods ratio ratio_diff intersection_union_all \
-    --ec-output-detail summary \
-    --outdir ./ec_regression_results
-```
-
-Omit `--ec-methods` to calculate all seven regression methods. The short list
-above is only meant to make a first run quicker.
-
-Two profiles provide settings used by the EC reference experiments:
-
-```shell
-# 80/20 holdout, 5 folds, 10 repetitions, fixed model seeds
---ec-profile classification-paper
-
-# 80/20 holdout, 5 folds, 50 repetitions, fixed model seeds
---ec-profile regression-paper
-```
-
-Explicit CLI or spreadsheet values override individual profile settings. These
-profiles reproduce the split and repetition settings, not the original
-datasets, preprocessing, models, or published result tables.
-
-The normal default is 5 folds and 5 repetitions: 25 refits for every target,
-model, and selected feature set. The classification profile uses 50 refits; the
-regression profile uses 250. Start with 2 folds and 2 repetitions to check the
-workflow and estimate runtime. `--ec-output-detail summary` reduces the files
-kept in memory and written to disk, but it does not reduce the number of model
-fits.
-
-EC uses the holdout already created by df-analyze; it does not create another
-one. Without a profile, `--test-val-size` defaults to `0.4`. Add
-`--test-val-size 0.2` when an 80/20 split is required.
-
-Classification EC is the intersection-over-union of two models' error sets.
-Regression EC compares their residuals. Some regression methods are best at 1
-and others at 0, so read the `optimal_value` and `optimization_direction`
-columns in `summary.csv`.
-
-The default `--ec-holdout-role test` calculates EC for reporting but leaves the
-ranking and EC/performance correlation files empty. Use
-`--ec-holdout-role validation` only when the shared holdout is separate
-validation or audit data. Do not choose a model from final-test results.
-
-df-analyze creates a dataset/run folder below `--outdir`. EC results are in
-`results/error_consistency` inside that run folder. If adaptive error and error
-consistency are both enabled, a joined
-`results/adaptive_error/tables/risk_stability_report.csv` is also produced.
-Start with `summary.csv`, `performance_summary.csv`, `trial_failures.csv`, and
-`selection_guard.csv`. See the
-[error-consistency guide](docs/error_consistency.md) for the formulas, method
-names, runtime guidance, checkpoints, and interpretation. See
-[command-line arguments](docs/arguments.md) for every option and
-[program outputs](docs/program_outputs.md) for the file layout.
+See the [error-consistency guide](docs/error_consistency.md) for formulas,
+classification and regression examples, runtime guidance, and interpretation.
+The [command-line arguments](docs/arguments.md) and
+[program outputs](docs/program_outputs.md) document the complete interface and
+file layout.
 
 
 # Program Outputs
@@ -1723,28 +1477,9 @@ Data for univariate analyses of all features.
 
 #### `📂 downsampling`
 
-This directory is populated when `--feat-downsample` is enabled:
-
-```
-📂 downsampling/
-├── downsampling.json
-├── downsampling_report.md
-├── feature_scores.csv
-└── selected_features.csv
-```
-
-- `downsampling_report.md`
-  - readable summary of the requested/resolved method, dimensions, screening
-    design, timings, and selected features
-- `downsampling.json`
-  - machine-readable form of the same metadata
-- `selected_features.csv`
-  - selected source features or generated component names in output order
-- `feature_scores.csv`
-  - saved ranking scores when the selected method produces them
-
-Fold suffixes are added when an analysis has multiple external-test splits.
-`feature_scores.csv` is omitted for methods without feature scores.
+This directory is populated when `--feat-downsample` is enabled. See
+[program outputs](docs/program_outputs.md) for its file layout and
+[feature downsampling](docs/feature_downsampling.md) for method details.
 
 #### `📂 associations`
 
@@ -1994,8 +1729,7 @@ available in the [`features` directory](#📂-features).
 - `run_timing.json`
   - run status and total time, separate planned and actually resolved device
     decisions, per-model-task device records, runtime fold counts, model
-    failures, partial analysis failures, and error-consistency backend
-    information
+    failures, and error-consistency backend information
 
 ## Complete Listing
 

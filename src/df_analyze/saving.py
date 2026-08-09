@@ -299,7 +299,7 @@ class ProgramDirs(Debug):
         valset: str,
         is_classification: bool,
     ) -> DataFrame:
-        drop_cols = [col for col in ["trainset", "holdout", "5-fold"] if col != valset]
+        drop_cols = [col for col in ["trainset", "holdout", "cv_mean"] if col != valset]
         idx_cols = ["model", "selection"]
         if "embed_selector" in df.columns:
             idx_cols.append("embed_selector")
@@ -337,20 +337,22 @@ class ProgramDirs(Debug):
         )
         fold = self._wide_eval_table(
             df_target,
-            valset="5-fold",
+            valset="cv_mean",
             is_classification=is_classification,
         )
         tab_train = train.to_markdown(tablefmt="simple", floatfmt="0.3f", index=False)
         tab_hold = hold.to_markdown(tablefmt="simple", floatfmt="0.3f", index=False)
         tab_fold = fold.to_markdown(tablefmt="simple", floatfmt="0.3f", index=False)
+        if "final_cv_folds" not in df_target.columns:
+            raise ValueError("Target results are missing `final_cv_folds`.")
         fold_counts = (
             pd.to_numeric(df_target["final_cv_folds"], errors="coerce")
             .dropna()
             .astype(int)
             .unique()
-            if "final_cv_folds" in df_target.columns
-            else [5]
         )
+        if len(fold_counts) == 0:
+            raise ValueError("Target results contain no valid final CV fold count.")
         fold_heading = (
             f"{int(fold_counts[0])}-fold"
             if len(fold_counts) == 1
@@ -908,7 +910,7 @@ class ProgramDirs(Debug):
         if has_target:
             pivot_index = ["model", "selection", "target", "test_idx"]
 
-        cols = ["holdout", "5-fold", "trainset"]
+        cols = ["holdout", "cv_mean", "trainset"]
         final_tables = {}
         for valset in cols:
             drop_cols = ["embed_selector"] if "embed_selector" in df.columns else []
@@ -950,7 +952,7 @@ class ProgramDirs(Debug):
         tab_hold = final_tables["holdout"].to_markdown(
             tablefmt="simple", floatfmt="0.3f", index=False
         )
-        tab_fold = final_tables["5-fold"].to_markdown(
+        tab_fold = final_tables["cv_mean"].to_markdown(
             tablefmt="simple", floatfmt="0.3f", index=False
         )
         text = (

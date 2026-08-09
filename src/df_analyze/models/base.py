@@ -47,7 +47,9 @@ from sklearn.metrics import accuracy_score as acc
 from sklearn.metrics import mean_absolute_error as mae
 from sklearn.metrics import mean_squared_error as mse
 from sklearn.metrics import r2_score as r2
+from sklearn.multioutput import MultiOutputClassifier, MultiOutputRegressor
 from sklearn.preprocessing import StandardScaler
+from sklearn.compose import TransformedTargetRegressor
 
 from df_analyze._constants import SEED
 from df_analyze.enumerables import (
@@ -67,21 +69,6 @@ NEG_MAE = "neg_mean_absolute_error"
 OPT_LOGGER = _get_library_root_logger()
 
 
-_MULTITARGET_FIT_ERRORS = (
-    "y should be a 1d array",
-    "bad input shape",
-    "multioutput target data is not supported",
-    "multi-output target data is not supported",
-    "dataframe for label cannot have multiple columns",
-    "label should be a 1-dimensional array",
-)
-
-
-def _is_multitarget_fit_error(error: Exception) -> bool:
-    message = str(error).lower()
-    return any(fragment in message for fragment in _MULTITARGET_FIT_ERRORS)
-
-
 def classification_output_dim(y: Series) -> int:
     values = np.asarray(y)
     if values.size == 0:
@@ -97,150 +84,6 @@ def _calibration_folds(y: Series) -> Optional[int]:
         return None
     folds = min(5, int(counts.min()))
     return folds if folds >= 2 else None
-
-
-class PerTargetEstimator:
-    """Adapter for estimators that only accept a one-dimensional target."""
-
-    def __init__(
-        self,
-        model_cls: Type[Any],
-        model_args: Mapping[str, Any],
-        is_classifier: bool,
-        needs_calibration: bool = False,
-    ) -> None:
-        self.model_cls = model_cls
-        self.model_args = dict(model_args)
-        self.is_classifier = is_classifier
-        self.needs_calibration = needs_calibration
-        self.target_cols: list[str] = []
-        self.models: dict[str, Any] = {}
-        self.target_scalers: dict[str, StandardScaler] = {}
-
-    def _new_model(self, y: Series) -> Any:
-        model = self.model_cls(**self.model_args)
-        if self.needs_calibration:
-            folds = _calibration_folds(y)
-            if folds is None:
-                warn(
-                    f"Skipping probability calibration for target '{y.name}' because "
-                    "one of its classes has fewer than two training samples."
-                )
-            else:
-                model = CVCalibrate(model, method="sigmoid", cv=folds, n_jobs=folds)
-        return model
-
-    def fit(self, X: DataFrame, y: DataFrame) -> PerTargetEstimator:
-        if not isinstance(y, DataFrame):
-            raise ValueError("PerTargetEstimator requires DataFrame targets.")
-        self.target_cols = [str(col) for col in y.columns]
-        self.models = {}
-        self.target_scalers = {}
-        for col in y.columns:
-            model = self._new_model(y[col])
-            target = str(col)
-            y_fit = y[col]
-            if not self.is_classifier:
-                if y_fit.nunique(dropna=False) < 2:
-                    raise ValueError(
-                        f"Regression target '{target}' is constant in a model "
-                        "training partition."
-                    )
-                scaler = StandardScaler()
-                scaled = scaler.fit_transform(
-                    y_fit.to_numpy(dtype=float).reshape(-1, 1)
-                ).reshape(-1)
-                y_fit = Series(scaled, index=y_fit.index, name=y_fit.name)
-                self.target_scalers[target] = scaler
-            model.fit(X, y_fit)
-            self.models[target] = model
-        return self
-
-    def predict(self, X: DataFrame) -> DataFrame:
-        predictions = {}
-        for target, model in self.models.items():
-            values = np.asarray(model.predict(X)).reshape(-1)
-            scaler = self.target_scalers.get(target)
-            if scaler is not None:
-                values = scaler.inverse_transform(values.reshape(-1, 1)).reshape(-1)
-            predictions[target] = values
-        return DataFrame(predictions, index=X.index, columns=self.target_cols)
-
-    def predict_proba(self, X: DataFrame) -> dict[str, ndarray]:
-        if not self.is_classifier:
-            raise ValueError("Cannot get probabilities for a regression model.")
-        return {
-            target: np.asarray(model.predict_proba(X))
-            for target, model in self.models.items()
-        }
-
-    def score(self, X: DataFrame, y: DataFrame) -> float:
-        if not isinstance(y, DataFrame):
-            raise ValueError("PerTargetEstimator requires DataFrame targets.")
-        if not self.is_classifier:
-            aligned = y.loc[:, self.target_cols]
-            return float(
-                r2(
-                    aligned.to_numpy(dtype=float),
-                    self.predict(X).to_numpy(dtype=float),
-                    multioutput="uniform_average",
-                )
-            )
-        scores = [
-            float(self.models[str(col)].score(X, y[col]))
-            for col in y.columns
-            if str(col) in self.models
-        ]
-        if not scores:
-            raise ValueError("No target models were available for scoring.")
-        return float(np.mean(scores))
-
-
-class ScaledMultiTargetRegressor:
-    """Train a native multi-output regressor with equally scaled targets.
-
-    Predictions are always converted back to the supplied target units. This
-    prevents a change of measurement units in one target from changing that
-    target's implicit weight in a joint squared-error objective.
-    """
-
-    def __init__(
-        self,
-        estimator: Any,
-        scaler: StandardScaler,
-        target_cols: Sequence[str],
-    ) -> None:
-        self.estimator = estimator
-        self.scaler = scaler
-        self.target_cols = [str(col) for col in target_cols]
-
-    def predict(self, X: DataFrame) -> DataFrame:
-        predictions = self.estimator.predict(X)
-        if isinstance(predictions, DataFrame):
-            values = predictions.loc[:, self.target_cols].to_numpy(dtype=float)
-        else:
-            values = np.asarray(predictions, dtype=float)
-        if values.ndim == 1:
-            values = values.reshape(-1, 1)
-        restored = self.scaler.inverse_transform(values)
-        return DataFrame(restored, index=X.index, columns=self.target_cols)
-
-    def score(self, X: DataFrame, y: DataFrame) -> float:
-        aligned = y.loc[:, self.target_cols]
-        return float(
-            r2(
-                aligned.to_numpy(dtype=float),
-                self.predict(X).to_numpy(dtype=float),
-                multioutput="uniform_average",
-            )
-        )
-
-    def __getattr__(self, name: str) -> Any:
-        # Forward attributes such as feature_importances_ to the estimator.
-        estimator = self.__dict__.get("estimator")
-        if estimator is None:
-            raise AttributeError(name)
-        return getattr(estimator, name)
 
 
 class EarlyStopping:
@@ -293,7 +136,7 @@ class DfAnalyzeModel(ABC):
         self.default_args: dict[str, Any] = {}
         self.model_args: Mapping = model_args or {}
         self.grid: Optional[dict[str, Any]] = None
-        self._multitarget_fallback_warned: set[str] = set()
+        self._multitarget_columns: list[str] = []
 
         self.tuned_args: Optional[dict[str, Any]] = None
         self.tuned_model: Optional[Any] = None
@@ -863,9 +706,28 @@ class DfAnalyzeModel(ABC):
         needs_calibration: bool = False,
     ) -> Any:
         estimator = model_cls(**dict(clean_args))
-        if needs_calibration and isinstance(y, Series):
-            folds = _calibration_folds(y)
+        is_multitarget = isinstance(y, DataFrame) and y.shape[1] > 1
+        if is_multitarget:
+            self._multitarget_columns = [str(col) for col in y.columns]
+        else:
+            self._multitarget_columns = []
+
+        if needs_calibration:
+            calibration_targets = (
+                [y] if isinstance(y, Series) else [y[col] for col in y]
+            )
+            fold_options = [_calibration_folds(target) for target in calibration_targets]
+            folds = (
+                None
+                if any(fold is None for fold in fold_options)
+                else min(int(fold) for fold in fold_options if fold is not None)
+            )
             if folds is None:
+                if is_multitarget:
+                    raise ValueError(
+                        "Probability calibration requires at least two samples from "
+                        "every class in every target."
+                    )
                 warn(
                     f"Skipping probability calibration for target '{y.name}' because "
                     "one of its classes has fewer than two training samples."
@@ -875,57 +737,26 @@ class DfAnalyzeModel(ABC):
                     estimator, method="sigmoid", cv=folds, n_jobs=folds
                 )
 
-        fit_target = y
-        target_scaler: Optional[StandardScaler] = None
-        if (
-            not self.is_classifier
-            and isinstance(y, DataFrame)
-            and y.shape[1] > 1
-        ):
-            constant = [
-                str(col) for col in y.columns if y[col].nunique(dropna=False) < 2
-            ]
-            if constant:
-                raise ValueError(
-                    "Multi-target regression has constant target(s) in a model "
-                    f"training partition: {constant}."
+        if is_multitarget:
+            if self.is_classifier:
+                estimator = MultiOutputClassifier(estimator)
+            else:
+                assert isinstance(y, DataFrame)
+                constant = [
+                    str(col) for col in y.columns if y[col].nunique(dropna=False) < 2
+                ]
+                if constant:
+                    raise ValueError(
+                        "Multi-target regression has constant target(s) in a model "
+                        f"training partition: {constant}."
+                    )
+                estimator = TransformedTargetRegressor(
+                    regressor=MultiOutputRegressor(estimator),
+                    transformer=StandardScaler(),
                 )
-            target_scaler = StandardScaler()
-            fit_target = DataFrame(
-                target_scaler.fit_transform(y.to_numpy(dtype=float)),
-                index=y.index,
-                columns=y.columns,
-            )
 
-        try:
-            estimator.fit(X, fit_target)
-            if target_scaler is not None:
-                return ScaledMultiTargetRegressor(
-                    estimator=estimator,
-                    scaler=target_scaler,
-                    target_cols=[str(col) for col in y.columns],
-                )
-            return estimator
-        except (TypeError, ValueError) as error:
-            if (
-                not isinstance(y, DataFrame)
-                or y.shape[1] <= 1
-                or not _is_multitarget_fit_error(error)
-            ):
-                raise
-            model_name = model_cls.__name__
-            if model_name not in self._multitarget_fallback_warned:
-                warn(
-                    f"{model_name} does not support multi-target fitting; "
-                    "using one estimator per target."
-                )
-                self._multitarget_fallback_warned.add(model_name)
-            return PerTargetEstimator(
-                model_cls=model_cls,
-                model_args=clean_args,
-                is_classifier=self.is_classifier,
-                needs_calibration=needs_calibration,
-            ).fit(X, y)
+        estimator.fit(X, y)
+        return estimator
 
     def refit_tuned(
         self,
@@ -971,11 +802,9 @@ class DfAnalyzeModel(ABC):
         Returns
         -------
         df: DataFrame
-            DataFrame with columns [trainset, holdout, 5-fold,
-            final_cv_folds] and index as the scorers. `5-fold` is retained as a
-            compatibility column name; `final_cv_folds` records the actual
-            number of group-disjoint folds when fewer than five holdout groups
-            are available.
+            DataFrame with columns [trainset, holdout, cv_mean,
+            final_cv_folds] and index as the scorers. `final_cv_folds` records
+            the actual number of group-disjoint folds.
         """
         # TODO: need to specify valiation method, and return confidences, etc.
         # Actually maybe just want to call refit in here...
@@ -1086,7 +915,7 @@ class DfAnalyzeModel(ABC):
         train = Series(train_scores, name="trainset")
         scores = pd.concat([Series(score) for score in scores], axis=1)
         means = scores.mean(axis=1)
-        means.name = "5-fold"
+        means.name = "cv_mean"
         df = pd.concat([train, holdout, means], axis=1)
         df.index.name = "metric"
         df = df.reset_index()
@@ -1116,7 +945,7 @@ class DfAnalyzeModel(ABC):
                             "metric": metric_name,
                             "trainset": tr_scores.get(metric_name, np.nan),
                             "holdout": ho_scores.get(metric_name, np.nan),
-                            "5-fold": fold_means.get(metric_name, np.nan),
+                            "cv_mean": fold_means.get(metric_name, np.nan),
                             "final_cv_folds": final_cv_folds,
                         }
                     )
@@ -1198,17 +1027,27 @@ class DfAnalyzeModel(ABC):
 
         return self.tuned_model.score(X, y)
 
-    def predict(self, X: DataFrame) -> Union[Series, ndarray]:
+    def predict(self, X: DataFrame) -> Union[Series, DataFrame, ndarray]:
         if self.model is None:
             raise RuntimeError("Need to call `model.fit()` before calling `.predict()`")
-        return self.model.predict(X)
+        predictions = self.model.predict(X)
+        if self._multitarget_columns:
+            return DataFrame(
+                np.asarray(predictions), index=X.index, columns=self._multitarget_columns
+            )
+        return predictions
 
-    def tuned_predict(self, X: DataFrame) -> Union[Series, ndarray]:
+    def tuned_predict(self, X: DataFrame) -> Union[Series, DataFrame, ndarray]:
         if self.tuned_model is None:
             raise RuntimeError(
                 "Need to call `model.tune()` before calling `.tuned_predict()`"
             )
-        return self.tuned_model.predict(X)
+        predictions = self.tuned_model.predict(X)
+        if self._multitarget_columns:
+            return DataFrame(
+                np.asarray(predictions), index=X.index, columns=self._multitarget_columns
+            )
+        return predictions
 
     def wrapper_select(
         self,
@@ -1232,7 +1071,15 @@ class DfAnalyzeModel(ABC):
         if self.tuned_model is None:
             raise RuntimeError("Need to tune estimator before calling `.predict_proba()`")
 
-        return self.tuned_model.predict_proba(X)
+        probabilities = self.tuned_model.predict_proba(X)
+        if self._multitarget_columns and isinstance(probabilities, (list, tuple)):
+            return {
+                target: np.asarray(values)
+                for target, values in zip(
+                    self._multitarget_columns, probabilities, strict=True
+                )
+            }
+        return probabilities
 
     @overload
     @staticmethod

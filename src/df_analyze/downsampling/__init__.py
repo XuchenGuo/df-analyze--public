@@ -1,6 +1,5 @@
 from df_analyze.downsampling.base import (
     auto_chunk_size,
-    projection_n_components,
     resolve_n_features,
 )
 from df_analyze.downsampling.containers import FeatureDownsampleResult
@@ -17,7 +16,6 @@ __all__ = [
     "INDEXED_SAFE_METHODS",
     "auto_chunk_size",
     "downsample_split",
-    "projection_n_components",
     "resolve_feature_downsample_method",
     "resolve_n_features",
     "screening_tuning_indices",

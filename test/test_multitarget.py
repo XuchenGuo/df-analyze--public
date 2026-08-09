@@ -135,7 +135,7 @@ def test_target_result_reconstruction_uses_internal_target_score_and_table() -> 
             "metric": ["acc"],
             "trainset": [1.0],
             "holdout": [0.75],
-            "5-fold": [0.7],
+            "cv_mean": [0.7],
             "model": ["dummy"],
             "selection": ["none"],
             "embed_selector": ["none"],
@@ -147,7 +147,7 @@ def test_target_result_reconstruction_uses_internal_target_score_and_table() -> 
             "metric": ["acc", "acc"],
             "trainset": [1.0, 1.0],
             "holdout": [0.5, 1.0],
-            "5-fold": [0.6, 0.8],
+            "cv_mean": [0.6, 0.8],
             "model": ["dummy", "dummy"],
             "selection": ["none", "none"],
             "embed_selector": ["none", "none"],
@@ -204,7 +204,9 @@ def test_multitarget_tuning_records_internal_target_scores() -> None:
 
     expected_targets = {"target_a", "target_b"}
     assert set(model.per_target_tuning_scores) == expected_targets
-    assert set(study.best_trial.user_attrs["per_target_tuning_scores"]) == expected_targets
+    assert (
+        set(study.best_trial.user_attrs["per_target_tuning_scores"]) == expected_targets
+    )
     assert all(np.isfinite(score) for score in model.per_target_tuning_scores.values())
 
 

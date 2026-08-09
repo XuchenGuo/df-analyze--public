@@ -40,12 +40,7 @@ class FeatureDownsampleResult:
     fit_seconds: float = 0.0
     transform_seconds: float = 0.0
     notes: list[str] = field(default_factory=list)
-    auto_reason: Optional[str] = None
-    strategy: Optional[str] = None
-    ensemble_members: list[str] = field(default_factory=list)
     score_aggregation: Optional[str] = None
-    stability_repeats: Optional[int] = None
-    stability_subsample: Optional[float] = None
     large_feature_mode: bool = False
     # Keep full score vectors as NumPy arrays. Python lists for millions of
     # scores, indices, and names use much more memory. Stream them to CSV.
@@ -138,11 +133,10 @@ class FeatureDownsampleResult:
             screening_rows=self.screening_rows.copy(),
             tuning_rows=self.tuning_rows.copy(),
             notes=self.notes.copy(),
-            ensemble_members=self.ensemble_members.copy(),
         )
 
     def selected_frame(self) -> pd.DataFrame:
-        indices: list[Optional[int]] = self.selected_indices
+        indices: list[Optional[int]] = [*self.selected_indices]
         if len(indices) != len(self.selected_features):
             indices = [None] * len(self.selected_features)
         columns: dict[str, Any] = {
@@ -274,24 +268,6 @@ class FeatureDownsampleResult:
                     f"- Features: {', '.join(self.protected_features[:25])}",
                 ]
             )
-        if self.auto_reason:
-            rows.extend(["", "## Auto selection", "", self.auto_reason])
-        if self.strategy:
-            rows.extend(
-                [
-                    "",
-                    "## Selection strategy",
-                    "",
-                    f"- Strategy: `{self.strategy}`",
-                    f"- Members: {', '.join(self.ensemble_members) or 'none'}",
-                    f"- Score aggregation: `{self.score_aggregation or 'none'}`",
-                ]
-            )
-        if self.stability_repeats is not None:
-            rows.extend(
-                [
-                    f"- Stability repeats: {self.stability_repeats}",
-                    f"- Stability subsample: {self.stability_subsample}",
-                ]
-            )
+        if self.score_aggregation:
+            rows.append(f"- Score aggregation: `{self.score_aggregation}`")
         return "\n".join(rows) + "\n"

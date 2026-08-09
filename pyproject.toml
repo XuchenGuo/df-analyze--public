@@ -131,6 +131,8 @@ markers = [
   "regen: marks tests as being for regenerating cached results",
   "cached: marks tests as using cached results (deselect with '-m \"not cached\"')",
   "integration: marks opt-in tests that exercise real external model backends",
+  "gpu_integration: requires a configured physical CUDA device",
+  "licensed_integration: requires accepted model licenses and credentials",
   "wip: marks tests not expected to pass (deselect with '-m \"not wip\"')",
 ]
 

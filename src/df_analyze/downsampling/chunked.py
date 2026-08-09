@@ -31,9 +31,7 @@ def _column_chunk(
     return X[row_indices, start:stop]
 
 
-def _chunk_source(
-    X: Any, row_indices: Optional[NDArray[np.int_]]
-) -> Any:
+def _chunk_source(X: Any, row_indices: Optional[NDArray[np.int_]]) -> Any:
     if sparse.issparse(X):
         full_rows = (
             row_indices is not None
@@ -61,8 +59,8 @@ def _sparse_variance(X: Any) -> NDArray[np.float64]:
         return np.full(X.shape[1], np.nan, dtype=np.float64)
     X = X.astype(np.float64, copy=False)
     means = np.asarray(X.mean(axis=0)).ravel().astype(np.float64, copy=False)
-    squared = np.asarray(X.multiply(X).mean(axis=0)).ravel().astype(
-        np.float64, copy=False
+    squared = (
+        np.asarray(X.multiply(X).mean(axis=0)).ravel().astype(np.float64, copy=False)
     )
     population = np.maximum(0.0, squared - means * means)
     return population * n_samples / (n_samples - 1)
@@ -119,10 +117,9 @@ def chunked_range_normalized_variance_scores(
             feature_range = np.asarray(maximum).ravel() - np.asarray(minimum).ravel()
         elif hasattr(chunk, "var") and hasattr(chunk, "to_numpy"):
             variance = chunk.var(axis=0).to_numpy(dtype=np.float64)
-            feature_range = (
-                chunk.max(axis=0).to_numpy(dtype=np.float64)
-                - chunk.min(axis=0).to_numpy(dtype=np.float64)
-            )
+            feature_range = chunk.max(axis=0).to_numpy(dtype=np.float64) - chunk.min(
+                axis=0
+            ).to_numpy(dtype=np.float64)
         else:
             values = np.asarray(chunk)
             variance = np.var(values, axis=0, ddof=1, dtype=np.float64)
@@ -134,9 +131,7 @@ def chunked_range_normalized_variance_scores(
             feature_range**2,
             out=normalized,
             where=(
-                np.isfinite(variance)
-                & np.isfinite(feature_range)
-                & (feature_range > 0.0)
+                np.isfinite(variance) & np.isfinite(feature_range) & (feature_range > 0.0)
             ),
         )
         scores[start:stop] = normalized
@@ -145,7 +140,13 @@ def chunked_range_normalized_variance_scores(
 
 def _target_series(y: Union[Series, DataFrame]) -> list[Series]:
     if isinstance(y, DataFrame):
-        return [y[col] for col in y.columns]
+        targets = []
+        for col in y.columns:
+            target = y.loc[:, col]
+            if not isinstance(target, Series):
+                raise ValueError(f"Expected exactly one target column named {col!r}.")
+            targets.append(target)
+        return targets
     return [y]
 
 

@@ -12,7 +12,7 @@ sys.path.append(str(ROOT))  # isort: skip
 from base64 import b64decode, b64encode
 from io import BytesIO
 from math import ceil
-from typing import Any, Callable, Mapping, Optional, Union
+from typing import Any, Callable, Mapping, Optional, Union, cast
 
 import numpy as np
 import optuna
@@ -42,9 +42,16 @@ KAN_WIDTH = 32
 KAN_DEPTH = 2
 
 
+def _target_series(frame: DataFrame, name: object) -> Series:
+    target = frame.loc[:, name]
+    if not isinstance(target, Series):
+        raise ValueError(f"Expected one target column named {name!r}.")
+    return target
+
+
 def official_kan_cls() -> type[Any]:
     try:
-        from kan import KAN
+        from kan import KAN  # pyright: ignore[reportAttributeAccessIssue]
     except ImportError as exc:
         raise ImportError(
             "KAN support requires `pykan`. Install it with `pip install pykan`."
@@ -79,7 +86,7 @@ class SkorchKAN(Module):
         out_channels = self.num_classes
         dims = [int(input_dim), *([int(width)] * int(depth)), out_channels]
         kan_cls = official_kan_cls()
-        self.kan = kan_cls(
+        self.kan: Any = kan_cls(
             width=dims,
             grid=int(grid_size),
             k=int(spline_order),
@@ -98,8 +105,10 @@ class SkorchKAN(Module):
     def _raw_forward(self, x: Tensor) -> Tensor:
         x = x.to(dtype=torch.float32)
         input_id = getattr(self.kan, "input_id", None)
-        if isinstance(input_id, Tensor) and input_id.device != x.device:
-            self.kan.input_id = input_id.to(x.device)
+        if isinstance(input_id, Tensor):
+            tensor_input_id = cast(Tensor, input_id)
+            if tensor_input_id.device != x.device:
+                self.kan.input_id = tensor_input_id.to(x.device)
         return self.kan(x)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -155,9 +164,7 @@ class KANEstimator(MLPEstimator):
         torch.save(state_dict, buffer)
         return {
             "estimator": (
-                "classifier"
-                if isinstance(model, NeuralNetClassifier)
-                else "regressor"
+                "classifier" if isinstance(model, NeuralNetClassifier) else "regressor"
             ),
             "module_args": module_args,
             "classes": params.get("classes"),
@@ -225,7 +232,8 @@ class KANEstimator(MLPEstimator):
     def __setstate__(self, state: dict[str, Any]) -> None:
         model_state = state.pop("_serialized_model", None)
         tuned_model_state = state.pop("_serialized_tuned_model", None)
-        self.__dict__.update(state)
+        for name, value in state.items():
+            setattr(self, name, value)
         # Load saved models on CPU; callers can choose another device later.
         self.runtime = get_runtime("cpu")
         self._configure_runtime()
@@ -248,7 +256,7 @@ class KANEstimator(MLPEstimator):
 
     def _get_scheduler(
         self, X_train: DataFrame, restarts: bool, val_split: bool
-    ) -> LRScheduler:
+    ) -> Union[CosineAnnealingWarmRestarts, CosineAnnealingLR]:
         policy = CosineAnnealingWarmRestarts if restarts else CosineAnnealingLR
         n_epochs = 8 if restarts else 50
         batch_size = int(self.model_args.get("batch_size", BATCH_SIZE))
@@ -257,11 +265,22 @@ class KANEstimator(MLPEstimator):
         )
         shared: Mapping[str, Any] = dict(eta_min=0, step_every="step")
         if restarts:
-            return LRScheduler(
-                policy=policy, T_0=period, T_mult=2, **shared  # type: ignore[arg-type]
+            return cast(
+                Union[CosineAnnealingWarmRestarts, CosineAnnealingLR],
+                LRScheduler(
+                    policy=cast(Any, policy),
+                    T_0=period,
+                    T_mult=2,
+                    **shared,
+                ),
             )
-        return LRScheduler(
-            policy=policy, T_max=period, **shared  # type: ignore[arg-type]
+        return cast(
+            Union[CosineAnnealingWarmRestarts, CosineAnnealingLR],
+            LRScheduler(
+                policy=cast(Any, policy),
+                T_max=period,
+                **shared,
+            ),
         )
 
     def _set_input_dim(self, X: DataFrame) -> None:
@@ -305,13 +324,17 @@ class KANEstimator(MLPEstimator):
         self._set_input_dim(X_train)
         self._set_targets(y_train)
         if not isinstance(y_train, DataFrame) or y_train.shape[1] == 1:
-            target = y_train.iloc[:, 0] if isinstance(y_train, DataFrame) else y_train
+            target = (
+                _target_series(y_train, y_train.columns[0])
+                if isinstance(y_train, DataFrame)
+                else y_train
+            )
             super().fit(X_train, target)
             return
 
         models = {}
         for col in y_train.columns:
-            target = y_train[col]
+            target = _target_series(y_train, col)
             child = type(self)(
                 self._num_classes(target, self.is_classifier), self.model_args
             )
@@ -330,13 +353,13 @@ class KANEstimator(MLPEstimator):
         self._set_input_dim(X)
         self._set_targets(y)
         if not isinstance(y, DataFrame) or y.shape[1] == 1:
-            target = y.iloc[:, 0] if isinstance(y, DataFrame) else y
+            target = _target_series(y, y.columns[0]) if isinstance(y, DataFrame) else y
             super().refit_tuned(X, target, g=g, tuned_args=tuned_args)
             return
 
         models = {}
         for col in y.columns:
-            target = y[col]
+            target = _target_series(y, col)
             child = type(self)(
                 self._num_classes(target, self.is_classifier), self.model_args
             )
@@ -407,14 +430,14 @@ class KANEstimator(MLPEstimator):
                 target = str(col)
                 if target not in self.tuned_model:
                     raise ValueError(f"No tuned KAN model found for target {target!r}.")
-                _, yt = self._to_torch(X, y[col])
+                _, yt = self._to_torch(X, _target_series(y, col))
                 scores.append(float(self.tuned_model[target].score(Xt, yt)))
             return float(np.mean(scores))
 
         if isinstance(y, DataFrame):
             if y.shape[1] != 1:
                 raise ValueError("Expected one target for a single-target KAN model.")
-            y = y.iloc[:, 0]
+            y = _target_series(y, y.columns[0])
         Xt, yt = self._to_torch(X, y)
         return float(self.tuned_model.score(Xt, yt))
 
@@ -448,9 +471,7 @@ class KANEstimator(MLPEstimator):
             X_train,
             y_split,
             g_train,
-            multitarget_y=(
-                y_train
-            ),
+            multitarget_y=(y_train),
         )[0]
 
         def objective(trial: Trial) -> float:
@@ -461,9 +482,10 @@ class KANEstimator(MLPEstimator):
                 X_tr, X_test = X_train.iloc[idx_train], X_train.iloc[idx_test]
                 target_scores = []
                 for col in y_train.columns:
+                    full_target = _target_series(y_train, col)
                     y_tr, y_test = (
-                        y_train[col].iloc[idx_train],
-                        y_train[col].iloc[idx_test],
+                        full_target.iloc[idx_train],
+                        full_target.iloc[idx_test],
                     )
                     child = type(self)(
                         self._num_classes(y_tr, self.is_classifier), self.model_args
@@ -486,9 +508,7 @@ class KANEstimator(MLPEstimator):
                         preds = estimator.predict(child._to_torch(X_test))
                         score = float(metric.tuning_score(y_test, preds))
                         if y_train.shape[1] > 1:
-                            score = self._scale_tuning_score(
-                                metric, y_train[col], score
-                            )
+                            score = self._scale_tuning_score(metric, full_target, score)
                         target_scores.append(score)
                         scores_by_target.setdefault(str(col), []).append(score)
                     finally:

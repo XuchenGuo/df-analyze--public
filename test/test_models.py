@@ -26,14 +26,15 @@ import torch
 from numpy import ndarray
 from pandas import DataFrame, Series
 from pytest import CaptureFixture
+from sklearn.base import BaseEstimator
+from sklearn.compose import TransformedTargetRegressor
+from sklearn.multioutput import MultiOutputClassifier, MultiOutputRegressor
 from sklearn.preprocessing import KBinsDiscretizer
 
 from df_analyze.analysis.adaptive_error.oof import _init_model as init_aer_model
 from df_analyze.enumerables import ClassifierScorer, RegressorScorer
 from df_analyze.models.base import (
     DfAnalyzeModel,
-    PerTargetEstimator,
-    ScaledMultiTargetRegressor,
     _calibration_folds,
 )
 from df_analyze.models.catboost import CatBoostClassifier, CatBoostRegressor
@@ -65,9 +66,7 @@ C = 10
 
 def test_adaptive_error_model_reconstruction_keeps_model_args() -> None:
     model_args = {"strategy": "uniform", "random_state": 17}
-    model = init_aer_model(
-        DummyClassifier, Series([0, 1, 0, 1]), model_args=model_args
-    )
+    model = init_aer_model(DummyClassifier, Series([0, 1, 0, 1]), model_args=model_args)
 
     assert model.model_args == model_args
 
@@ -149,7 +148,7 @@ def lightweight_multitarget_data() -> tuple[DataFrame, DataFrame, DataFrame]:
     return X, y_cls, y_reg
 
 
-def test_linear_models_use_per_target_fallback() -> None:
+def test_linear_models_use_explicit_multioutput_wrappers() -> None:
     X, y_cls, y_reg = lightweight_multitarget_data()
 
     classifier = LRClassifier(model_args={"C": 1.0, "l1_ratio": 0.0})
@@ -157,7 +156,7 @@ def test_linear_models_use_per_target_fallback() -> None:
     cls_preds = classifier.tuned_predict(X)
     cls_probs = classifier.predict_proba(X)
 
-    assert isinstance(classifier.tuned_model, PerTargetEstimator)
+    assert isinstance(classifier.tuned_model, MultiOutputClassifier)
     assert isinstance(cls_preds, DataFrame)
     assert list(cls_preds.columns) == list(y_cls.columns)
     assert isinstance(cls_probs, dict)
@@ -167,16 +166,15 @@ def test_linear_models_use_per_target_fallback() -> None:
     regressor.refit_tuned(X, y_reg, tuned_args={})
     reg_preds = regressor.tuned_predict(X)
 
-    assert isinstance(regressor.tuned_model, PerTargetEstimator)
+    assert isinstance(regressor.tuned_model, TransformedTargetRegressor)
+    assert isinstance(regressor.tuned_model.regressor_, MultiOutputRegressor)
     assert isinstance(reg_preds, DataFrame)
     assert list(reg_preds.columns) == list(y_reg.columns)
 
 
 def test_scaled_per_target_regressor_jsonpickle_roundtrip() -> None:
     X, _, y_reg = lightweight_multitarget_data()
-    model = SGDRegressor(
-        model_args={"max_iter": 100, "tol": 1e-3, "random_state": 0}
-    )
+    model = SGDRegressor(model_args={"max_iter": 100, "tol": 1e-3, "random_state": 0})
     model.refit_tuned(X, y_reg, tuned_args={})
     expected = model.tuned_predict(X)
 
@@ -195,7 +193,7 @@ def test_logistic_regression_avoids_deprecated_penalty_argument() -> None:
         model.refit_tuned(X, y_cls["target_a"], tuned_args={})
 
 
-def test_multitarget_optuna_refits_fallback_model() -> None:
+def test_multitarget_optuna_refits_explicit_wrapper() -> None:
     X, y_cls, _ = lightweight_multitarget_data()
     model = LRClassifier()
 
@@ -208,7 +206,7 @@ def test_multitarget_optuna_refits_fallback_model() -> None:
         n_jobs=1,
     )
 
-    assert isinstance(model.tuned_model, PerTargetEstimator)
+    assert isinstance(model.tuned_model, MultiOutputClassifier)
     predictions = model.tuned_predict(X)
     assert isinstance(predictions, DataFrame)
     assert list(predictions.columns) == list(y_cls.columns)
@@ -325,12 +323,8 @@ def test_native_multitarget_regression_fit_is_target_unit_invariant() -> None:
     )
     rescaled = y.assign(second=y["second"] * 1_000.0)
 
-    original_model = DecisionTreeRegressor(
-        model_args={"max_depth": 1, "random_state": 0}
-    )
-    rescaled_model = DecisionTreeRegressor(
-        model_args={"max_depth": 1, "random_state": 0}
-    )
+    original_model = DecisionTreeRegressor(model_args={"max_depth": 1, "random_state": 0})
+    rescaled_model = DecisionTreeRegressor(model_args={"max_depth": 1, "random_state": 0})
     original_model.fit(X, y)
     rescaled_model.fit(X, rescaled)
 
@@ -350,14 +344,15 @@ def test_native_multitarget_regression_fit_is_target_unit_invariant() -> None:
 
 
 def test_catboost_native_multitarget_regression_scales_targets() -> None:
-    class RecordingRegressor:
+    class RecordingRegressor(BaseEstimator):
         def __init__(self, **kwargs) -> None:
             self.fit_y = DataFrame()
             self.means = np.array([])
 
-        def fit(self, X: DataFrame, y: DataFrame) -> None:
-            self.fit_y = y.copy()
-            self.means = y.mean(axis=0).to_numpy(dtype=float)
+        def fit(self, X: DataFrame, y: DataFrame) -> RecordingRegressor:
+            self.fit_y = np.asarray(y, dtype=float).copy()
+            self.means = self.fit_y.mean(axis=0)
+            return self
 
         def predict(self, X: DataFrame) -> np.ndarray:
             return np.tile(self.means, (len(X), 1))
@@ -367,16 +362,16 @@ def test_catboost_native_multitarget_regression_scales_targets() -> None:
     model.model_cls = RecordingRegressor
     fitted = model._fit_target_models(X, y, {})
 
-    assert isinstance(fitted, ScaledMultiTargetRegressor)
-    np.testing.assert_allclose(fitted.estimator.fit_y.mean(axis=0), 0.0, atol=1e-12)
+    assert isinstance(fitted, TransformedTargetRegressor)
+    np.testing.assert_allclose(fitted.regressor_.fit_y.mean(axis=0), 0.0, atol=1e-12)
     np.testing.assert_allclose(
-        fitted.estimator.fit_y.std(axis=0, ddof=0),
+        fitted.regressor_.fit_y.std(axis=0, ddof=0),
         1.0,
         atol=1e-12,
     )
     predictions = fitted.predict(X)
     expected = np.tile(y.mean(axis=0).to_numpy(dtype=float), (len(X), 1))
-    np.testing.assert_allclose(predictions.to_numpy(), expected)
+    np.testing.assert_allclose(predictions, expected)
 
 
 def test_scaled_native_multitarget_regressor_jsonpickle_roundtrip() -> None:
@@ -658,11 +653,7 @@ def test_neural_optuna_objectives_include_model_args(
 
         def predict(self, **kwargs):
             gandalf_prediction_calls.append(kwargs)
-            return [
-                torch.tensor(
-                    [[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]]
-                )
-            ]
+            return [torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]])]
 
     gandalf = GandalfEstimator(num_classes=2, model_args={"user_option": "kept"})
     gandalf.model_cls = GandalfModel

@@ -33,7 +33,7 @@ class DecisionTreeEstimator(DfAnalyzeModel):
     def model_cls_args(self, full_args: dict[str, Any]) -> tuple[type, dict[str, Any]]:
         return self.model_cls, full_args
 
-    def optuna_args(self, trial: Trial) -> dict[str, str | float | int | None]:
+    def optuna_args(self, trial: Trial) -> dict[str, Any]:
         return dict(
             max_depth=trial.suggest_categorical("max_depth", [None, 3, 5, 10, 20]),
             min_samples_split=trial.suggest_int("min_samples_split", 2, 20),
@@ -58,7 +58,7 @@ class ExtraTreesEstimator(DfAnalyzeModel):
     def model_cls_args(self, full_args: dict[str, Any]) -> tuple[type, dict[str, Any]]:
         return self.model_cls, full_args
 
-    def optuna_args(self, trial: Trial) -> dict[str, str | float | int | None]:
+    def optuna_args(self, trial: Trial) -> dict[str, Any]:
         return dict(
             n_estimators=trial.suggest_int("n_estimators", 50, 300, step=50),
             max_depth=trial.suggest_categorical("max_depth", [None, 5, 10, 20, 40]),

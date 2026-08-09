@@ -1,4 +1,4 @@
-"""Build sample summaries and optional validation-holdout comparisons.
+"""Build optional validation-holdout comparisons.
 
 Model ranking and EC/performance correlations are disabled for a holdout marked
 as final test data.
@@ -7,10 +7,9 @@ as final test data.
 from __future__ import annotations
 
 import re
-from typing import Optional
 
 import numpy as np
-from numpy import ndarray
+import pandas as pd
 from pandas import DataFrame, Series
 
 from df_analyze.enumerables import ClassifierScorer, RegressorScorer
@@ -26,101 +25,19 @@ CORRELATION_COLUMNS = [
 ]
 
 
-def _row_ids(n_samples: int, row_ids=None) -> ndarray:
-    if row_ids is None:
-        return np.arange(n_samples)
-    values = np.asarray(row_ids)
-    if values.size != n_samples:
-        raise ValueError(f"Expected {n_samples} holdout row ids, received {values.size}.")
-    return values
+def _require_frame(value: object) -> DataFrame:
+    if not isinstance(value, DataFrame):
+        raise TypeError("Expected a pandas DataFrame.")
+    return value
 
 
-def _group_table(sample_df: DataFrame, value_columns: list[str]) -> DataFrame:
-    if "group" not in sample_df.columns:
-        return DataFrame()
-    grouped = sample_df.groupby("group", dropna=False, sort=True)
-    table = grouped[value_columns].mean(numeric_only=True).reset_index()
-    table.insert(1, "n_samples", grouped.size().to_numpy())
-    return table
-
-
-def classification_sample_diagnostics(
-    errors: ndarray,
-    row_ids=None,
-    groups: Optional[Series] = None,
-) -> dict[str, DataFrame]:
-    error_matrix = np.asarray(errors, dtype=bool)
-    if error_matrix.ndim != 2:
-        raise ValueError("Classification error matrix must be two-dimensional.")
-    n_models, n_samples = error_matrix.shape
-    error_count = error_matrix.sum(axis=0)
-    error_rate = error_count / n_models
-    sample_df = DataFrame(
-        {
-            "row_id": _row_ids(n_samples, row_ids),
-            "n_ec_models": n_models,
-            "error_count": error_count,
-            "error_rate": error_rate,
-            "instability": 4.0 * error_rate * (1.0 - error_rate),
-            "all_models_wrong": error_count == n_models,
-            "any_model_wrong": error_count > 0,
-        }
-    )
-    outputs = {"sample_diagnostics.csv": sample_df}
-    if groups is not None:
-        sample_df["group"] = np.asarray(groups)
-        outputs["group_diagnostics.csv"] = _group_table(
-            sample_df,
-            ["error_rate", "instability", "all_models_wrong", "any_model_wrong"],
-        )
-    return outputs
-
-
-def regression_sample_diagnostics(
-    residuals: ndarray,
-    row_ids=None,
-    groups: Optional[Series] = None,
-) -> dict[str, DataFrame]:
-    residual_matrix = np.asarray(residuals, dtype=float)
-    if residual_matrix.ndim != 2:
-        raise ValueError("Regression residual matrix must be two-dimensional.")
-    n_models, n_samples = residual_matrix.shape
-    absolute = np.abs(residual_matrix)
-    signs = np.sign(residual_matrix)
-    sign_consensus = np.maximum.reduce(
-        [
-            np.mean(signs < 0, axis=0),
-            np.mean(signs == 0, axis=0),
-            np.mean(signs > 0, axis=0),
-        ]
-    )
-    sample_df = DataFrame(
-        {
-            "row_id": _row_ids(n_samples, row_ids),
-            "n_ec_models": n_models,
-            "residual_mean": np.mean(residual_matrix, axis=0),
-            "residual_sd": np.std(residual_matrix, axis=0),
-            "mean_abs_residual": np.mean(absolute, axis=0),
-            "sd_abs_residual": np.std(absolute, axis=0),
-            "max_abs_residual": np.max(absolute, axis=0),
-            "residual_range": np.ptp(residual_matrix, axis=0),
-            "sign_consensus": sign_consensus,
-        }
-    )
-    outputs = {"sample_diagnostics.csv": sample_df}
-    if groups is not None:
-        sample_df["group"] = np.asarray(groups)
-        outputs["group_diagnostics.csv"] = _group_table(
-            sample_df,
-            [
-                "mean_abs_residual",
-                "sd_abs_residual",
-                "residual_sd",
-                "residual_range",
-                "sign_consensus",
-            ],
-        ).rename(columns={"mean_abs_residual": "mean_abs_residual_mean"})
-    return outputs
+def _column_series(frame: object, name: str) -> Series:
+    """Return one unambiguous DataFrame column."""
+    frame = _require_frame(frame)
+    column = frame.loc[:, name]
+    if not isinstance(column, Series):
+        raise ValueError(f"Expected one column named {name!r}.")
+    return column
 
 
 def _performance_higher_is_better(metric: str) -> bool:
@@ -134,33 +51,31 @@ def _performance_higher_is_better(metric: str) -> bool:
 
 def compute_correlation_summary(summary: DataFrame, performance: DataFrame) -> DataFrame:
     if summary.empty or performance.empty:
-        return DataFrame(columns=CORRELATION_COLUMNS)
+        return DataFrame(columns=pd.Index(CORRELATION_COLUMNS, dtype=str))
     keys = [col for col in IDENTITY_COLUMNS if col in summary and col in performance]
     merged = summary.merge(performance, on=keys, how="inner", suffixes=("", "_perf"))
     if merged.empty or "ec_trial_mean" not in merged:
-        return DataFrame(columns=CORRELATION_COLUMNS)
+        return DataFrame(columns=pd.Index(CORRELATION_COLUMNS, dtype=str))
 
     rows = []
     group_cols = [col for col in ["target", "ec_method", "metric"] if col in merged]
     for group_key, group in merged.groupby(group_cols, dropna=False):
-        finite = group[["ec_mean", "ec_trial_mean"]].dropna()
+        finite = group.loc[:, ["ec_mean", "ec_trial_mean"]].dropna()
         if len(finite) < 3:
             continue
+        ec_mean = _column_series(finite, "ec_mean")
+        ec_trial_mean = _column_series(finite, "ec_trial_mean")
         key_values = group_key if isinstance(group_key, tuple) else (group_key,)
         row = dict(zip(group_cols, key_values))
         row.update(
             {
                 "n_configurations": len(finite),
-                "pearson_r": finite["ec_mean"].corr(
-                    finite["ec_trial_mean"], method="pearson"
-                ),
-                "spearman_r": finite["ec_mean"].corr(
-                    finite["ec_trial_mean"], method="spearman"
-                ),
+                "pearson_r": ec_mean.corr(ec_trial_mean, method="pearson"),
+                "spearman_r": ec_mean.corr(ec_trial_mean, method="spearman"),
             }
         )
         rows.append(row)
-    return DataFrame(rows, columns=CORRELATION_COLUMNS)
+    return DataFrame(rows, columns=pd.Index(CORRELATION_COLUMNS, dtype=str))
 
 
 def compute_model_ec_ranking(summary: DataFrame, performance: DataFrame) -> DataFrame:
@@ -168,14 +83,16 @@ def compute_model_ec_ranking(summary: DataFrame, performance: DataFrame) -> Data
         return DataFrame()
     keys = [col for col in IDENTITY_COLUMNS if col in summary and col in performance]
     ranking = summary.copy()
-    supported = (
-        ranking["ranking_supported"].fillna(True).astype(bool)
+    supported: Series = (
+        _column_series(ranking, "ranking_supported").fillna(True).astype(bool)
         if "ranking_supported" in ranking
         else Series(True, index=ranking.index)
     )
     ranking["stability_distance"] = np.where(
         supported,
-        np.abs(ranking["ec_mean"] - ranking["optimal_value"]),
+        np.abs(
+            _column_series(ranking, "ec_mean") - _column_series(ranking, "optimal_value")
+        ),
         np.nan,
     )
     rank_groups = [col for col in ["target", "ec_method"] if col in ranking]
@@ -192,17 +109,15 @@ def compute_model_ec_ranking(summary: DataFrame, performance: DataFrame) -> Data
     if "metric" not in ranking or "ec_trial_mean" not in ranking:
         return ranking
     supported = (
-        ranking["ranking_supported"].fillna(True).astype(bool)
+        _column_series(ranking, "ranking_supported").fillna(True).astype(bool)
         if "ranking_supported" in ranking
         else Series(True, index=ranking.index)
     )
-    perf_groups = [
-        col for col in ["target", "ec_method", "metric"] if col in ranking
-    ]
+    perf_groups = [col for col in ["target", "ec_method", "metric"] if col in ranking]
     ranking["rank_by_performance"] = np.nan
-    for _, idx in ranking.loc[supported].groupby(
-        perf_groups, dropna=False
-    ).groups.items():
+    for _, idx in (
+        ranking.loc[supported].groupby(perf_groups, dropna=False).groups.items()
+    ):
         indices = list(idx)
         metric = str(ranking.loc[indices[0], "metric"])
         ranking.loc[indices, "rank_by_performance"] = ranking.loc[
@@ -223,7 +138,9 @@ def _natural_key(value: object) -> tuple[tuple[int, object], ...]:
 def compute_target_ec_trend(summary: DataFrame) -> DataFrame:
     if summary.empty or "target" not in summary:
         return DataFrame()
-    targets = sorted(summary["target"].dropna().unique(), key=_natural_key)
+    targets = sorted(
+        _column_series(summary, "target").dropna().unique(), key=_natural_key
+    )
     target_order = {target: idx for idx, target in enumerate(targets)}
     group_cols = [
         col
@@ -237,6 +154,14 @@ def compute_target_ec_trend(summary: DataFrame) -> DataFrame:
         ]
         if col in summary
     ]
-    trend = summary.groupby(group_cols, dropna=False)["ec_mean"].mean().reset_index()
-    trend.insert(0, "target_order", trend["target"].map(target_order))
+    trend = _require_frame(
+        summary.groupby(group_cols, dropna=False, as_index=False).agg(
+            ec_mean=("ec_mean", "mean")
+        )
+    )
+    trend.insert(
+        0,
+        "target_order",
+        _column_series(trend, "target").map(lambda value: target_order.get(value)),
+    )
     return trend.sort_values(["target_order", *[c for c in group_cols if c != "target"]])

@@ -93,30 +93,3 @@ def top_k_indices(
     priorities = _tie_priorities(indices, seed, tie_keys)
     order = np.lexsort((priorities, -values[indices]))
     return indices[order].astype(int, copy=False)
-
-
-def fractional_top_k_votes(
-    scores: NDArray[np.float64],
-    n_select: int,
-) -> NDArray[np.float64]:
-    """Give tied features fractional votes at the top-k boundary."""
-    values = np.asarray(scores, dtype=np.float64)
-    votes = np.zeros(values.shape, dtype=np.float64)
-    usable = usable_score_mask(values)
-    indices = np.flatnonzero(usable)
-    if n_select <= 0 or len(indices) == 0:
-        return votes
-    if len(indices) <= n_select:
-        votes[indices] = 1.0
-        return votes
-
-    usable_values = values[indices]
-    cutoff_position = len(indices) - n_select
-    cutoff = np.partition(usable_values, cutoff_position)[cutoff_position]
-    above = indices[usable_values > cutoff]
-    boundary = indices[usable_values == cutoff]
-    votes[above] = 1.0
-    remaining = n_select - len(above)
-    if remaining > 0 and len(boundary) > 0:
-        votes[boundary] = remaining / len(boundary)
-    return votes

@@ -91,12 +91,7 @@ def test_reindex_preserves_interleaved_partitions() -> None:
 
 def test_training_target_cleanup_does_not_use_holdout_counts() -> None:
     target = pd.Series(
-        ["a"] * 40
-        + ["b"] * 40
-        + ["c"] * 5
-        + ["a"] * 20
-        + ["b"] * 20
-        + ["c"] * 30,
+        ["a"] * 40 + ["b"] * 40 + ["c"] * 5 + ["a"] * 20 + ["b"] * 20 + ["c"] * 30,
         name="target",
     )
     frame = pd.DataFrame({"feature": np.arange(len(target)), "target": target})

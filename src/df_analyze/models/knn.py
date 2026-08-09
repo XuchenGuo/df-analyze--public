@@ -9,7 +9,6 @@ sys.path.append(str(ROOT))  # isort: skip
 
 import platform
 from typing import Any, Mapping, Optional, Type, Union
-from warnings import warn
 
 import numpy as np
 import optuna
@@ -20,7 +19,7 @@ from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 
 from df_analyze.enumerables import Scorer
 from df_analyze.models.base import DfAnalyzeModel
-from df_analyze.runtime.hardware import DeviceIntent, RuntimeComponent, RuntimePolicy
+from df_analyze.runtime.hardware import RuntimeComponent, RuntimePolicy
 
 
 def _float_array(X: Any) -> np.ndarray:
@@ -84,7 +83,6 @@ class _TorchKNN:
         self._X_centered_norm = None
         self._X_cpu: Optional[np.ndarray] = None
         self._y_cpu: Optional[np.ndarray] = None
-        self._cpu_model = None
 
     @staticmethod
     def _torch():
@@ -115,46 +113,10 @@ class _TorchKNN:
             raise ValueError(
                 "Found input variables with inconsistent numbers of samples."
             )
-        try:
-            torch = self._torch()
-            self._X = torch.as_tensor(
-                self._X_cpu, dtype=torch.float32, device=self.device
-            )
-        except Exception as error:
-            if not _cuda_memory_error(error):
-                raise
-            self._activate_cpu("training data did not fit in GPU memory")
-
-    def _new_cpu_model(self):
-        raise NotImplementedError
-
-    def _activate_cpu(self, reason: str) -> None:
-        if self._cpu_model is not None:
-            return
-        if self._X_cpu is None or self._y_cpu is None:
-            raise RuntimeError("KNN training data is unavailable for CPU fallback.")
-        if self.runtime is not None and self.runtime.intent in {
-            DeviceIntent.Auto,
-            DeviceIntent.CUDA,
-        }:
-            raise RuntimeError(
-                f"CUDA KNN {reason}. The complete model task must be retried on CPU."
-            )
-        warn(f"CUDA KNN {reason}; continuing with sklearn KNN on CPU.")
-        if self.runtime is not None:
-            self.runtime.record_cpu_fallback(
-                RuntimeComponent.KNN, "cuda_out_of_memory"
-            )
-        self._cpu_model = self._new_cpu_model()
-        target = self._y_cpu.ravel() if self._y_cpu.shape[1] == 1 else self._y_cpu
-        self._cpu_model.fit(self._X_cpu, target)
-        self._X = None
-        self._X_norm = None
-        self._X_centered_norm = None
-        try:
-            self._torch().cuda.empty_cache()
-        except Exception:
-            pass
+        torch = self._torch()
+        self._X = torch.as_tensor(
+            self._X_cpu, dtype=torch.float32, device=self.device
+        )
 
     def _train_for_metric(self):
         if self._X is None:
@@ -259,19 +221,11 @@ class _TorchKNN:
     def kneighbors(
         self, X: Any, n_neighbors: Optional[int] = None, return_distance: bool = True
     ):
-        if self._cpu_model is not None:
-            return self._cpu_model.kneighbors(X, n_neighbors, return_distance)
         old_neighbors = self.n_neighbors
         if n_neighbors is not None:
             self.n_neighbors = int(n_neighbors)
         try:
-            try:
-                distances, indices = self._kneighbors_torch(X)
-            except Exception as error:
-                if not _cuda_memory_error(error):
-                    raise
-                self._activate_cpu("prediction exceeded available GPU memory")
-                return self._cpu_model.kneighbors(X, n_neighbors, return_distance)
+            distances, indices = self._kneighbors_torch(X)
         finally:
             self.n_neighbors = old_neighbors
         index_array = indices.detach().cpu().numpy()
@@ -304,27 +258,10 @@ class TorchKNNClassifier(_TorchKNN):
             codes.append(encoded)
         self.classes_ = self._classes[0] if self._single_output else self._classes
         self._fit_features(X)
-        if self._cpu_model is None:
-            try:
-                self._codes = self._torch().as_tensor(
-                    np.column_stack(codes), dtype=self._torch().long, device=self.device
-                )
-            except Exception as error:
-                if not _cuda_memory_error(error):
-                    raise
-                self._activate_cpu("targets did not fit in GPU memory")
-        return self
-
-    def _new_cpu_model(self):
-        return KNeighborsClassifier(
-            n_neighbors=self.n_neighbors,
-            weights=self.weights,
-            metric=self.metric,
-            p=self.p,
-            algorithm=self.algorithm,
-            leaf_size=self.leaf_size,
-            metric_params=self.metric_params,
+        self._codes = self._torch().as_tensor(
+            np.column_stack(codes), dtype=self._torch().long, device=self.device
         )
+        return self
 
     def _vote_arrays(self, X: Any) -> list[np.ndarray]:
         distances, indices = self._kneighbors_torch(X)
@@ -344,25 +281,14 @@ class TorchKNNClassifier(_TorchKNN):
         return votes_out
 
     def _votes(self, X: Any) -> list[np.ndarray]:
-        try:
-            return self._vote_arrays(X)
-        except Exception as error:
-            if not _cuda_memory_error(error):
-                raise
-            self._activate_cpu("prediction exceeded available GPU memory")
-            probabilities = self._cpu_model.predict_proba(X)
-            return [probabilities] if isinstance(probabilities, np.ndarray) else probabilities
+        return self._vote_arrays(X)
 
     def predict(self, X: Any) -> np.ndarray:
-        if self._cpu_model is not None:
-            return np.asarray(self._cpu_model.predict(X))
         columns = [classes[np.argmax(votes, axis=1)] for votes, classes in zip(self._votes(X), self._classes)]
         output = np.column_stack(columns)
         return output.ravel() if self._single_output else output
 
     def predict_proba(self, X: Any):
-        if self._cpu_model is not None:
-            return self._cpu_model.predict_proba(X)
         probabilities = []
         for votes in self._votes(X):
             total = votes.sum(axis=1, keepdims=True)
@@ -380,47 +306,22 @@ class TorchKNNRegressor(_TorchKNN):
         self._y_cpu = _target_array(y).astype(np.float32)
         self._single_output = self._y_cpu.shape[1] == 1
         self._fit_features(X)
-        if self._cpu_model is None:
-            try:
-                self._y = self._torch().as_tensor(
-                    self._y_cpu, dtype=self._torch().float32, device=self.device
-                )
-            except Exception as error:
-                if not _cuda_memory_error(error):
-                    raise
-                self._activate_cpu("targets did not fit in GPU memory")
+        self._y = self._torch().as_tensor(
+            self._y_cpu, dtype=self._torch().float32, device=self.device
+        )
         return self
 
-    def _new_cpu_model(self):
-        return KNeighborsRegressor(
-            n_neighbors=self.n_neighbors,
-            weights=self.weights,
-            metric=self.metric,
-            p=self.p,
-            algorithm=self.algorithm,
-            leaf_size=self.leaf_size,
-            metric_params=self.metric_params,
-        )
-
     def predict(self, X: Any) -> np.ndarray:
-        if self._cpu_model is not None:
-            return np.asarray(self._cpu_model.predict(X))
-        try:
-            distances, indices = self._kneighbors_torch(X)
-            weights = self._weights(distances)
-            values = self._y[indices]
-            if self.weights == "uniform":
-                prediction = values.mean(dim=1)
-            else:
-                total = weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
-                prediction = (values * weights.unsqueeze(-1)).sum(dim=1) / total
-            output = prediction.detach().cpu().numpy()
-            return output.ravel() if self._single_output else output
-        except Exception as error:
-            if not _cuda_memory_error(error):
-                raise
-            self._activate_cpu("prediction exceeded available GPU memory")
-            return np.asarray(self._cpu_model.predict(X))
+        distances, indices = self._kneighbors_torch(X)
+        weights = self._weights(distances)
+        values = self._y[indices]
+        if self.weights == "uniform":
+            prediction = values.mean(dim=1)
+        else:
+            total = weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
+            prediction = (values * weights.unsqueeze(-1)).sum(dim=1) / total
+        output = prediction.detach().cpu().numpy()
+        return output.ravel() if self._single_output else output
 
     def score(self, X: Any, y: Any) -> float:
         return float(r2_score(y, self.predict(X)))

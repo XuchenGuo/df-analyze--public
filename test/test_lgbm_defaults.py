@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("lightgbm")
-
 from df_analyze.models.lgbm import (
     LightGBMClassifier,
     LightGBMRegressor,

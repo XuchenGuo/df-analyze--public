@@ -24,45 +24,37 @@ from df_analyze.analysis.error_consistency.backend import (
     ECBackendDecision,
     resolve_ec_backend,
 )
-from df_analyze.analysis.error_consistency.checkpoint import (
-    checkpoint_directory,
-    configuration_fingerprint,
-    load_partial_checkpoint,
-    save_partial_checkpoint,
-)
 from df_analyze.analysis.error_consistency.classification import (
     _pair_counts,
     compute_classification_ec,
 )
 from df_analyze.analysis.error_consistency.containers import finite_summary
-from df_analyze.analysis.error_consistency.diagnostics import (
-    classification_sample_diagnostics,
-    compute_model_ec_ranking,
-    regression_sample_diagnostics,
-)
-from df_analyze.analysis.error_consistency.profiles import (
-    REGRESSION_PAPER_METHODS,
-)
+from df_analyze.analysis.error_consistency.diagnostics import compute_model_ec_ranking
 from df_analyze.analysis.error_consistency.regression import (
     _torch_pairwise,
     compute_regression_ec,
     normalize_regression_method,
     regression_pairwise_consistency,
 )
-from df_analyze.analysis.error_consistency.risk_stability import (
-    risk_stability_summary,
-    write_risk_stability_report,
-)
 from df_analyze.analysis.error_consistency.runner import (
     _init_model,
     _seed_trial_model,
     _trial_model_seed,
-    detail_output_dir,
     run_error_consistency_analysis,
 )
 from df_analyze.analysis.error_consistency.writer import _write_detail_plots
 from df_analyze.cli.cli import ArgumentError, get_options
 from df_analyze.enumerables import ClassifierScorer, RegressorScorer
+
+TEST_REGRESSION_METHODS = (
+    "ratio",
+    "ratio_diff",
+    "ratio_sign",
+    "ratio_diff_sign_reference",
+    "intersection_union_sample",
+    "intersection_union_all",
+    "intersection_union_distance",
+)
 from df_analyze.hypertune import EvaluationResults, HtuneResult
 from df_analyze.models.dummy import DummyClassifier, DummyRegressor
 from df_analyze.models.mlp import MLPEstimator
@@ -95,20 +87,20 @@ def test_published_regression_metrics_and_zero_conventions() -> None:
         np.asarray([0.0, 0.003, 4.0]),
         "ratio_sign",
     )
-    ratio_diff_sign = regression_pairwise_consistency(
+    ratio_diff_sign_reference = regression_pairwise_consistency(
         np.asarray([0.0, 0.002, -2.0]),
         np.asarray([0.0, 0.003, 4.0]),
-        "ratio_diff_sign",
+        "ratio_diff_sign_reference",
     )
 
     assert ratio.tolist() == pytest.approx([1.0, 2.0 / 3.0, 0.5])
     assert ratio_diff.tolist() == pytest.approx([0.0, 0.2, 1.0 / 3.0])
     assert ratio_sign.tolist() == pytest.approx([1.0, 2.0 / 3.0, -0.5])
-    assert ratio_diff_sign.tolist() == pytest.approx([0.0, 0.2, -1.0 / 3.0])
+    assert ratio_diff_sign_reference.tolist() == pytest.approx([0.0, 0.2, -1.0 / 3.0])
 
 
 @pytest.mark.fast
-def test_ratio_diff_sign_magnitude_preferred_alias_is_backward_compatible() -> None:
+def test_ratio_diff_sign_variants_are_explicit() -> None:
     assert normalize_regression_method("ratio_diff_sign_magnitude") == (
         "ratio_diff_sign_magnitude"
     )
@@ -124,21 +116,18 @@ def test_ratio_diff_sign_magnitude_preferred_alias_is_backward_compatible() -> N
         residuals,
         methods=["ratio_diff_sign_magnitude"],
     )[0]
-    compatibility = compute_regression_ec(
-        residuals,
-        methods=["ratio_diff_sign"],
-    )[0]
     reference = compute_regression_ec(
         residuals,
         methods=["ratio_diff_sign_reference"],
     )[0]
 
     assert preferred.info.name == "ratio_diff_sign_magnitude"
-    assert compatibility.info.name == "ratio_diff_sign"
-    assert preferred.summary()["ec_mean"] == compatibility.summary()["ec_mean"]
-    assert preferred.summary()["preferred_method_name"] == ("ratio_diff_sign_magnitude")
-    assert preferred.summary()["compatibility_method_name"] == "ratio_diff_sign"
-    assert compatibility.summary()["legacy_ambiguous_method_name"] is True
+    assert preferred.summary()["primary_aggregation"] == (
+        "mean_unsigned_ratio_difference"
+    )
+    assert "compatibility_method_name" not in preferred.summary()
+    with pytest.raises(ValueError, match="Unknown regression EC method"):
+        normalize_regression_method("ratio_diff_sign")
     assert reference.summary()["ec_mean"] == pytest.approx(0.0)
     assert reference.summary()["ec_signed_mean"] == pytest.approx(0.0)
     assert reference.summary()["primary_aggregation"] == ("mean_signed_ratio_difference")
@@ -220,7 +209,7 @@ def test_all_regression_methods_numpy_torch_parity() -> None:
     second = np.asarray([0.0, 1.0, -6.0, -2.0, 3.0])
     first_t = torch.as_tensor(first, dtype=torch.float64).reshape(1, -1)
     second_t = torch.as_tensor(second, dtype=torch.float64).reshape(1, -1)
-    for method in REGRESSION_PAPER_METHODS:
+    for method in TEST_REGRESSION_METHODS:
         expected = regression_pairwise_consistency(first, second, method)
         observed = _torch_pairwise(first_t, second_t, method, epsilon=0.0)
         np.testing.assert_allclose(
@@ -254,7 +243,7 @@ def test_physical_cuda_pairwise_parity() -> None:
     second = np.asarray([0.0, 1.0, -6.0, -2.0, 3.0])
     first_t = torch.as_tensor(first, dtype=torch.float64, device="cuda").reshape(1, -1)
     second_t = torch.as_tensor(second, dtype=torch.float64, device="cuda").reshape(1, -1)
-    for method in REGRESSION_PAPER_METHODS:
+    for method in TEST_REGRESSION_METHODS:
         expected = regression_pairwise_consistency(first, second, method)
         observed = _torch_pairwise(first_t, second_t, method, epsilon=0.0)
         np.testing.assert_allclose(
@@ -380,36 +369,9 @@ def test_adaptive_error_cross_model_outputs_support_a_long_windows_path(
     )
 
     assert windows_io_path(parquet).is_file()
-    assert windows_io_path(plots_dir / "confidence_vs_expected_error_compare.png").is_file()
-
-
-@pytest.mark.fast
-@pytest.mark.skipif(os.name != "nt", reason="Windows MAX_PATH regression")
-def test_ec_checkpoint_supports_a_long_windows_output_path(tmp_path) -> None:
-    padding = max(1, 225 - len(str(tmp_path.resolve())))
-    detail = tmp_path / ("x" * padding)
-    temporary = checkpoint_directory(detail) / "predictions.parquet.tmp"
-    predictions = np.asarray([[0.0, 1.0], [1.0, 0.0]])
-    frame = pd.DataFrame({"repetition": [0], "fold": [0]})
-
-    assert len(str(temporary.resolve())) > 260
-    save_partial_checkpoint(
-        detail,
-        fingerprint="long-path-checkpoint",
-        fingerprint_payload={"test": "windows-long-path"},
-        completed_repetitions=1,
-        predictions=predictions,
-        trial_design=frame,
-        fold_assignments=frame,
-        trial_scores=frame,
-        trial_failures=pd.DataFrame(),
-    )
-    loaded = load_partial_checkpoint(detail, fingerprint="long-path-checkpoint")
-
-    assert loaded is not None
-    np.testing.assert_array_equal(loaded.predictions, predictions)
-    assert loaded.completed_repetitions == 1
-    assert windows_io_path(checkpoint_directory(detail) / "state.json").is_file()
+    assert windows_io_path(
+        plots_dir / "confidence_vs_expected_error_compare.png"
+    ).is_file()
 
 
 @pytest.mark.fast
@@ -541,9 +503,7 @@ def test_regression_streaming_summaries_match_explicit_values() -> None:
 
 @pytest.mark.fast
 def test_summary_detail_preserves_metric_values_without_detail_frames() -> None:
-    residuals = np.asarray(
-        [[0.0, 1.0, -2.0], [0.0, 2.0, 4.0], [1.0, -2.0, 3.0]]
-    )
+    residuals = np.asarray([[0.0, 1.0, -2.0], [0.0, 2.0, 4.0], [1.0, -2.0, 3.0]])
     full = compute_regression_ec(residuals, output_detail="full")
     compact = compute_regression_ec(residuals, output_detail="summary")
 
@@ -579,7 +539,9 @@ def test_summary_detail_preserves_metric_values_without_detail_frames() -> None:
 def test_ratio_diff_sign_primary_summary_cannot_cancel_opposite_directions() -> None:
     residuals = np.asarray([[1.0, 1.0], [2.0, -2.0]])
 
-    computation = compute_regression_ec(residuals, methods=["ratio_diff_sign"])[0]
+    computation = compute_regression_ec(residuals, methods=["ratio_diff_sign_magnitude"])[
+        0
+    ]
     summary = computation.summary()
 
     assert summary["ec_mean"] == pytest.approx(1.0 / 3.0)
@@ -598,11 +560,13 @@ def test_ratio_diff_sign_primary_summary_cannot_cancel_opposite_directions() -> 
 def test_ratio_diff_sign_primary_preserves_zero_nonzero_difference() -> None:
     residuals = np.asarray([[0.0, 2.0, 0.0], [2.0, 0.0, 0.0]])
 
-    computation = compute_regression_ec(residuals, methods=["ratio_diff_sign"])[0]
+    computation = compute_regression_ec(residuals, methods=["ratio_diff_sign_magnitude"])[
+        0
+    ]
     summary = computation.summary()
 
     assert regression_pairwise_consistency(
-        residuals[0], residuals[1], "ratio_diff_sign"
+        residuals[0], residuals[1], "ratio_diff_sign_reference"
     ).tolist() == pytest.approx([0.0, 0.0, 0.0])
     assert summary["ec_mean"] == pytest.approx(2.0 / 3.0)
     assert summary["ec_signed_mean"] == pytest.approx(0.0)
@@ -631,7 +595,7 @@ def test_classification_iou_and_empty_union_policy() -> None:
         np.vstack([truth, truth]), truth, empty_unions="1"
     )
     assert perfect.values.tolist() == [1.0]
-    assert np.isnan(perfect.summary()["leave_one_out_mean"])
+    assert np.isnan(perfect.summary()["leave_one_model_out_mean"])
 
     with pytest.warns(UserWarning, match="empty error unions"):
         perfect_default = compute_classification_ec(np.vstack([truth, truth]), truth)
@@ -665,7 +629,7 @@ def test_classification_total_and_leave_one_out_are_set_iou() -> None:
 
     assert summary["ec_mean"] == pytest.approx(1.0 / 3.0)
     assert summary["total_consistency"] == pytest.approx(1.0 / 5.0)
-    assert summary["leave_one_out_mean"] == pytest.approx(1.0 / 4.0)
+    assert summary["leave_one_model_out_mean"] == pytest.approx(1.0 / 4.0)
     assert summary["leave_one_model_out_mean"] == pytest.approx(1.0 / 4.0)
     assert summary["n_leave_one_model_out"] == 4
     assert summary["total_error_intersection"] == 1
@@ -846,38 +810,20 @@ def test_grouped_kfold_repetitions_shuffle_groups(is_classification) -> None:
 
 
 @pytest.mark.fast
-def test_sample_and_group_diagnostics() -> None:
-    cls = classification_sample_diagnostics(
-        np.asarray([[False, True], [True, True]]),
-        row_ids=[10, 11],
-        groups=pd.Series(["a", "b"]),
-    )
-    reg = regression_sample_diagnostics(
-        np.asarray([[1.0, 2.0], [1.5, 3.0]]),
-        row_ids=[10, 11],
-        groups=pd.Series(["a", "b"]),
-    )
-
-    assert cls["sample_diagnostics.csv"]["error_rate"].tolist() == [0.5, 1.0]
-    assert "group_diagnostics.csv" in cls
-    assert "mean_abs_residual_mean" in reg["group_diagnostics.csv"]
-
-
-@pytest.mark.fast
-def test_backend_selection_respects_runtime_policy_and_work_size() -> None:
+def test_backend_selection_respects_runtime_policy_at_any_work_size() -> None:
     capabilities = HardwareCapabilities(True, False, False, False)
     cuda = SimpleNamespace(runtime=RuntimePolicy(DeviceIntent.CUDA, capabilities))
     auto = SimpleNamespace(runtime=RuntimePolicy(DeviceIntent.Auto, capabilities))
     cpu = SimpleNamespace(runtime=RuntimePolicy(DeviceIntent.CPU, capabilities))
 
     assert resolve_ec_backend(cuda, 3, 10).resolved == "torch_cuda"
-    assert resolve_ec_backend(auto, 3, 10).resolved == "numpy"
+    assert resolve_ec_backend(auto, 3, 10).resolved == "torch_cuda"
     assert resolve_ec_backend(auto, 400, 100).resolved == "torch_cuda"
     assert resolve_ec_backend(cpu, 400, 100).resolved == "numpy"
 
 
 @pytest.mark.fast
-def test_backend_reports_unavailable_cuda_fallback() -> None:
+def test_backend_uses_numpy_when_auto_detects_no_cuda() -> None:
     unavailable = HardwareCapabilities(False, False, False, False)
     explicit = SimpleNamespace(runtime=RuntimePolicy(DeviceIntent.CUDA, unavailable))
     automatic = SimpleNamespace(runtime=RuntimePolicy(DeviceIntent.Auto, unavailable))
@@ -888,35 +834,22 @@ def test_backend_reports_unavailable_cuda_fallback() -> None:
 
 
 @pytest.mark.fast
-def test_classification_cuda_error_falls_back_to_numpy(monkeypatch) -> None:
+def test_classification_cuda_error_propagates(monkeypatch) -> None:
     from df_analyze.analysis.error_consistency import classification
-
-    original = classification._pair_counts
 
     def fail_cuda(errors, pairs, use_cuda):
         if use_cuda:
             raise RuntimeError("simulated CUDA failure")
-        return original(errors, pairs, use_cuda)
+        return _pair_counts(errors, pairs, use_cuda)
 
     monkeypatch.setattr(classification, "_pair_counts", fail_cuda)
-    backend = ECBackendDecision("auto", "torch_cuda", "size_threshold", 10)
+    backend = ECBackendDecision("auto", "torch_cuda", "cuda_available", 10)
 
-    with pytest.warns(UserWarning, match="falling back to numpy"):
-        computation = compute_classification_ec(
-            np.asarray([[0, 1], [1, 1]]),
-            np.asarray([0, 0]),
-            backend=backend,
-        )
-
-    assert computation.summary()["ec_backend_resolved"] == "numpy"
-    assert computation.summary()["ec_backend_reason"] == "torch_cuda_error:RuntimeError"
-
-    strict = ECBackendDecision("cuda", "torch_cuda", "device_cuda", 10)
-    with pytest.raises(RuntimeError, match="strict"):
+    with pytest.raises(RuntimeError, match="simulated CUDA failure"):
         compute_classification_ec(
             np.asarray([[0, 1], [1, 1]]),
             np.asarray([0, 0]),
-            backend=strict,
+            backend=backend,
         )
 
 
@@ -928,8 +861,6 @@ def _options() -> SimpleNamespace:
         ec_methods=None,
         ec_holdout_role="validation",
         ec_output_detail="full",
-        ec_resume=False,
-        ec_checkpoint_every=5,
         ec_save_predictions=True,
         ec_empty_unions="1",
         ec_epsilon=0.0,
@@ -991,7 +922,7 @@ def _runner_case(is_classification: bool):
                     "metric": metric_name,
                     "trainset": 0.5,
                     "holdout": 0.5,
-                    "5-fold": 0.5,
+                    "cv_mean": 0.5,
                 }
             ]
         ),
@@ -1089,7 +1020,7 @@ def test_reference_pipeline_outputs_match_hand_checked_values(
     prep_train, prep_test, eval_results = _runner_case(is_classification)
     options = _options()
     if not is_classification:
-        options.ec_methods = REGRESSION_PAPER_METHODS
+        options.ec_methods = TEST_REGRESSION_METHODS
     output_dir = tmp_path / "error_consistency"
 
     result = run_error_consistency_analysis(
@@ -1141,15 +1072,13 @@ def test_reference_pipeline_outputs_match_hand_checked_values(
             "intersection_union_distance",
         }
         assert observed.loc["ratio", "ec_mean"] == pytest.approx(0.9051250974354325)
-        assert observed.loc["ratio_diff", "ec_mean"] == pytest.approx(
-            0.05044655144960405
-        )
+        assert observed.loc["ratio_diff", "ec_mean"] == pytest.approx(0.05044655144960405)
         assert observed.loc["intersection_union_all", "ec_mean"] == pytest.approx(
             0.9081382385730211
         )
-        assert observed.loc[
-            "intersection_union_distance", "ec_mean"
-        ] == pytest.approx(0.5833333333333333)
+        assert observed.loc["intersection_union_distance", "ec_mean"] == pytest.approx(
+            0.5833333333333333
+        )
 
 
 @pytest.mark.fast
@@ -1189,147 +1118,7 @@ def test_summary_output_detail_keeps_audit_outputs_without_large_details(
 
 
 @pytest.mark.fast
-def test_checkpoint_fingerprint_includes_model_class_and_tuned_parameters() -> None:
-    class AlternateDummyRegressor(DummyRegressor):
-        pass
-
-    prep_train, prep_test, eval_results = _runner_case(False)
-    tuned = eval_results.results[0]
-    common = {
-        "identity": {
-            "target": "target",
-            "model": "dummy",
-            "selection": "none",
-            "embed_selector": "none",
-        },
-        "options": _options(),
-        "X_train": prep_train.X,
-        "y_train": prep_train.y,
-        "X_holdout": prep_test.X,
-        "y_holdout": prep_test.y,
-        "is_classification": False,
-    }
-
-    baseline, payload = configuration_fingerprint(
-        **common,
-        model_class=tuned.model_cls,
-        tuned_parameters={"strategy": "mean", "constant": np.float64(1.0)},
-    )
-    changed_parameters, _ = configuration_fingerprint(
-        **common,
-        model_class=tuned.model_cls,
-        tuned_parameters={"strategy": "median", "constant": np.float64(1.0)},
-    )
-    changed_class, _ = configuration_fingerprint(
-        **common,
-        model_class=AlternateDummyRegressor,
-        tuned_parameters={"strategy": "mean", "constant": np.float64(1.0)},
-    )
-
-    assert baseline != changed_parameters
-    assert baseline != changed_class
-    assert payload["model_class"].endswith(".DummyRegressor")
-    assert payload["tuned_parameters"]["constant"] == 1.0
-
-
-@pytest.mark.fast
-def test_complete_checkpoint_resume_does_not_refit_models(tmp_path) -> None:
-    class CountingDummyRegressor(DummyRegressor):
-        refit_calls = 0
-
-        def refit_tuned(self, X, y, g=None, tuned_args=None) -> None:
-            type(self).refit_calls += 1
-            return super().refit_tuned(X, y, g=g, tuned_args=tuned_args)
-
-    prep_train, prep_test, eval_results = _runner_case(False)
-    tuned = eval_results.results[0]
-    tuned.model_cls = CountingDummyRegressor
-    tuned.model = CountingDummyRegressor()
-    options = _options()
-    output_dir = tmp_path / "error_consistency"
-
-    first = run_error_consistency_analysis(
-        prep_train,
-        prep_test,
-        eval_results,
-        options,
-        base_dir=output_dir,
-    )
-    assert CountingDummyRegressor.refit_calls == 4
-
-    options.ec_resume = True
-    second = run_error_consistency_analysis(
-        prep_train,
-        prep_test,
-        eval_results,
-        options,
-        base_dir=output_dir,
-    )
-    assert CountingDummyRegressor.refit_calls == 4
-    assert second.metadata["n_resumed_complete_configurations"] == 1
-    assert first.summary["ec_method"].tolist() == second.summary["ec_method"].tolist()
-    np.testing.assert_allclose(
-        first.summary[["ec_mean", "ec_sd", "ec_model_pair_sd"]].to_numpy(float),
-        second.summary[["ec_mean", "ec_sd", "ec_model_pair_sd"]].to_numpy(float),
-        equal_nan=True,
-    )
-
-
-@pytest.mark.fast
-def test_partial_checkpoint_resumes_after_completed_repetition(
-    tmp_path, monkeypatch
-) -> None:
-    from df_analyze.analysis.error_consistency import runner
-
-    class CountingDummyRegressor(DummyRegressor):
-        refit_calls = 0
-
-        def refit_tuned(self, X, y, g=None, tuned_args=None) -> None:
-            type(self).refit_calls += 1
-            return super().refit_tuned(X, y, g=g, tuned_args=tuned_args)
-
-    prep_train, prep_test, eval_results = _runner_case(False)
-    tuned = eval_results.results[0]
-    tuned.model_cls = CountingDummyRegressor
-    tuned.model = CountingDummyRegressor()
-    options = _options()
-    options.ec_checkpoint_every = 1
-    output_dir = tmp_path / "error_consistency"
-    original_save = runner.save_partial_checkpoint
-
-    def interrupt_after_first(*args, **kwargs):
-        original_save(*args, **kwargs)
-        if kwargs["completed_repetitions"] == 1:
-            raise RuntimeError("simulated interruption after checkpoint")
-
-    monkeypatch.setattr(runner, "save_partial_checkpoint", interrupt_after_first)
-    with pytest.raises(RuntimeError, match="did not complete"):
-        run_error_consistency_analysis(
-            prep_train,
-            prep_test,
-            eval_results,
-            options,
-            base_dir=output_dir,
-        )
-    assert CountingDummyRegressor.refit_calls == 2
-
-    monkeypatch.setattr(runner, "save_partial_checkpoint", original_save)
-    options.ec_resume = True
-    resumed = run_error_consistency_analysis(
-        prep_train,
-        prep_test,
-        eval_results,
-        options,
-        base_dir=output_dir,
-    )
-    assert CountingDummyRegressor.refit_calls == 4
-    assert resumed.metadata["n_resumed_partial_configurations"] == 1
-    assert set(resumed.summary["n_ec_models"]) == {4}
-    assert len(resumed.trial_design) == 4
-
-
-@pytest.mark.fast
-def test_failed_trial_is_recorded_and_remaining_trials_are_analyzed(
+def test_failed_trial_fails_the_configuration_immediately(
     tmp_path,
 ) -> None:
     class FlakyDummyRegressor(DummyRegressor):
@@ -1347,8 +1136,8 @@ def test_failed_trial_is_recorded_and_remaining_trials_are_analyzed(
     tuned.model = FlakyDummyRegressor()
     output_dir = tmp_path / "error_consistency"
 
-    with pytest.warns(UserWarning, match="trial failed and was recorded"):
-        result = run_error_consistency_analysis(
+    with pytest.raises(RuntimeError, match="intentional fold failure"):
+        run_error_consistency_analysis(
             prep_train,
             prep_test,
             eval_results,
@@ -1356,16 +1145,8 @@ def test_failed_trial_is_recorded_and_remaining_trials_are_analyzed(
             base_dir=output_dir,
         )
 
-    assert set(result.summary["n_ec_models"]) == {3}
-    assert set(result.summary["n_failed_trials"]) == {1}
-    assert result.trial_design["status"].value_counts().to_dict() == {
-        "success": 3,
-        "failed": 1,
-    }
-    failures = pd.read_csv(output_dir / "trial_failures.csv")
-    assert len(failures) == 1
-    assert failures["error_type"].item() == "RuntimeError"
-    assert "intentional fold failure" in failures["reason"].item()
+    assert FlakyDummyRegressor.refit_calls == 2
+    assert not (output_dir / "trial_failures.csv").exists()
 
 
 @pytest.mark.fast
@@ -1468,49 +1249,7 @@ def test_ec_runner_releases_fold_model_before_cleanup(tmp_path) -> None:
 
 
 @pytest.mark.fast
-def test_ec_runner_metadata_records_cuda_fallback(tmp_path, monkeypatch) -> None:
-    from df_analyze.analysis.error_consistency import classification, runner
-
-    original = classification._pair_counts
-
-    def fail_cuda(errors, pairs, use_cuda):
-        if use_cuda:
-            raise RuntimeError("simulated CUDA failure")
-        return original(errors, pairs, use_cuda)
-
-    monkeypatch.setattr(classification, "_pair_counts", fail_cuda)
-    monkeypatch.setattr(
-        runner,
-        "resolve_ec_backend",
-        lambda *args, **kwargs: ECBackendDecision(
-            "auto", "torch_cuda", "size_threshold", 10
-        ),
-    )
-    prep_train, prep_test, eval_results = _runner_case(True)
-
-    with pytest.warns(UserWarning, match="falling back to numpy"):
-        result = run_error_consistency_analysis(
-            prep_train,
-            prep_test,
-            eval_results,
-            _options(),
-            base_dir=tmp_path / "error_consistency",
-        )
-
-    assert result.metadata["ec_backends"] == [
-        {
-            "ec_backend_requested": "auto",
-            "ec_backend_resolved": "numpy",
-            "ec_backend_reason": "torch_cuda_error:RuntimeError",
-            "ec_backend_work_items": 10,
-        }
-    ]
-
-
-@pytest.mark.fast
-def test_ec_runner_does_not_swallow_strict_cuda_failure(
-    tmp_path, monkeypatch
-) -> None:
+def test_ec_runner_does_not_swallow_strict_cuda_failure(tmp_path, monkeypatch) -> None:
     from df_analyze.analysis.error_consistency import classification, runner
 
     def fail_cuda(errors, pairs, use_cuda):
@@ -1539,7 +1278,7 @@ def test_ec_runner_does_not_swallow_strict_cuda_failure(
         ),
     )
 
-    with pytest.raises(RuntimeError, match="strict"):
+    with pytest.raises(RuntimeError, match="simulated CUDA failure"):
         run_error_consistency_analysis(
             prep_train,
             prep_test,
@@ -1587,7 +1326,7 @@ def test_multitarget_ec_reconstruction_keeps_model_args() -> None:
                 "metric": ["acc"],
                 "trainset": [0.5],
                 "holdout": [0.5],
-                "5-fold": [0.5],
+                "cv_mean": [0.5],
             }
         ),
         X_train=X_train,
@@ -1617,7 +1356,7 @@ def test_error_consistency_cli_options(tmp_path) -> None:
         f"--df {path} --outdir {tmp_path} --error-consistency "
         "--ec-folds 3 --ec-repetitions 2 --ec-methods ratio ratio-diff "
         "--ec-save-predictions --ec-empty-unions nan --ec-epsilon 1e-8"
-        " --ec-recurrence-threshold 0.65 --ec-model-seed-mode fixed"
+        " --ec-model-seed-mode fixed"
         " --ec-holdout-role validation"
     )
 
@@ -1630,23 +1369,16 @@ def test_error_consistency_cli_options(tmp_path) -> None:
     assert options.ec_save_predictions is True
     assert options.ec_empty_unions == "nan"
     assert options.ec_epsilon == pytest.approx(1e-8)
-    assert options.ec_recurrence_threshold == pytest.approx(0.65)
 
     with pytest.raises(ArgumentError, match="ec-folds"):
         get_options(f"--df {path} --outdir {tmp_path} --ec-folds 1")
-    with pytest.raises(ArgumentError, match="ec-recurrence-threshold"):
-        get_options(f"--df {path} --outdir {tmp_path} --ec-recurrence-threshold 1.1")
-
     defaults = get_options(f"--df {path} --outdir {tmp_path}")
     assert defaults.error_consistency is False
     assert defaults.ec_repetitions == 5
     assert defaults.ec_model_seed_mode == "vary"
     assert defaults.ec_empty_unions == "warn"
     assert defaults.ec_holdout_role == "test"
-    assert defaults.ec_profile == "none"
     assert defaults.ec_output_detail == "full"
-    assert defaults.ec_resume is False
-    assert defaults.ec_checkpoint_every == 5
 
     explicit = get_options(
         f"--df {path} --outdir {tmp_path} --mode regress "
@@ -1656,73 +1388,9 @@ def test_error_consistency_cli_options(tmp_path) -> None:
         "ratio_diff_sign_magnitude",
         "ratio_diff_sign_reference",
     )
-    with pytest.warns(UserWarning, match="ambiguous legacy EC method"):
-        legacy = get_options(
-            f"--df {path} --outdir {tmp_path} --mode regress --ec-methods ratio_diff_sign"
-        )
-    assert legacy.ec_methods == ("ratio_diff_sign",)
-
-
-@pytest.mark.fast
-def test_ec_paper_profiles_apply_defaults_and_preserve_explicit_overrides(
-    tmp_path,
-) -> None:
-    path = tmp_path / "input.csv"
-    pd.DataFrame({"x": [0, 1, 2, 3], "target": [0.0, 1.0, 2.0, 3.0]}).to_csv(
-        path, index=False
-    )
-
-    regression = get_options(
-        f"--df {path} --outdir {tmp_path} --mode regress --ec-profile regression-paper"
-    )
-    assert regression.error_consistency is True
-    assert regression.test_val_size == pytest.approx(0.2)
-    assert regression.ec_folds == 5
-    assert regression.ec_repetitions == 50
-    assert regression.ec_model_seed_mode == "fixed"
-    assert regression.ec_methods == REGRESSION_PAPER_METHODS
-    assert regression.ec_holdout_role == "test"
-    assert regression.ec_profile_overrides == {}
-    resume_same_run = get_options(
-        f"--df {path} --outdir {tmp_path} --mode regress "
-        "--ec-profile regression-paper --ec-resume --ec-checkpoint-every 2"
-    )
-    assert resume_same_run.hash() == regression.hash()
-
-    overridden = get_options(
-        f"--df {path} --outdir {tmp_path} --mode regress "
-        "--ec-profile regression-paper --test-val-size 0.3 "
-        "--ec-repetitions 3 --ec-methods ratio --ec-holdout-role validation "
-        "--ec-output-detail summary --ec-resume --ec-checkpoint-every 2"
-    )
-    assert overridden.test_val_size == pytest.approx(0.3)
-    assert overridden.ec_repetitions == 3
-    assert overridden.ec_methods == ("ratio",)
-    assert overridden.ec_holdout_role == "validation"
-    assert overridden.ec_output_detail == "summary"
-    assert overridden.ec_resume is True
-    assert overridden.ec_checkpoint_every == 2
-    assert overridden.ec_profile_overrides == {
-        "test_val_size": 0.3,
-        "ec_repetitions": 3,
-        "ec_methods": ["ratio"],
-        "ec_holdout_role": "validation",
-    }
-
-    classification = get_options(
-        f"--df {path} --outdir {tmp_path} --mode classify "
-        "--ec-profile classification-paper"
-    )
-    assert classification.error_consistency is True
-    assert classification.test_val_size == pytest.approx(0.2)
-    assert classification.ec_folds == 5
-    assert classification.ec_repetitions == 10
-    assert classification.ec_model_seed_mode == "fixed"
-
-    with pytest.raises(ArgumentError, match="requires regression mode"):
+    with pytest.raises(ArgumentError, match="Unknown regression EC method"):
         get_options(
-            f"--df {path} --outdir {tmp_path} --mode classify "
-            "--ec-profile regression-paper"
+            f"--df {path} --outdir {tmp_path} --mode regress --ec-methods ratio_diff_sign"
         )
 
 
@@ -1732,7 +1400,7 @@ def test_runner_raises_when_every_configuration_fails(tmp_path) -> None:
     eval_results.results[0].score = np.nan
     output_dir = tmp_path / "error_consistency"
 
-    with pytest.raises(RuntimeError, match="did not complete"):
+    with pytest.raises(RuntimeError, match="finite score"):
         run_error_consistency_analysis(
             prep_train,
             prep_test,
@@ -1741,131 +1409,4 @@ def test_runner_raises_when_every_configuration_fails(tmp_path) -> None:
             base_dir=output_dir,
         )
 
-    metadata = (output_dir / "metadata.json").read_text(encoding="utf-8")
-    assert "finite score" in metadata
-
-
-@pytest.mark.fast
-def test_risk_stability_report_joins_by_holdout_row(tmp_path) -> None:
-    aer_base = tmp_path / "adaptive_error"
-    ec_base = tmp_path / "error_consistency"
-    aer_predictions = aer_base / "models" / "dummyclassifier" / "predictions"
-    target_name = "target / special"
-    ec_details = detail_output_dir(
-        ec_base,
-        {
-            "target": target_name,
-            "model": "dummy",
-            "selection": "none",
-            "embed_selector": "none",
-        },
-    )
-    aer_predictions.mkdir(parents=True)
-    ec_details.mkdir(parents=True)
-    pd.DataFrame(
-        {
-            "row_id": [10, 11, 12, 13],
-            "correct": [1, 0, 1, 0],
-            "aer": [0.05, 0.4, 0.3, 0.1],
-        }
-    ).to_csv(aer_predictions / "test_per_sample.csv", index=False)
-    pd.DataFrame(
-        {
-            "row_id": [10, 11, 12, 13],
-            "error_rate": [0.0, 0.75, 0.25, 1.0],
-            "instability": [0.0, 0.75, 0.75, 0.0],
-        }
-    ).to_csv(ec_details / "sample_diagnostics.csv", index=False)
-    _, _, eval_results = _runner_case(True)
-    options = SimpleNamespace(
-        htune_cls_metric=ClassifierScorer.Accuracy,
-        is_classification=True,
-        classifiers=(),
-        aer_top_k=0,
-        aer_target_error=0.2,
-        ec_recurrence_threshold=0.5,
-    )
-
-    report = write_risk_stability_report(
-        target_name, eval_results, options, aer_base, ec_base
-    )
-    summary = risk_stability_summary(report)
-
-    assert set(report["risk_stability_quadrant"]) == {
-        "low_aer_low_recurrence",
-        "high_aer_high_recurrence",
-        "high_aer_low_recurrence",
-        "low_aer_high_recurrence",
-    }
-    assert int(summary["n_samples"].sum()) == 4
-    assert set(report["ec_recurrence_threshold"]) == {0.5}
-    assert set(report["threshold_basis"]) == {"user_configurable_heuristic"}
-    assert set(summary["ec_recurrence_threshold"]) == {0.5}
-    assert (aer_base / "tables" / "risk_stability_summary.csv").exists()
-
-
-@pytest.mark.fast
-def test_risk_stability_empty_join_writes_readable_outputs(tmp_path) -> None:
-    aer_base = tmp_path / "adaptive_error"
-    ec_base = tmp_path / "error_consistency"
-    aer_predictions = aer_base / "models" / "dummyclassifier" / "predictions"
-    ec_details = ec_base / "target" / "dummy" / "none_none"
-    aer_predictions.mkdir(parents=True)
-    ec_details.mkdir(parents=True)
-    pd.DataFrame({"row_id": [1], "correct": [1], "aer": [0.1]}).to_csv(
-        aer_predictions / "test_per_sample.csv", index=False
-    )
-    pd.DataFrame({"row_id": [2], "error_rate": [0.0], "instability": [0.0]}).to_csv(
-        ec_details / "sample_diagnostics.csv", index=False
-    )
-    _, _, eval_results = _runner_case(True)
-    options = SimpleNamespace(
-        htune_cls_metric=ClassifierScorer.Accuracy,
-        is_classification=True,
-        classifiers=(),
-        aer_top_k=0,
-        aer_target_error=0.2,
-        ec_recurrence_threshold=0.5,
-    )
-
-    report = write_risk_stability_report(
-        "target", eval_results, options, aer_base, ec_base
-    )
-    report_file = pd.read_csv(aer_base / "tables" / "risk_stability_report.csv")
-    summary_file = pd.read_csv(aer_base / "tables" / "risk_stability_summary.csv")
-    skipped_file = pd.read_csv(aer_base / "tables" / "risk_stability_skipped.csv")
-
-    assert report.empty and report_file.empty and summary_file.empty
-    assert {"row_id", "aer", "error_rate", "risk_stability_quadrant"}.issubset(
-        report_file.columns
-    )
-    assert {"n_samples", "sample_fraction", "mean_ec_error_rate"}.issubset(
-        summary_file.columns
-    )
-    assert skipped_file["reason"].str.contains("no matching holdout rows").all()
-    assert report.attrs["skipped_configurations"] == skipped_file.to_dict("records")
-
-
-@pytest.mark.fast
-def test_risk_stability_summary_keeps_model_denominators_separate() -> None:
-    report = pd.DataFrame(
-        {
-            "target": ["target"] * 4,
-            "model": ["a", "a", "b", "b"],
-            "selection": ["none"] * 4,
-            "risk_stability_quadrant": ["high", "low", "high", "high"],
-            "correct": [0, 1, 0, 1],
-            "aer": [0.5, 0.1, 0.4, 0.3],
-            "error_rate": [0.8, 0.2, 0.7, 0.6],
-            "instability": [0.2, 0.3, 0.4, 0.5],
-        }
-    )
-
-    summary = risk_stability_summary(report)
-
-    fractions = summary.groupby("model")["sample_fraction"].sum()
-    assert fractions.to_dict() == pytest.approx({"a": 1.0, "b": 1.0})
-    assert summary.loc[
-        (summary["model"] == "b") & (summary["risk_stability_quadrant"] == "high"),
-        "sample_fraction",
-    ].item() == pytest.approx(1.0)
+    assert not (output_dir / "metadata.json").exists()

@@ -1,8 +1,4 @@
-"""Choose NumPy or CUDA for the model-pair EC calculation.
-
-This choice does not affect model fitting. Small calculations stay on NumPy
-because moving the data to a GPU can take longer than the calculation.
-"""
+"""Choose the NumPy or CUDA backend for error-consistency calculations."""
 
 from __future__ import annotations
 
@@ -13,8 +9,6 @@ from df_analyze.runtime.hardware import (
     RuntimeComponent,
     RuntimePolicy,
 )
-
-CUDA_WORK_THRESHOLD = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -31,14 +25,6 @@ class ECBackendDecision:
             "ec_backend_reason": self.reason,
             "ec_backend_work_items": self.work_items,
         }
-
-    def fallback(self, reason: str) -> ECBackendDecision:
-        return ECBackendDecision(
-            requested=self.requested,
-            resolved="numpy",
-            reason=reason,
-            work_items=self.work_items,
-        )
 
 
 def resolve_ec_backend(
@@ -60,29 +46,16 @@ def resolve_ec_backend(
     requested = intent.value
     if intent is DeviceIntent.CPU:
         return ECBackendDecision(requested, "numpy", "device_cpu", work_items)
-    if intent is DeviceIntent.Auto and work_items < CUDA_WORK_THRESHOLD:
-        return ECBackendDecision(requested, "numpy", "size_threshold", work_items)
 
     if intent is DeviceIntent.CUDA:
         if runtime is None:
-            raise RuntimeError(
-                "Strict CUDA error consistency requires a RuntimePolicy."
-            )
+            raise RuntimeError("Strict CUDA error consistency requires a RuntimePolicy.")
         runtime.device_for(RuntimeComponent.ErrorConsistency)
         return ECBackendDecision(requested, "torch_cuda", "device_cuda", work_items)
 
     if runtime is None:
         return ECBackendDecision(requested, "numpy", "cuda_unavailable", work_items)
     decision = runtime.decision_for(RuntimeComponent.ErrorConsistency)
-    if decision.resolved == "cuda" and work_items >= CUDA_WORK_THRESHOLD:
-        return ECBackendDecision(requested, "torch_cuda", "size_threshold", work_items)
-    reason = (
-        decision.reason
-        if decision.reason.startswith("cuda_runtime_fallback:")
-        else (
-            "cuda_unavailable"
-            if decision.resolved != "cuda"
-            else "size_threshold"
-        )
-    )
-    return ECBackendDecision(requested, "numpy", reason, work_items)
+    if decision.resolved == "cuda":
+        return ECBackendDecision(requested, "torch_cuda", "cuda_available", work_items)
+    return ECBackendDecision(requested, "numpy", "cuda_unavailable", work_items)

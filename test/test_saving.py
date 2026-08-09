@@ -42,20 +42,22 @@ def test_target_markdown_reports_resolved_final_cv_folds() -> None:
             "metric": ["acc"],
             "trainset": [0.8],
             "holdout": [0.7],
-            "5-fold": [0.6],
+            "cv_mean": [0.6],
+            "final_cv_folds": [3],
         }
     )
 
-    compatibility_report = ProgramDirs()._target_markdown(
-        scores, target_name="target", is_classification=True
-    )
-    assert "## 5-fold performance on holdout set" in compatibility_report
-
-    scores["final_cv_folds"] = 3
     adaptive_report = ProgramDirs()._target_markdown(
         scores, target_name="target", is_classification=True
     )
     assert "## 3-fold performance on holdout set" in adaptive_report
+
+    with np.testing.assert_raises_regex(ValueError, "final_cv_folds"):
+        ProgramDirs()._target_markdown(
+            scores.drop(columns="final_cv_folds"),
+            target_name="target",
+            is_classification=True,
+        )
 
     scores["positive_class"] = "case"
     positive_report = ProgramDirs()._target_markdown(
@@ -85,9 +87,28 @@ def test_random_options(dataset: Tuple[str, TestDataset]) -> None:
         ProgramOptions.random(ds)
 
 
-def test_random_options_falls_back_when_only_tabpfn_was_drawn() -> None:
-    cls_ds = TestDataset.from_name("credit_approval")
-    reg_ds = TestDataset.from_name("abalone")
+def _local_test_dataset(root: Path, *, classification: bool) -> TestDataset:
+    mode = "classification" if classification else "regression"
+    dataset_root = root / mode / "local"
+    dataset_root.mkdir(parents=True)
+    DataFrame(
+        {
+            "feature_name": ["feature", "target"],
+            "type": ["continuous", "continuous"],
+        }
+    ).to_csv(dataset_root / "types.csv", index=False)
+    target = [0, 1, 0, 1] if classification else [0.1, 0.4, 0.8, 1.2]
+    DataFrame({"feature": [1.0, 2.0, 3.0, 4.0], "target": target}).to_parquet(
+        dataset_root / "local.parquet", index=False
+    )
+    return TestDataset(dataset_root)
+
+
+def test_random_options_falls_back_when_only_tabpfn_was_drawn(
+    tmp_path: Path,
+) -> None:
+    cls_ds = _local_test_dataset(tmp_path / "classification-data", classification=True)
+    reg_ds = _local_test_dataset(tmp_path / "regression-data", classification=False)
 
     with (
         patch.object(

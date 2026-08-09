@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from time import perf_counter
 from typing import Any, Optional
-from warnings import warn
 
 import numpy as np
 import pandas as pd
@@ -37,6 +36,15 @@ from df_analyze.preprocessing.prepare import (
 from df_analyze.preprocessing.targets import as_target_list
 
 
+def _column_series(frame: object, name: str) -> Series:
+    if not isinstance(frame, DataFrame):
+        raise TypeError("Expected a pandas DataFrame.")
+    column = frame.loc[:, name]
+    if not isinstance(column, Series):
+        raise ValueError(f"Expected exactly one column named {name!r}.")
+    return column
+
+
 def _selection_targets(
     frame: DataFrame,
     targets: list[str],
@@ -45,7 +53,7 @@ def _selection_targets(
 ) -> Series | DataFrame:
     encoded = {}
     for target in targets:
-        values = frame[target].iloc[rows].reset_index(drop=True)
+        values = _column_series(frame, target).iloc[rows].reset_index(drop=True)
         if is_classification:
             if values.nunique(dropna=False) <= 1:
                 suffix = (
@@ -57,19 +65,19 @@ def _selection_targets(
             encoder = LabelEncoder()
             encoded[target] = encoder.fit_transform(values)
         else:
-            numeric = pd.to_numeric(values, errors="raise").astype(float)
-            if not np.isfinite(numeric.to_numpy()).all():
+            numeric = np.asarray(pd.to_numeric(values, errors="raise"), dtype=np.float64)
+            if not np.isfinite(numeric).all():
                 raise ValueError(
                     f"Regression target {target} contains NaN or infinite values."
                 )
-            if numeric.nunique(dropna=False) <= 1:
+            if np.unique(numeric).size <= 1:
                 suffix = (
                     " Remove this target column and re-run df-analyze."
                     if len(targets) > 1
                     else ""
                 )
                 raise ValueError(f"Regression target {target} is constant.{suffix}")
-            encoded[target] = numeric.to_numpy()
+            encoded[target] = numeric
     y = DataFrame(encoded)
     if len(targets) == 1:
         return y.iloc[:, 0].rename(targets[0])
@@ -145,8 +153,9 @@ def large_table_prepared_splits(
         # grouping column needed for the split.
         cleaned_groups = unify_nans(frame[[options.grouper]].copy())
         frame = frame.copy(deep=False)
-        frame[options.grouper] = cleaned_groups[options.grouper].to_numpy()
-        groups = cleaned_groups[options.grouper].reset_index(drop=True)
+        cleaned_group = _column_series(cleaned_groups, options.grouper)
+        frame[options.grouper] = cleaned_group.to_numpy()
+        groups = cleaned_group.reset_index(drop=True)
     excluded = set(targets) | set(options.drops)
     if options.grouper is not None:
         excluded.add(options.grouper)
@@ -229,7 +238,7 @@ def large_table_prepared_splits(
             options.is_classification,
             y_train,
         )
-        effective, screening, tuning, fallback_note = resolve_screening_split(
+        _, screening, tuning, _ = resolve_screening_split(
             options.feat_downsample,
             resolved,
             y_train,
@@ -241,67 +250,23 @@ def large_table_prepared_splits(
         cache_key = tuple(np.asarray(fit_rows, dtype=int).tolist())
         cached = selection_cache.get(cache_key)
         if cached is None:
-            selection_request = (
-                options.feat_downsample if fallback_note is None else effective
+            selected, result = select_indexed_columns(
+                X,
+                fit_rows,
+                y_train,
+                options.is_classification,
+                options.feat_downsample,
+                options.n_feat_downsample,
+                options.downsample_chunk_size,
+                screening,
+                feature_names,
+                options.downsample_save_scores,
+                input_format="table-large",
+                seed=options.seed,
+                large_feature_mode=True,
+                protected_indices=protected_indices,
             )
-            try:
-                selected, result = select_indexed_columns(
-                    X,
-                    fit_rows,
-                    y_train,
-                    options.is_classification,
-                    selection_request,
-                    options.n_feat_downsample,
-                    options.downsample_chunk_size,
-                    screening,
-                    feature_names,
-                    options.downsample_variance_threshold,
-                    options.downsample_save_scores,
-                    input_format="table-large",
-                    seed=options.seed,
-                    large_feature_mode=True,
-                    protected_indices=protected_indices,
-                )
-            except ValueError as error:
-                if (
-                    options.feat_downsample is not FeatureDownsampleMethod.Auto
-                    or screening is None
-                    or "usable downsampling scores" not in str(error)
-                ):
-                    raise
-                fallback_note = (
-                    f"Auto feature downsampling fell back from {effective.value} to "
-                    "normalized-variance because supervised scoring produced no "
-                    f"usable feature scores: {error}"
-                )
-                warn(fallback_note, stacklevel=2)
-                screening = None
-                tuning = np.arange(len(y_train), dtype=int)
-                selected, result = select_indexed_columns(
-                    X,
-                    fit_rows,
-                    y_train,
-                    options.is_classification,
-                    FeatureDownsampleMethod.NormalizedVariance,
-                    options.n_feat_downsample,
-                    options.downsample_chunk_size,
-                    None,
-                    feature_names,
-                    options.downsample_variance_threshold,
-                    options.downsample_save_scores,
-                    input_format="table-large",
-                    seed=options.seed,
-                    large_feature_mode=True,
-                    protected_indices=protected_indices,
-                )
             result.requested_method = options.feat_downsample.value
-            if (
-                options.feat_downsample is FeatureDownsampleMethod.Auto
-                and result.auto_reason is None
-            ):
-                result.auto_reason = fallback_note
-            if fallback_note is not None:
-                result.notes.append(fallback_note)
             result.tuning_rows = tuning.tolist()
             result.tuning_samples = len(tuning)
             selection_cache[cache_key] = (
@@ -367,7 +332,7 @@ def large_table_prepared_splits(
             ValidationMethod.List,
         )
         prepared_train, prepared_test = next(
-            prepared.get_splits(test_size=options.test_val_size, seed=options.seed)
+            iter(prepared.get_splits(test_size=options.test_val_size, seed=options.seed))
         )
         result.transform_seconds = perf_counter() - started
         final_names = prepared_train.X.columns.astype(str).tolist()

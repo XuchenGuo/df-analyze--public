@@ -9,10 +9,6 @@ sys.path.append(str(ROOT))  # isort: skip
 sys.path.append(str(SRC))  # isort: skip
 # fmt: on
 
-from df_analyze.runtime.bootstrap import bootstrap
-
-bootstrap("df-analyze", Path(__file__), ROOT)
-
 # fmt: off
 # Stupid insane Python import garbage
 # https://github.com/huggingface/transformers/issues/5281#issuecomment-2365359156
@@ -27,9 +23,6 @@ andr2w commented on Jan 25, 2023:
 """
 import torch  # noqa  # type: ignore
 # fmt: on
-
-# Bootstrap before torch so missing packages can be reported or installed.
-# Torch must still load before df_analyze._main and its transformer models.
 
 from src.df_analyze._main import main
 

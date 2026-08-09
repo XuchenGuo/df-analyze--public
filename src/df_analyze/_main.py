@@ -49,10 +49,8 @@ from df_analyze.preprocessing.prepare import (
 )
 from df_analyze.preprocessing.targets import as_target_list
 from df_analyze.runtime.hardware import (
-    DeviceIntent,
     RuntimeComponent,
     format_device_plan,
-    is_cuda_runtime_error,
     validate_cuda_request,
 )
 from df_analyze.selection.filter import FilterSelected, filter_select_features
@@ -273,13 +271,11 @@ def _device_decisions(
     audit_fields = {
         "requested",
         "resolved",
+        "backend",
         "reason",
         "n_samples",
         "n_features",
         "n_queries",
-        "work_metric",
-        "work_items",
-        "threshold",
     }
     for model_name in model_names:
         completed = [
@@ -298,6 +294,9 @@ def _device_decisions(
         devices = sorted(
             {str(record.get("resolved")) for record in completed}
         )
+        backends = sorted(
+            {str(record.get("backend")) for record in completed if record.get("backend")}
+        )
         if len(completed) == 1:
             decisions[model_name] = {
                 key: value
@@ -312,6 +311,7 @@ def _device_decisions(
                 ),
                 "reason": "multiple_model_tasks",
                 "devices": devices,
+                "backends": backends,
                 "tasks": len(completed),
             }
     ec_backends = [
@@ -333,6 +333,13 @@ def _device_decisions(
         decisions["error-consistency"] = {
             "requested": runtime.intent.value,
             "resolved": devices[0] if len(devices) == 1 else "mixed",
+            "backend": (
+                "torch"
+                if devices == ["cuda"]
+                else "numpy"
+                if devices == ["cpu"]
+                else "mixed"
+            ),
             "reason": "error_consistency_runtime_backends",
             "devices": devices,
             "tasks": len(ec_backends),
@@ -362,31 +369,6 @@ def _record_ec_backends(options: ProgramOptions, result) -> None:
         if entry not in recorded:
             recorded.append(entry)
     options._ec_backends = recorded
-    for skipped in result.metadata.get("skipped_configurations", []):
-        _record_partial_failure(
-            options,
-            component="error_consistency",
-            reason=str(skipped.get("reason", "configuration skipped")),
-            details={key: value for key, value in skipped.items() if key != "reason"},
-        )
-
-
-def _record_partial_failure(
-    options: ProgramOptions,
-    component: str,
-    reason: str,
-    details: Optional[dict[str, object]] = None,
-) -> None:
-    failure: dict[str, object] = {
-        "component": str(component),
-        "reason": str(reason),
-    }
-    if details:
-        failure.update(details)
-    recorded = getattr(options, "_partial_failures", [])
-    if failure not in recorded:
-        recorded.append(failure)
-    options._partial_failures = recorded
 
 
 def _write_run_timing(
@@ -415,7 +397,6 @@ def _write_run_timing(
         "runtime_folds": getattr(options, "_runtime_fold_audit", []),
         "runtime_models": getattr(options, "_runtime_model_audit", []),
         "model_failures": getattr(options, "_model_failures", []),
-        "partial_failures": getattr(options, "_partial_failures", []),
         "error_consistency": {
             "enabled": bool(getattr(options, "error_consistency", False)),
             "backends": getattr(options, "_ec_backends", []),
@@ -477,7 +458,6 @@ def _run(options: ProgramOptions) -> None:
     options._ec_backends = []
     options._model_failures = []
     options._model_successes = []
-    options._partial_failures = []
     components = _runtime_components(options)
     validate_cuda_request(options.runtime, components)
     print(format_device_plan(options.runtime, components))
@@ -889,12 +869,11 @@ def _run(options: ProgramOptions) -> None:
 
             ec_base_dir = _error_consistency_base_dir(prog_dirs, fold_idx)
             if ec_base_dir is None:
-                warn(
-                    "No output directory is available; skipping error consistency analysis."
+                raise RuntimeError(
+                    "Error consistency requires an output directory."
                 )
             elif isinstance(prep_train.y, DataFrame):
                 target_outputs = []
-                skipped_targets = []
                 for target_name in prep_train.target_cols:
                     prep_train_t = prep_train.for_target(target_name)
                     prep_test_t = prep_test.for_target(target_name)
@@ -904,51 +883,20 @@ def _run(options: ProgramOptions) -> None:
                         prep_test_t=prep_test_t,
                         target=target_name,
                     )
-                    try:
-                        target_outputs.append(
-                            run_error_consistency_analysis(
-                                prep_train=prep_train_t,
-                                prep_test=prep_test_t,
-                                eval_results=eval_results_t,
-                                options=options,
-                                prog_dirs=prog_dirs,
-                                base_dir=ec_base_dir,
-                                write_root=False,
-                            )
+                    target_outputs.append(
+                        run_error_consistency_analysis(
+                            prep_train=prep_train_t,
+                            prep_test=prep_test_t,
+                            eval_results=eval_results_t,
+                            options=options,
+                            prog_dirs=prog_dirs,
+                            base_dir=ec_base_dir,
+                            write_root=False,
                         )
-                    except RuntimeError as error:
-                        if (
-                            options.runtime.intent is DeviceIntent.CUDA
-                            and is_cuda_runtime_error(error)
-                        ):
-                            raise
-                        skipped_targets.append(
-                            {
-                                "scope": "target",
-                                "target": str(target_name),
-                                "model": "*",
-                                "selection": "*",
-                                "embed_selector": "*",
-                                "reason": str(error),
-                            }
-                        )
-                        warn(
-                            "Skipping error-consistency target "
-                            f"'{target_name}': {error}"
-                        )
-                if not target_outputs:
-                    reasons = "; ".join(
-                        f"{item['target']}: {item['reason']}"
-                        for item in skipped_targets
-                    )
-                    raise RuntimeError(
-                        "Error consistency did not complete for any target. "
-                        f"{reasons or 'No targets were available.'}"
                     )
                 combined_ec = combine_error_consistency_results(
                     target_outputs,
                     options=options,
-                    skipped=skipped_targets,
                 )
                 write_root_outputs(ec_base_dir, combined_ec)
                 _record_ec_backends(options, combined_ec)
@@ -995,32 +943,6 @@ def _run(options: ProgramOptions) -> None:
                         no_preds=options.no_preds,
                         base_dir=target_base_dir,
                     )
-                    if options.error_consistency and target_base_dir is not None:
-                        from df_analyze.analysis.error_consistency.risk_stability import (
-                            write_risk_stability_report,
-                        )
-
-                        ec_base_dir = _error_consistency_base_dir(prog_dirs, fold_idx)
-                        if ec_base_dir is not None:
-                            try:
-                                write_risk_stability_report(
-                                    target=str(target_name),
-                                    eval_results=eval_results_t,
-                                    options=options,
-                                    aer_base_dir=target_base_dir,
-                                    ec_base_dir=ec_base_dir,
-                                )
-                            except Exception as error:
-                                _record_partial_failure(
-                                    options,
-                                    component="risk_stability",
-                                    reason=str(error),
-                                    details={"target": str(target_name)},
-                                )
-                                warn(
-                                    "Could not write the AER/EC risk-stability "
-                                    f"report for target '{target_name}': {error}"
-                                )
             else:
                 run_adaptive_error_analysis(
                     prep_train=prep_train,
@@ -1031,32 +953,6 @@ def _run(options: ProgramOptions) -> None:
                     no_preds=options.no_preds,
                     base_dir=base_dir,
                 )
-                if options.error_consistency and base_dir is not None:
-                    from df_analyze.analysis.error_consistency.risk_stability import (
-                        write_risk_stability_report,
-                    )
-
-                    ec_base_dir = _error_consistency_base_dir(prog_dirs, fold_idx)
-                    if ec_base_dir is not None:
-                        try:
-                            write_risk_stability_report(
-                                target=str(prep_test.target),
-                                eval_results=eval_results,
-                                options=options,
-                                aer_base_dir=base_dir,
-                                ec_base_dir=ec_base_dir,
-                            )
-                        except Exception as error:
-                            _record_partial_failure(
-                                options,
-                                component="risk_stability",
-                                reason=str(error),
-                                details={"target": str(prep_test.target)},
-                            )
-                            warn(
-                                "Could not write the AER/EC risk-stability "
-                                f"report: {error}"
-                            )
         try:
             print(eval_results.to_markdown())
         except ValueError as e:
@@ -1129,10 +1025,7 @@ def main() -> None:
         raise
     status = (
         "completed_with_failures"
-        if (
-            getattr(options, "_model_failures", [])
-            or getattr(options, "_partial_failures", [])
-        )
+        if getattr(options, "_model_failures", [])
         else "completed"
     )
     _write_run_timing(options, started_at, started_s, status)

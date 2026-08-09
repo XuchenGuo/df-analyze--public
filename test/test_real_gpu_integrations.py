@@ -15,12 +15,15 @@ from df_analyze.models.xgboost import XGBoostClassifier
 from df_analyze.runtime.hardware import RuntimeComponent, get_runtime
 
 
-RUN_REAL_CUDA_TESTS = os.getenv(
-    "DF_ANALYZE_RUN_REAL_CUDA_TESTS", ""
-).lower() in {"1", "true", "yes"}
+RUN_REAL_CUDA_TESTS = os.getenv("DF_ANALYZE_RUN_REAL_CUDA_TESTS", "").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 pytestmark = [
     pytest.mark.integration,
+    pytest.mark.gpu_integration,
     pytest.mark.skipif(
         not RUN_REAL_CUDA_TESTS,
         reason="set DF_ANALYZE_RUN_REAL_CUDA_TESTS=1 to run real CUDA backends",
@@ -34,22 +37,18 @@ TORCH_CUDA_COMPONENTS = frozenset(
 
 def _classification_data() -> tuple[pd.DataFrame, pd.Series]:
     rng = np.random.default_rng(20260726)
-    X = pd.DataFrame(
-        rng.normal(size=(48, 6)), columns=[f"x{idx}" for idx in range(6)]
-    )
+    X = pd.DataFrame(rng.normal(size=(48, 6)), columns=[f"x{idx}" for idx in range(6)])
     y = pd.Series((X["x0"] - X["x1"] > 0).astype(int), name="target")
     return X, y
 
 
 def _cuda_policy(component: RuntimeComponent):
     if component in TORCH_CUDA_COMPONENTS and not torch.cuda.is_available():
-        pytest.skip("PyTorch CUDA is not available on this test host")
+        pytest.fail("GPU integration was requested but PyTorch CUDA is unavailable")
     policy = get_runtime("cuda").with_workload(48, 6)
     decision = policy.decision_for(component)
     if decision.resolved != "cuda":
-        pytest.skip(
-            f"{component.value} CUDA backend is unavailable: {decision.reason}"
-        )
+        pytest.fail(f"{component.value} CUDA backend is unavailable: {decision.reason}")
     return policy
 
 

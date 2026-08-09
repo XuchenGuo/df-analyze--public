@@ -16,9 +16,11 @@ from openpyxl.worksheet.worksheet import Worksheet
 from pandas import DataFrame
 
 from df_analyze._constants import SIMPLE_CSV, SIMPLE_XLSX
+from df_analyze.spreadsheet import spreadsheet_options
 
 
 def load_excel(path: Path) -> tuple[DataFrame, str]:
+    options = spreadsheet_options(path)
     wb = load_workbook(path, data_only=True)
     sheetnames = wb.sheetnames
     if len(sheetnames) != 1:
@@ -28,17 +30,10 @@ def load_excel(path: Path) -> tuple[DataFrame, str]:
         )
     ws: Worksheet = wb[sheetnames[0]]
     row: tuple[Any]
-    meta = {}
     data = []
-    for i, row in enumerate(ws.iter_rows(values_only=True)):  # type: ignore
+    for row in ws.iter_rows(values_only=True):  # type: ignore
         first = row[0]
         if first is not None and str(first).strip().startswith("--"):
-            line = " ".join([str(value) for value in row if value is not None])
-            meta[i] = line
-            continue
-        if first is not None and str(first).strip().startswith("--categorical"):
-            line = "".join([str(value) for value in row if value is not None])
-            meta[i] = line
             continue
 
         if all(val is None for val in row):  # ignore blank rows
@@ -54,21 +49,21 @@ def load_excel(path: Path) -> tuple[DataFrame, str]:
         if col == "None":
             drops.append(col)
     df = df.drop(columns=drops, errors="ignore")
-    return df, " ".join(meta.values())
+    return df, options
 
 
 def load_csv(path: Path, separator: str = ",") -> tuple[DataFrame, str]:
+    options = spreadsheet_options(path, separator)
     with open(path, "r") as handle:
         lines = handle.readlines()
 
-    meta = {}
     header = None
     empties = ["\n", ""]
     for i, line in enumerate(lines):
         if line in empties or (line.replace(separator, "") in empties):
             continue  # ignore blanks
         if line.startswith("--"):
-            meta[i] = line.replace(separator, " ").strip()
+            continue
         else:
             header = i
             break
@@ -81,7 +76,7 @@ def load_csv(path: Path, separator: str = ",") -> tuple[DataFrame, str]:
 
     data = StringIO("".join(lines[header:]))
     df = pd.read_csv(data, sep=separator)
-    return df, " ".join(meta.values())
+    return df, options
 
 
 def load_spreadsheet(path: Path, separator: str = ",") -> tuple[DataFrame, str]:

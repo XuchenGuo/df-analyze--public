@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import inspect
 from typing import Any, Optional
-from warnings import warn
 
 import numpy as np
 import pandas as pd
@@ -39,8 +38,6 @@ from df_analyze.runtime.hardware import (
     clear_fitted_model_state,
     device_reason_text,
     get_runtime,
-    is_cuda_runtime_error,
-    release_accelerator_memory,
 )
 from df_analyze.splitting import OmniKFold
 
@@ -88,13 +85,8 @@ def build_oof_for_result(
         raise RuntimeError(
             "Adaptive error analysis could not create any cross-validation folds."
         )
-    component = getattr(
-        result.model_cls, "runtime_component", RuntimeComponent.Sklearn
-    )
-    fold_sizes = [
-        (len(idx_train), len(idx_query))
-        for idx_train, idx_query in splits
-    ]
+    component = getattr(result.model_cls, "runtime_component", RuntimeComponent.Sklearn)
+    fold_sizes = [(len(idx_train), len(idx_query)) for idx_train, idx_query in splits]
     if component is RuntimeComponent.KNN:
         largest_train, largest_query = max(
             fold_sizes,
@@ -105,9 +97,7 @@ def build_oof_for_result(
             fold_sizes,
             key=lambda sizes: sizes[0],
         )
-    base_runtime = getattr(result.model, "runtime", None) or get_runtime(
-        DeviceIntent.CPU
-    )
+    base_runtime = getattr(result.model, "runtime", None) or get_runtime(DeviceIntent.CPU)
     runtime = base_runtime.for_task(
         largest_train,
         X_train.shape[1],
@@ -150,51 +140,6 @@ def build_oof_for_result(
             stage="failed",
             error=error,
         )
-        cuda_failure = (
-            decision.resolved == "cuda" and is_cuda_runtime_error(error)
-        )
-        if runtime.intent is DeviceIntent.Auto and cuda_failure:
-            reason = f"cuda_runtime_fallback:{type(error).__name__}"
-            runtime.record_cpu_fallback(component, reason)
-            release_accelerator_memory()
-            warn(
-                "Adaptive error OOF encountered a CUDA runtime failure. "
-                "Restarting this complete model/selection OOF task on CPU once."
-            )
-            try:
-                output = _build_oof_attempt(
-                    result,
-                    X_train,
-                    y_train,
-                    groups,
-                    runtime,
-                    splits,
-                )
-            except Exception as retry_error:
-                _record_oof_device(
-                    options,
-                    result,
-                    runtime,
-                    component,
-                    attempt=2,
-                    stage="failed",
-                    error=retry_error,
-                )
-                raise
-            _record_oof_device(
-                options,
-                result,
-                runtime,
-                component,
-                attempt=2,
-                stage="completed",
-            )
-            return output
-        if runtime.intent is DeviceIntent.CUDA and cuda_failure:
-            raise RuntimeError(
-                "Adaptive error OOF failed on CUDA while --device cuda is "
-                "strict. CPU fallback is disabled."
-            ) from error
         raise
 
 
@@ -257,8 +202,7 @@ def _fit_oof_fold(
             proba = scores_to_proba(scores)
         if proba is None:
             raise RuntimeError(
-                "Adaptive error analysis requires predict_proba or "
-                "decision_function."
+                "Adaptive error analysis requires predict_proba or decision_function."
             )
         if scores is None:
             scores = predict_scores(tuned_model, X_val)
@@ -271,16 +215,12 @@ def _fit_oof_fold(
             "y_pred": y_pred,
             "proba": np.asarray(proba),
             "conf": np.asarray(proba_margin_for_pred(proba, y_pred)),
-            "knn_vote": knn_neighbor_vote_conf(
-                tuned_model, X_val, y_pred, y_tr_arr
-            ),
+            "knn_vote": knn_neighbor_vote_conf(tuned_model, X_val, y_pred, y_tr_arr),
             "knn_dist_weighted": knn_distance_weighted_conf(
                 tuned_model, X_val, y_pred, y_tr_arr
             ),
             "knn_min_dist": knn_min_dist_raw(tuned_model, X_val),
-            "tree_vote_agreement": tree_vote_agreement_conf(
-                tuned_model, X_val, y_pred
-            ),
+            "tree_vote_agreement": tree_vote_agreement_conf(tuned_model, X_val, y_pred),
             "tree_leaf_support": tree_leaf_support_conf(
                 tuned_model, X_val, n_train=len(X_tr)
             ),
@@ -316,9 +256,7 @@ def _build_oof_attempt(
         y_tr = y_train.iloc[idx_train]
         g_tr = groups.iloc[idx_train] if groups is not None else None
         X_val = X_train.iloc[idx_val]
-        outputs = _fit_oof_fold(
-            result, X_tr, y_tr, g_tr, X_val, runtime
-        )
+        outputs = _fit_oof_fold(result, X_tr, y_tr, g_tr, X_val, runtime)
         y_pred = np.asarray(outputs["y_pred"])
         proba = np.asarray(outputs["proba"])
         conf = np.asarray(outputs["conf"])

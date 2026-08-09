@@ -119,27 +119,12 @@ options:
                         If "classify", do classification. If "regress", do regression.
 
   --device {auto,cpu,cuda}
-                        Choose how supported work uses a GPU. Auto is recommended: it uses CUDA for
-                        neural models and TabPFN when available, and applies workload thresholds to
-                        KNN, CatBoost, XGBoost, and pairwise error consistency. An auto task that
-                        encounters a CUDA runtime error is tried once more on the CPU. CPU disables
-                        GPU use. CUDA requires CUDA for selected work that supports it; CUDA errors
-                        stop the run, and CPU-only work remains on the CPU. GANDALF may use MPS in
-                        auto mode on a supported Mac.
-
-  --device-install {auto,ask,never}
-                        Choose whether df-analyze may create a separate CUDA-enabled PyTorch
-                        environment: auto, ask, or never (the default). Setup requires a source
-                        checkout containing pyproject.toml and uv.lock.
-
-  --tabpfn-version {v3,v2.6,v2.5}
-                        TabPFN checkpoint to use. The default is v3; v2.6 and v2.5 select older
-                        checkpoints. This option applies only when `tabpfn` is selected. Before the
-                        first run, accept the matching Prior Labs license and authenticate with the
-                        Prior Labs browser flow or TABPFN_TOKEN. If the installed package reports a
-                        gated Hugging Face repository, use `hf auth login` or HF_TOKEN after accepting
-                        that repository's terms. Check the current license before commercial or
-                        production use.
+                        Choose how supported work uses an accelerator. Auto is recommended: each
+                        selected component uses CUDA when its backend is available, MPS when
+                        supported, and otherwise CPU. CPU disables accelerator checks. CUDA is
+                        strict for selected CUDA-capable work; missing backends and runtime CUDA
+                        errors stop the run, while CPU-only work remains on CPU. The startup plan
+                        shows every resolved device.
 
   --classifiers  [ ...]
 
@@ -243,7 +228,7 @@ options:
                         is to prevent double-dipping / circular analysis that can result in
                         (extremely) biased performance estimates.
 
-  --feat-downsample {none,auto,random,variance,normalized-variance,f-test,mutual-info,linear,lgbm,svd,sparse-rp,rank-ensemble,selector-ensemble,stable-rank}
+  --feat-downsample {none,normalized-variance,f-test}
 
                         Reduce a wide matrix before the usual feature-selection and tuning stages.
                         Supervised methods use separate rows for feature ranking and model tuning.
@@ -252,10 +237,6 @@ options:
   --n-feat-downsample N_FEAT_DOWNSAMPLE
 
                         Maximum number or fraction of features retained.
-
-  --downsample-variance-threshold DOWNSAMPLE_VARIANCE_THRESHOLD
-
-                        Minimum sample variance retained by variance downsampling.
 
   --downsample-save-scores
 
@@ -714,14 +695,6 @@ options:
                         Run error consistency after feature selection and tuning. The
                         training folds change, but every fitted model predicts the same
                         external holdout. Do not use a final-test holdout to select a model.
-  --ec-profile {none,classification-paper,regression-paper}
-                        Use the settings from an EC reference experiment.
-                        classification-paper uses an 80/20 holdout, 5 folds, 10
-                        repetitions, and fixed model seeds. regression-paper uses an 80/20
-                        holdout, 5 folds, 50 repetitions, fixed model seeds, and the seven
-                        reference methods. A CLI or spreadsheet value overrides the
-                        corresponding profile value. Profiles do not reproduce the
-                        original datasets, preprocessing, models, or result tables.
   --ec-folds EC_FOLDS
                         Number of folds in each error-consistency repetition.
   --ec-repetitions EC_REPETITIONS
@@ -736,8 +709,8 @@ options:
                         methods: ratio, ratio_diff, ratio_sign,
                         ratio_diff_sign_magnitude, intersection_union_sample,
                         intersection_union_all, and intersection_union_distance.
-                        ratio_diff_sign_reference is an optional signed compatibility
-                        method and is not ranked.
+                        ratio_diff_sign_reference is the optional signed reference
+                        calculation and is not ranked.
   --ec-holdout-role {test,validation}
                         Tell df-analyze how the shared holdout is being used. test (the
                         default) calculates EC but disables model ranking and
@@ -750,13 +723,6 @@ options:
                         adds sample-level diagnostics. --ec-save-predictions adds
                         prediction and residual/error matrices at any level. The default
                         is full.
-  --ec-resume
-                        Continue EC from a matching checkpoint, or reuse a completed
-                        result. The prepared training data, holdout data, and EC settings
-                        must match.
-  --ec-checkpoint-every EC_CHECKPOINT_EVERY
-                        Save an EC checkpoint after this many completed repetitions. The
-                        default is 5.
   --ec-save-predictions
                         Save the prediction and residual/error matrices used to calculate
                         EC, including holdout positions and true target values.
@@ -768,10 +734,6 @@ options:
   --ec-epsilon EC_EPSILON
                         Non-negative value added to regression ratio denominators near
                         zero. The default is 0.
-  --ec-recurrence-threshold EC_RECURRENCE_THRESHOLD
-                        Error-rate threshold used to label high recurrence in the combined
-                        adaptive-error/EC report. The default is 0.5; it is not a
-                        universal cutoff.
 
   --adaptive-error
                         Estimate the chance that each holdout prediction is wrong from

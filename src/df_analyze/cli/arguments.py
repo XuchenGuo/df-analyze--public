@@ -1,51 +1,36 @@
 from __future__ import annotations
 
-# fmt: off
-import sys  # isort: skip
-from pathlib import Path  # isort: skip
-ROOT = Path(__file__).resolve().parent.parent.parent  # isort: skip
-sys.path.append(str(ROOT))  # isort: skip
-# fmt: on
+import shlex
 
 
-from argparse import ArgumentParser
-from enum import Enum
-from typing import Generic, Mapping, TypeVar
+COLUMN_LIST_OPTIONS = frozenset(
+    {"--targets", "--categoricals", "--ordinals", "--drops"}
+)
 
 
-T = TypeVar("T")
+def split_cli_args(args: str) -> list[str]:
+    """Split CLI text without damaging Windows paths or column names."""
+    lexer = shlex.shlex(args, posix=True)
+    lexer.commenters = ""
+    lexer.whitespace_split = True
+    lexer.escape = ""
+    lexer.quotes = '"\''
+    tokens = list(lexer)
 
+    normalized: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        normalized.append(token)
+        index += 1
+        if token not in COLUMN_LIST_OPTIONS:
+            continue
 
-class CliOption(Generic[T]):
-    def __init__(
-        self,
-        longnames: list[str],
-        shortnames: list[str],
-        choices: list[str] | None,
-        default: T,
-        argparse_kwargs: Mapping | None = None,
-    ) -> None:
-        self.longnames = longnames
-        self.shortnames = shortnames
-        self.choices = choices
-        self.default = default
-        self.kwargs = argparse_kwargs or {}
+        columns: list[str] = []
+        while index < len(tokens) and not tokens[index].startswith("--"):
+            columns.extend(column for column in tokens[index].split(",") if column)
+            index += 1
+        if columns:
+            normalized.append(",".join(columns))
 
-    def add_to_parser(self, parser: ArgumentParser) -> None:
-        kwargs = {}
-        if (self.choices is not None) and (len(self.choices) > 0):
-            kwargs["choices"] = self.choices
-        kwargs["default"] = self.default
-
-        parser.add_argument(*self.longnames, *self.shortnames)
-
-    def default_str(self) -> str:
-        if isinstance(self.default, Enum):
-            return self.default.value
-        return str(self.default)
-
-    def to_line(self) -> str:
-        return f"--{self.longnames[0]} {self.default_str()}"
-
-    def to_cell_values(self) -> list[str]:
-        return [f"--{self.longnames[0]}", f"{self.default_str()}"]
+    return normalized

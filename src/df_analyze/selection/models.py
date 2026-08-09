@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from df_analyze.cli.cli import ProgramOptions
 from df_analyze.preprocessing.prepare import PreparedData
 from df_analyze.enumerables import FeatureSelection
-from df_analyze.runtime.hardware import DeviceIntent, is_cuda_runtime_error
+from df_analyze.runtime.hardware import DeviceIntent
 from df_analyze.selection.embedded import (
     EmbedSelected,
     EmbedSelectionModel,
@@ -25,7 +25,6 @@ def _raise_strict_cuda_failure(options: ProgramOptions, error: Exception) -> Non
     if (
         runtime is not None
         and runtime.intent is DeviceIntent.CUDA
-        and is_cuda_runtime_error(error)
     ):
         raise error
 

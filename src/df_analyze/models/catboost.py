@@ -15,11 +15,13 @@ import numpy as np
 import optuna
 from optuna import Study, Trial
 from pandas import DataFrame, Series
+from sklearn.compose import TransformedTargetRegressor
+from sklearn.multioutput import MultiOutputClassifier
 from sklearn.preprocessing import StandardScaler
 
 from df_analyze._constants import SEED
 from df_analyze.enumerables import Scorer
-from df_analyze.models.base import DfAnalyzeModel, ScaledMultiTargetRegressor
+from df_analyze.models.base import DfAnalyzeModel
 from df_analyze.runtime.hardware import RuntimeComponent
 from df_analyze.splitting import OmniKFold
 
@@ -147,8 +149,6 @@ class CatBoostEstimator(DfAnalyzeModel):
                 model_args.setdefault("loss_function", native_loss)
                 model_cls, clean_args = self.model_cls_args(model_args)
                 model = model_cls(**clean_args)
-                y_fit = y
-                target_scaler: Optional[StandardScaler] = None
                 if not self.is_classifier:
                     constant = [
                         str(col)
@@ -160,24 +160,18 @@ class CatBoostEstimator(DfAnalyzeModel):
                             "Multi-target regression has constant target(s) in a "
                             f"CatBoost training partition: {constant}."
                         )
-                    target_scaler = StandardScaler()
-                    y_fit = DataFrame(
-                        target_scaler.fit_transform(y.to_numpy(dtype=float)),
-                        index=y.index,
-                        columns=y.columns,
+                    estimator = TransformedTargetRegressor(
+                        regressor=model,
+                        transformer=StandardScaler(),
                     )
-                model.fit(X, y_fit)
-                if target_scaler is not None:
-                    return ScaledMultiTargetRegressor(
-                        estimator=model,
-                        scaler=target_scaler,
-                        target_cols=[str(col) for col in y.columns],
-                    )
+                    estimator.fit(X, y)
+                    return estimator
+                model.fit(X, y)
                 return model
-            return {
-                str(col): self._fit_single_target(X, y[col], kwargs)
-                for col in y.columns
-            }
+            model_cls, clean_args = self.model_cls_args(dict(kwargs))
+            estimator = MultiOutputClassifier(model_cls(**clean_args))
+            estimator.fit(X, y)
+            return estimator
         return self._fit_single_target(X, y, kwargs)
 
     def fit(self, X_train: DataFrame, y_train: Union[Series, DataFrame]) -> None:
@@ -459,7 +453,13 @@ class CatBoostClassifier(CatBoostEstimator):
                 target: np.asarray(self.tuned_model[target].predict_proba(X))
                 for target in self.target_cols
             }
-        probs = np.asarray(self.tuned_model.predict_proba(X))
+        raw_probs = self.tuned_model.predict_proba(X)
+        if isinstance(raw_probs, (list, tuple)):
+            return {
+                target: np.asarray(values)
+                for target, values in zip(self.target_cols, raw_probs, strict=True)
+            }
+        probs = np.asarray(raw_probs)
         if (
             probs.ndim == 2
             and len(self.target_cols) > 1

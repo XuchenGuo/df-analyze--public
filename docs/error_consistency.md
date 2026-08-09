@@ -127,7 +127,7 @@ For the intersection-union methods:
 When both residuals are zero, ratio and intersection-over-union values are 1;
 ratio-difference and distance values are 0.
 
-### Compatibility note for ratio-diff-sign
+### Explicit ratio-diff-sign variants
 
 The reference implementation signs the ratio difference before averaging.
 Positive and negative values can therefore cancel. `df-analyze` provides two
@@ -137,10 +137,6 @@ explicit choices:
   difference, while `ec_signed_mean` and `pair_signed_mean` keep the direction.
 - `ratio_diff_sign_reference` uses the signed reference calculation directly.
   It is reported but is not included in automatic rankings.
-
-The older name `ratio_diff_sign` still works and keeps its previous
-magnitude-first behaviour. New commands should use one of the two explicit
-names.
 
 Several regression methods are mathematically related. For example, when both
 residual sizes are nonzero,
@@ -166,12 +162,9 @@ metadata.
 | `--ec-methods` | all seven | Regression methods to calculate |
 | `--ec-holdout-role` | `test` | Controls whether ranking and EC/performance comparisons are written |
 | `--ec-output-detail` | `full` | Keep `summary`, `pairwise`, or `full` output |
-| `--ec-resume` | off | Continue a matching checkpoint or reuse a completed one |
-| `--ec-checkpoint-every` | `5` | Save a checkpoint after this many repetitions |
 | `--ec-save-predictions` | off | Save holdout predictions and residual/error matrices |
 | `--ec-empty-unions` | `warn` | Handle classification pairs where both error sets are empty |
 | `--ec-epsilon` | `0` | Stabilize regression ratio denominators |
-| `--ec-recurrence-threshold` | `0.5` | Label high recurrence in the combined adaptive-error/EC report |
 
 `--ec-model-seed-mode vary` measures changes from both the training rows and
 model randomness. `fixed` keeps the model seed the same, which focuses the
@@ -191,23 +184,6 @@ split.
 also keeps model-pair tables and plots. `full` adds sample-level tables and
 diagnostics. `--ec-save-predictions` adds prediction and residual/error
 matrices at any detail level.
-
-## Reference experiment profiles
-
-The profiles make it easier to use the split and repetition settings from the
-reference experiments:
-
-```shell
-# 80/20 holdout, 5 folds, 10 repetitions, fixed model seeds
---ec-profile classification-paper
-
-# 80/20 holdout, 5 folds, 50 repetitions, fixed model seeds
---ec-profile regression-paper
-```
-
-An option supplied on the command line or in a spreadsheet overrides that one
-profile setting. The profiles do not download the original data or reproduce
-the papers' preprocessing, model implementations, or result tables.
 
 ## Runtime and hardware
 
@@ -231,11 +207,6 @@ reaches the internal threshold. Larger comparison matrices are more likely to
 benefit; smaller calculations remain on NumPy because transfer overhead may
 leave little improvement. Model refits follow each model's own device support,
 so CPU-only models still run on the CPU.
-
-Each configuration has a `.ec_checkpoint` directory. With `--ec-resume`,
-`df-analyze` continues from the last saved repetition when the data and EC
-settings match. It refuses to reuse a checkpoint when the prepared data,
-methods, folds, repetitions, seeds, formula version, or output detail differ.
 
 ## Reading the results
 
@@ -263,14 +234,12 @@ The main audit files are:
   and the command with sensitive values removed.
 
 Each `<target>/<model>/<selection>_<embed-selector>/` directory contains the
-tables and checkpoint for one configuration. Pairwise and sample-level files
+tables for one configuration. Pairwise and sample-level files
 depend on `--ec-output-detail`. Classification configurations always include
 `leave_one_model_out.csv`. With `--ec-save-predictions`, they also include
 `trial_predictions.csv` and `residual_or_error_matrix.csv`.
 
 For multiple external test sets, the EC directories are nested under `testXX`.
-When adaptive error and EC are both enabled, the combined report is written to
-`results/adaptive_error/tables/risk_stability_report.csv`.
 
 ## How to use EC
 

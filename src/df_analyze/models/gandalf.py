@@ -76,7 +76,6 @@ from df_analyze.runtime.hardware import (
     RuntimeComponent,
     cleanup_torch_accelerator,
     configure_torch_cuda,
-    is_cuda_runtime_error,
 )
 from df_analyze.splitting import ApproximateStratifiedGroupSplit
 
@@ -1238,7 +1237,7 @@ class GandalfEstimator(DfAnalyzeModel):
                 score = metric.tuning_score(y_true=y_true, y_pred=preds)
                 return score
             except Exception as e:
-                if self._uses_accelerator() and is_cuda_runtime_error(e):
+                if self._uses_accelerator():
                     raise
                 traceback.print_exc()
                 print(f"Got error: {e}")
